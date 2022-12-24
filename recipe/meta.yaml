@@ -1,4 +1,4 @@
-{% set version = "2.2.2" %}
+{% set version = "2.3.0" %}
 
 package:
   name: deeplabcut
@@ -6,7 +6,7 @@ package:
 
 source:
   url: https://pypi.io/packages/source/d/deeplabcut/deeplabcut-{{ version }}.tar.gz
-  sha256: e57bd049adb90f18d3597cbb2b2a2a3d90e2fe80db0c138274979c64506fdb98
+  sha256: b4d233f590c7336be5b081ac81c13fda776bf13b7cc92559b3eccc8e06777329
   patches:
     - patches/0001-Remove-download-script-installation.patch
     - patches/0002-Silicence-warnigns-about-loading-DLC-in-light-mode.patch
@@ -14,7 +14,7 @@ source:
     - patches/0004-do-not-use_asscalar.patch
 
 build:
-  number: 3
+  number: 0
   noarch: python
   script: {{ PYTHON }} -m pip install . -vv --no-deps
   # Confirm with upstream before making this entry point
