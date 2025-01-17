@@ -5,7 +5,7 @@ package:
   version: {{ version }}
 
 source:
-  url: https://pypi.io/packages/source/d/deeplabcut/deeplabcut-{{ version }}.tar.gz
+  url: https://pypi.org/packages/source/d/deeplabcut/deeplabcut-{{ version }}.tar.gz
   sha256: 6eb0db8d1485f35a0492ddc74484c1dfe798e3177f29ff3b0c18d62bb1d8d62e
   patches:
     - patches/0001-Do-not-install-download-script.patch
@@ -18,7 +18,7 @@ source:
     - patches/0008-add-outputs-for-multi-animal-model-export.patch
 
 build:
-  number: 0
+  number: 1
   noarch: python
   script: {{ PYTHON }} -m pip install . -vv --no-deps
   # Confirm with upstream before making this entry point
@@ -29,10 +29,10 @@ build:
 
 requirements:
   host:
-    - python >=3.9
+    - python {{ python_min }}
     - pip
   run:
-    - python >=3.9
+    - python >={{ python_min }}
     - dlclibrary >=0.0.6
     - filterpy >=1.4.4
     - ruamel.yaml >=0.15.0
@@ -63,6 +63,7 @@ requirements:
 test:
   requires:
     - pip
+    - python {{ python_min }}
   commands:
     - pip check
   imports:
