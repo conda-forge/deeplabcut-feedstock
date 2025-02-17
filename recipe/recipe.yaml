@@ -67,6 +67,12 @@ requirements:
     - tensorflow >=2.0
 
 tests:
+  - script:
+      - echo hello
+    requirements:
+      run:
+        # Avoid opengl requirements
+        - opencv *=headless*
   - python:
       imports:
         - deeplabcut
