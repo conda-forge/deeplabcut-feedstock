@@ -1,6 +1,5 @@
 context:
   version: 2.3.11
-  python_min: 3.10
 
 package:
   name: deeplabcut
@@ -53,7 +52,9 @@ requirements:
     - pyyaml
     - scikit-image >=0.17
     - scikit-learn >=1.0
-    - scipy >=1.9
+    # They actually have a lowerbound on scipy 1.9 but I feel like scipy 1.9 is
+    # a little buggy on conda-forge
+    - scipy >=1.10
     - statsmodels >=0.11
     - pytables >=3.8.0
     - tf_slim >=1.1.0
