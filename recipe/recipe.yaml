@@ -1,11 +1,12 @@
-{% set version = "2.3.11" %}
+context:
+  version: 2.3.11
 
 package:
   name: deeplabcut
-  version: {{ version }}
+  version: ${{ version }}
 
 source:
-  url: https://pypi.org/packages/source/d/deeplabcut/deeplabcut-{{ version }}.tar.gz
+  url: https://pypi.org/packages/source/d/deeplabcut/deeplabcut-${{ version }}.tar.gz
   sha256: 0d77464eeb984a702d8b25f28ecc4444baef73b7bec72d79e2f00fecda188189
   patches:
     - patches/0001-Do-not-install-download-script.patch
@@ -19,21 +20,22 @@ source:
     - patches/0009-Loosen-dependencies.patch
 
 build:
-  number: 0
-  noarch: python
-  script: {{ PYTHON }} -m pip install . -vv --no-deps
   # Confirm with upstream before making this entry point
   # https://github.com/DeepLabCut/DeepLabCut/pull/1547
-  entry_points:
-    - dlc = deeplabcut.cli:main
-    - deeplabcut = deeplabcut.gui.launch_script:launch_dlc
+  number: 0
+  noarch: python
+  script: ${{ PYTHON }} -m pip install . -vv --no-deps
+  python:
+    entry_points:
+      - dlc = deeplabcut.cli:main
+      - deeplabcut = deeplabcut.gui.launch_script:launch_dlc
 
 requirements:
   host:
-    - python {{ python_min }}
+    - python  ${{ python_min }}
     - pip
   run:
-    - python >={{ python_min }}
+    - python  >=${{ python_min }}
     - setuptools
     - dlclibrary >=0.0.6
     - filterpy >=1.4.4
@@ -60,31 +62,22 @@ requirements:
     # They don't explicitely depend on opencv in their requirements
     # but they import it...
     - opencv
-
-  run_constrained:
+  run_constraints:
     - napari-deeplabcut >=0.2.1.6
     - tensorflow >=2.0
 
-test:
-  requires:
-    - pip
-    - python {{ python_min }}
-  commands:
-    - pip check
-  imports:
-    - deeplabcut
-  # Confirm with upstream before making this entry point
-  # https://github.com/DeepLabCut/DeepLabCut/pull/1547
-  # commands:
-  #   - dlc --help
+tests:
+  - python:
+      imports:
+        - deeplabcut
+      pip_check: true
 
 about:
-  home: www.deeplabcut.org
   license: LGPL-3.0-only
-  license_family: LGPL
   license_file: LICENSE
   summary: DeepLabCut is a toolbox for markerless pose estimation of animals performing various tasks.
-  dev_url: https://github.com/DeepLabCut/DeepLabCut
+  homepage: www.deeplabcut.org
+  repository: https://github.com/DeepLabCut/DeepLabCut
 
 extra:
   recipe-maintainers:
