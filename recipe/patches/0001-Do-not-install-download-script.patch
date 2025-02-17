@@ -1,7 +1,7 @@
 From ae13e2bccef0965d8e8d07a4fd32b9d56dd7b3ba Mon Sep 17 00:00:00 2001
 From: Mark Harfouche <mark.harfouche@gmail.com>
 Date: Mon, 25 Sep 2023 02:17:35 -0400
-Subject: [PATCH 1/8] Do not install download script
+Subject: [PATCH 1/9] Do not install download script
 
 ---
  setup.py | 1 -

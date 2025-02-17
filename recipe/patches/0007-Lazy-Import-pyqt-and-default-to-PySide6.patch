@@ -1,7 +1,7 @@
 From da3bac001b288aa10279debf2bad8f710b866852 Mon Sep 17 00:00:00 2001
 From: Mark Harfouche <mark.harfouche@gmail.com>
 Date: Mon, 25 Sep 2023 02:22:57 -0400
-Subject: [PATCH 7/8] Lazy Import pyqt and default to PySide6
+Subject: [PATCH 7/9] Lazy Import pyqt and default to PySide6
 
 ---
  deeplabcut/__init__.py          | 6 ------
