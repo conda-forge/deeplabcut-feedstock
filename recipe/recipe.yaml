@@ -68,15 +68,14 @@ requirements:
 
 tests:
   - script:
-      - echo hello
+      - pip check
+      - python -c "import deeplabcut"
     requirements:
       run:
+        - pip
+        - python ${{ python_min }}.*
         # Avoid opengl requirements
         - opencv *=headless*
-  - python:
-      imports:
-        - deeplabcut
-      pip_check: true
 
 about:
   license: LGPL-3.0-only
