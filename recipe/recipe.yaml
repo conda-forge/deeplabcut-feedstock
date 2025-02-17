@@ -32,7 +32,7 @@ build:
 
 requirements:
   host:
-    - python  ${{ python_min }}
+    - python  ${{ python_min }}.*
     - pip
   run:
     - python  >=${{ python_min }}
@@ -76,7 +76,7 @@ about:
   license: LGPL-3.0-only
   license_file: LICENSE
   summary: DeepLabCut is a toolbox for markerless pose estimation of animals performing various tasks.
-  homepage: www.deeplabcut.org
+  homepage: https://www.deeplabcut.org
   repository: https://github.com/DeepLabCut/DeepLabCut
 
 extra:
