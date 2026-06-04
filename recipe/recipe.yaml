@@ -8,7 +8,7 @@ package:
 
 source:
   url: https://pypi.org/packages/source/d/deeplabcut/deeplabcut-${{ version }}.tar.gz
-  sha256: 0d77464eeb984a702d8b25f28ecc4444baef73b7bec72d79e2f00fecda188189
+  sha256: 66eb56d0634460bf9e4dc7e87f4f52d920b3ffe4dadd65ed07b5d025e630c3b8
   # patches:
   # Le's try and either fix these in the codebase/ensure they are truly necessary
   # The qtpy ones are likely relevant still; others like multi animal export need review.
