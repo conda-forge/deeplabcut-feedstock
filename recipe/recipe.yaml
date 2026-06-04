@@ -66,7 +66,7 @@ tests:
         - opencv *=headless*
 
 about:
-  license: LGPL-3.0-only
+  license: LGPL-3.0-or-later
   license_file: LICENSE
   summary: DeepLabCut is a toolbox for markerless pose estimation of animals performing various tasks.
   homepage: https://www.deeplabcut.org
