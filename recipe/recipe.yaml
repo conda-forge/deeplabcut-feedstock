@@ -25,16 +25,16 @@ build:
   # https://github.com/DeepLabCut/DeepLabCut/pull/1547
   number: 0
   noarch: python
-  script: ${{ PYTHON }} -m pip install . -vv --no-deps
+  script: ${{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
   python:
     entry_points:
-      - dlc = deeplabcut.cli:main
-      - deeplabcut = deeplabcut.gui.launch_script:launch_dlc
+      - dlc = deeplabcut.__main__:main
 
 requirements:
   host:
     - python  ${{ python_min }}.*
     - pip
+    - setuptools >=61
   run:
     - python  >=${{ python_min }}
     - setuptools
