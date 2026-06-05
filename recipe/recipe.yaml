@@ -73,7 +73,6 @@ requirements:
     - napari-deeplabcut >=0.3.1
     - qdarkstyle ==3.1
     # TensorFlow extras are optional
-    - protobuf <7
     - tensorflow >=2.12
     - tensorpack >=0.11
     - tf-keras
