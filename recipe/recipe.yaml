@@ -1,5 +1,5 @@
 context:
-  version: 2.3.11
+  version: "3.0.0"
 
 package:
   name: deeplabcut
@@ -7,7 +7,7 @@ package:
 
 source:
   url: https://pypi.org/packages/source/d/deeplabcut/deeplabcut-${{ version }}.tar.gz
-  sha256: 0d77464eeb984a702d8b25f28ecc4444baef73b7bec72d79e2f00fecda188189
+  sha256: 66eb56d0634460bf9e4dc7e87f4f52d920b3ffe4dadd65ed07b5d025e630c3b8
   patches:
     - patches/0001-Do-not-install-download-script.patch
     - patches/0002-Silence-warnings-about-DLC-lite-mode.patch
@@ -22,7 +22,7 @@ source:
 build:
   # Confirm with upstream before making this entry point
   # https://github.com/DeepLabCut/DeepLabCut/pull/1547
-  number: 1
+  number: 0
   noarch: python
   script: ${{ PYTHON }} -m pip install . -vv --no-deps
   python:
