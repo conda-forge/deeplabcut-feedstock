@@ -50,6 +50,11 @@ requirements:
     - matplotlib-base >=3.3,<3.9,!=3.7,!=3.7.1
     - networkx >=2.6
     - numba >=0.54
+    # imgaug does not support numpy>2.2.6
+    # so training on tensorflow cannot not function without this pin
+    #  on python e.g. python 3.12 with numpy 2.4.6.
+    # See example of failing tests:
+    # https://github.com/C-Achard/DeepLabCut/actions/runs/27232381795/job/80415647150?pr=9
     - numpy >=1.18.5,<2
     - opencv
     - packaging >=26
