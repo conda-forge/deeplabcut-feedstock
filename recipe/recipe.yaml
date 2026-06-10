@@ -58,6 +58,10 @@ requirements:
     - numpy >=1.18.5,<2
     - opencv
     - packaging >=26
+    # pandas upper-bound is required due to 3.0-incompatible usage across the codebase
+    # See https://github.com/DeepLabCut/DeepLabCut/issues/3362
+    # Example of test failures when using pandas 3.0 
+    # https://github.com/C-Achard/DeepLabCut/actions/runs/27232381795/job/80415646865?pr=9
     - pandas >=2.2,<3
     - pillow >=7.1
     - pycocotools
