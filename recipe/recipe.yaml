@@ -52,7 +52,7 @@ requirements:
     - numba >=0.54
     - numpy >=1.22.4
     - opencv
-    - packaging >=20
+    - packaging >=26
     - pandas >=2.2
     - bottleneck
     - numexpr
@@ -79,25 +79,22 @@ requirements:
     - tf_slim >=1.1
 
 tests:
+  - python:
+      imports:
+        - deeplabcut
+        - deeplabcut.pose_estimation_pytorch.data.augmentation
+        - deeplabcut.pose_estimation_pytorch.data.transforms
+        - deeplabcut.post_processing.filtering
+        - deeplabcut.pose_estimation_3d.triangulation
+        - deeplabcut.refine_training_dataset.stitch
+        - deeplabcut.utils.make_labeled_video
+      pip_check: true
+      python_version: ${{ python_min }}.*
   - script:
-      - pip check
-      - python -c "import deeplabcut"
-      - python -c "import deeplabcut; deeplabcut.create_new_project"
-      - python -c "import numpy; print(numpy.__version__); assert numpy.__version__.split('.')[0] == '2'"
-      - python -c "import deeplabcut.pose_estimation_pytorch.data.augmentation as aug; print(sorted(aug.__all__))"
-      - python -c "import importlib.util as u; assert u.find_spec('albumentations') is None and u.find_spec('albucore') is None, 'albumentations must not be installed'"
-      - python -c "import numpy as np; from deeplabcut.pose_estimation_pytorch.data.transforms import build_transforms; t = build_transforms(dict(resize=dict(height=64, width=64, keep_ratio=True), normalize_images=True)); r = t(image=np.zeros((80, 50, 3), dtype=np.uint8), keypoints=[(10.0, 10.0)], class_labels=[0], bboxes=[(4.0, 6.0, 20.0, 25.0)], bbox_labels=[0]); assert r['image'].shape[:2] == (64, 64); assert np.allclose(r['keypoints'][0][:2], (8.0, 8.0)); assert np.allclose(r['bboxes'][0], (3.2, 4.8, 16.0, 20.0)); print('transforms ok', r['keypoints'], r['bboxes'])"
-      - python -c "import numpy as np; from deeplabcut.pose_estimation_pytorch.data.transforms import build_transforms; t = build_transforms(dict(affine=dict(p=0.5, rotation=30, scaling=[0.5, 1.25], translation=0), crop_sampling=dict(width=448, height=448, max_shift=0.1, method='hybrid'), gaussian_noise=12.75, motion_blur=True, normalize_images=True)); r = t(image=np.zeros((80, 50, 3), dtype=np.uint8), keypoints=[(10.0, 10.0, 2.0)], class_labels=[0], bboxes=[(4.0, 6.0, 20.0, 25.0)], bbox_labels=[0]); assert r['image'].shape[:2] == (448, 448); print('aug_default ok')"
-      - python -c "import pandas; print(pandas.__version__); assert pandas.__version__.split('.')[0] == '3'"
-      - python -c "from deeplabcut.refine_training_dataset.stitch import Tracklet"
-      - python -c "import deeplabcut.post_processing.filtering, deeplabcut.utils.make_labeled_video, deeplabcut.pose_estimation_3d.triangulation"
       - dlc --help
     requirements:
       run:
-        - pip
         - python ${{ python_min }}.*
-        - numpy >=2
-        - pandas >=3
         - opencv *headless*
 
 about:
