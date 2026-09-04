@@ -5,7 +5,7 @@ Feedstock license: [BSD-3-Clause](https://github.com/conda-forge/deeplabcut-feed
 
 Home: https://www.deeplabcut.org/
 
-Package license: LGPL-3.0-only
+Package license: LGPL-3.0-or-later
 
 Summary: DeepLabCut is a toolbox for markerless pose estimation of animals performing various tasks.
 
