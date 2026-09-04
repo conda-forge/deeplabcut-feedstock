@@ -73,6 +73,7 @@ requirements:
   run_constraints:
     - napari-deeplabcut >=0.2.1.6
     - qtpy >=2.0
+    - qdarkstyle >=3.1
     - tensorflow >=2.12
     - imgaug >=0.4
     - tensorpack >=0.11
@@ -89,13 +90,29 @@ tests:
         - deeplabcut.refine_training_dataset.stitch
         - deeplabcut.utils.make_labeled_video
       pip_check: true
-      python_version: ${{ python_min }}.*
+      python_version:
+        - ${{ python_min }}.*
+        - "*"
   - script:
       - dlc --help
     requirements:
       run:
         - python ${{ python_min }}.*
         - opencv *headless*
+  - script:
+      - python -c "import deeplabcut"
+      - python -c "import deeplabcut.gui.launch_script"
+    requirements:
+      run:
+        - opencv *headless*
+        - napari-deeplabcut >=0.2.1.6
+        - qtpy >=2.0
+        - qdarkstyle >=3.1
+        - pyside6
+        - tensorflow >=2.12
+        - imgaug >=0.4
+        - tensorpack >=0.11
+        - tf_slim >=1.1
 
 about:
   license: LGPL-3.0-or-later
