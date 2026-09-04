@@ -24,6 +24,7 @@ source:
     - patches/0007-Use-qtpy-instead-of-PySide6.patch
     - patches/0008-Add-outputs-required-for-multi-animal-model-export.patch
     - patches/0009-Loosen-dependency-bounds.patch
+    - patches/0010-Support-albumentations-1.4.15-via-a-compatibility-la.patch
 
 build:
   number: 0
@@ -40,7 +41,7 @@ requirements:
     - setuptools >=61
   run:
     - python >=${{ python_min }}
-    - albumentations >=1.4,<1.4.4
+    - albumentations >=1.4,<1.4.24
     - dlclibrary >=0.0.12
     - einops
     - filelock >=3.12
@@ -84,7 +85,7 @@ tests:
       - python -c "import deeplabcut"
       - python -c "import deeplabcut; deeplabcut.create_new_project"
       - python -c "import numpy; print(numpy.__version__); assert numpy.__version__.split('.')[0] == '2'"
-      - python -c "import albumentations as A; A.keypoint_scale"
+      - python -c "import albumentations as A; from packaging.version import Version; print(A.__version__); assert Version(A.__version__) >= Version('1.4.15')"
       - python -c "import numpy as np; from deeplabcut.pose_estimation_pytorch.data.transforms import build_transforms; t = build_transforms(dict(resize=dict(height=64, width=64, keep_ratio=True), normalize_images=True)); r = t(image=np.zeros((80, 50, 3), dtype=np.uint8), keypoints=[(10.0, 10.0)], class_labels=[0], bboxes=[], bbox_labels=[]); assert r['image'].shape[:2] == (64, 64); print('transforms ok', r['keypoints'])"
       - python -c "import pandas; print(pandas.__version__); assert pandas.__version__.split('.')[0] == '3'"
       - python -c "from deeplabcut.refine_training_dataset.stitch import Tracklet"
@@ -96,6 +97,7 @@ tests:
         - python ${{ python_min }}.*
         - numpy >=2
         - pandas >=3
+        - albumentations >=1.4.15
         - opencv *headless*
 
 about:

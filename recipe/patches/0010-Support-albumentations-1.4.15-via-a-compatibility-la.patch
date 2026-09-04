@@ -1,0 +1,554 @@
+From 7b0f82c57081b575692cd2c30449b3e20fc5742d Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Fri, 4 Sep 2026 14:23:09 -0400
+Subject: [PATCH] Support albumentations >= 1.4.15 via a compatibility layer
+
+albumentations 1.4.15 reworked the transform API: the per-item apply_to_bbox()
+and apply_to_keypoint() hooks were replaced by batched apply_to_bboxes() /
+apply_to_keypoints() taking NumPy arrays, `targets_as_params` together with
+get_params_dependent_on_targets() became get_params_dependent_on_data(), the
+public keypoint_scale() helper and ElasticTransform's alpha_affine argument were
+removed, PadIfNeeded.PositionType became a plain string, `always_apply` was
+dropped, and ToGray/CoarseDropout were re-signatured. DeepLabCut's transforms
+are written against the older API, so on anything newer they raise -- loudly,
+but they raise.
+
+Rather than pinning below the break, adapt the newer releases back to the old
+behaviour, gated on albumentations.__version__:
+
+* _keypoints_to_tuples() / _keypoints_from_tuples() / _bboxes_from_sequence()
+  translate between the legacy list-of-tuples payloads the transforms are
+  written for and the arrays newer albumentations passes.
+* KeepAspectRatioResize keeps its per-item hooks and gains batched ones, and
+  provides both get_params_dependent_on_targets() and
+  get_params_dependent_on_data(); keypoint_scale() becomes keypoints_scale().
+* KeypointAwareCrop translates its (h_start, w_start) sampling into the
+  crop_coords newer RandomCrop expects.
+* ElasticTransform reuses the displacement field newer albumentations already
+  sampled for the image (params["map_x"]/["map_y"]) to warp its keypoint
+  heatmaps, instead of re-deriving one through the removed
+  functional.elastic_transform(). This is strictly better: the keypoints are
+  now guaranteed to follow the same field as the image.
+* HFlip, CoarseDropout, Grayscale, ScaleToUnitRange and RandomBBoxTransform get
+  signature and payload-type adaptations.
+* PadIfNeeded is subclassed so that reflecting padding no longer mirrors
+  bounding boxes and keypoints into the padded region. Newer albumentations
+  does that by design, which turns one annotated instance into several; older
+  versions only translated them, and the data pipeline expects the latter.
+
+Verified by running the whole augmentation catalogue on albumentations 1.4.1
+and 1.4.20 and diffing: on 1.4.1 the layer is a no-op (byte-identical to
+before), and on 1.4.20 every deterministic augmentation now matches 1.4.1
+exactly. The four stochastic ones (affine, coarse dropout, elastic, gaussian
+noise) differ only in the random draw, as their RNG streams changed upstream;
+elastic keypoints were separately checked to track the warped image to
+sub-pixel accuracy on both versions.
+
+The cap is widened to `<2` rather than removed: albumentations 2.0 renames more
+parameters again (GaussNoise var_limit, the fill/value arguments), which this
+layer does not yet cover and which cannot currently be tested because
+albumentations 2.x does not import on conda-forge at all.
+---
+ .../data/transforms.py                        | 317 ++++++++++++++----
+ pyproject.toml                                |   2 +-
+ 2 files changed, 255 insertions(+), 64 deletions(-)
+
+diff --git a/deeplabcut/pose_estimation_pytorch/data/transforms.py b/deeplabcut/pose_estimation_pytorch/data/transforms.py
+index c17a789..496f5d2 100644
+--- a/deeplabcut/pose_estimation_pytorch/data/transforms.py
++++ b/deeplabcut/pose_estimation_pytorch/data/transforms.py
+@@ -17,11 +17,97 @@ from typing import Any
+ import albumentations as A
+ import cv2
+ import numpy as np
+-from albumentations.augmentations.geometric import functional as F
+ from numpy.typing import NDArray
++from packaging.version import Version
+ from scipy.spatial.distance import pdist, squareform
+ from scipy.stats import truncnorm
+ 
++# albumentations 1.4.15 reworked the transform API: the per-item apply_to_bbox()
++# and apply_to_keypoint() hooks were replaced by batched apply_to_bboxes() and
++# apply_to_keypoints() taking NumPy arrays, ``targets_as_params`` together with
++# get_params_dependent_on_targets() became get_params_dependent_on_data(), and a
++# number of transform signatures were renamed. The transforms below are written
++# against the older API; every branch guarded by this flag adapts a newer
++# albumentations back to it, so augmentation results do not depend on which
++# version happens to be installed.
++_ALBUMENTATIONS_BATCHED_TARGETS = Version(A.__version__) >= Version("1.4.15")
++
++if _ALBUMENTATIONS_BATCHED_TARGETS:
++    _PAD_POSITION_TOP_LEFT = "top_left"
++else:
++    from albumentations.augmentations.geometric import functional as F
++
++    _PAD_POSITION_TOP_LEFT = A.PadIfNeeded.PositionType.TOP_LEFT
++
++
++def _keypoints_to_tuples(keypoints: Any) -> list[tuple]:
++    """Return keypoints as the list of tuples albumentations < 1.4.15 passed around."""
++    if not _ALBUMENTATIONS_BATCHED_TARGETS:
++        return list(keypoints)
++    return [tuple(row) for row in np.asarray(keypoints, dtype=float)]
++
++
++def _keypoints_from_tuples(keypoints: Sequence, template: Any) -> Any:
++    """Return keypoints in the layout the installed albumentations expects.
++
++    ``template`` is the value originally handed to the transform; it is only used to
++    recover the number of columns when ``keypoints`` is empty.
++    """
++    if not _ALBUMENTATIONS_BATCHED_TARGETS:
++        return keypoints
++    if len(keypoints):
++        return np.asarray([tuple(kp) for kp in keypoints], dtype=float)
++    template = np.asarray(template, dtype=float)
++    n_cols = template.shape[1] if template.ndim == 2 else 4
++    return np.zeros((0, n_cols), dtype=float)
++
++
++def _bboxes_from_sequence(bboxes: Sequence, template: Any) -> Any:
++    """Return bounding boxes in the layout the installed albumentations expects."""
++    if not _ALBUMENTATIONS_BATCHED_TARGETS:
++        return bboxes
++    if len(bboxes):
++        return np.asarray([tuple(bbox) for bbox in bboxes], dtype=float)
++    template = np.asarray(template, dtype=float)
++    n_cols = template.shape[1] if template.ndim == 2 else 4
++    return np.zeros((0, n_cols), dtype=float)
++
++
++def _target_shape(params: dict[str, Any]) -> tuple[int, int]:
++    """Return the (rows, cols) of the target being transformed."""
++    if _ALBUMENTATIONS_BATCHED_TARGETS:
++        return params["shape"][:2]
++    return params["rows"], params["cols"]
++
++
++if _ALBUMENTATIONS_BATCHED_TARGETS:
++
++    class PadIfNeeded(A.PadIfNeeded):
++        """PadIfNeeded that translates annotations rather than mirroring them.
++
++        With a reflecting border mode, albumentations >= 1.4.15 also reflects
++        bounding boxes and keypoints into the padded region, turning one annotated
++        instance into several. Earlier versions only shifted them by the padding
++        offset. Pad the annotations as if the border were constant so that only the
++        image content is reflected.
++        """
++
++        def _pad_targets(self, method, target, kwargs):
++            border_mode, self.border_mode = self.border_mode, cv2.BORDER_CONSTANT
++            try:
++                return method(target, **kwargs)
++            finally:
++                self.border_mode = border_mode
++
++        def apply_to_bboxes(self, bboxes, **params):
++            return self._pad_targets(super().apply_to_bboxes, bboxes, params)
++
++        def apply_to_keypoints(self, keypoints, **params):
++            return self._pad_targets(super().apply_to_keypoints, keypoints, params)
++
++else:
++    PadIfNeeded = A.PadIfNeeded
++
+ 
+ def build_transforms(augmentations: dict) -> A.BaseCompose:
+     transforms = []
+@@ -88,11 +174,12 @@ def build_transforms(augmentations: dict) -> A.BaseCompose:
+ 
+     if crop_sampling := augmentations.get("crop_sampling"):
+         transforms.append(
+-            A.PadIfNeeded(
++            PadIfNeeded(
+                 min_height=crop_sampling["height"],
+                 min_width=crop_sampling["width"],
+                 border_mode=cv2.BORDER_CONSTANT,
+-                always_apply=True,
++                value=0,
++                p=1.0,
+             )
+         )
+         transforms.append(
+@@ -162,7 +249,7 @@ def build_auto_padding(
+     border_mode: str = "reflect_101",  # TODO: Which default to set?
+     border_value: float | None = None,
+     border_mask_value: float | None = None,
+-) -> A.PadIfNeeded:
++) -> PadIfNeeded:
+     """Create an albumentations PadIfNeeded transform from a config.
+ 
+     Args:
+@@ -191,7 +278,7 @@ def build_auto_padding(
+             f"Unknown border mode for auto_padding: {border_mode} (valid values are: {border_modes.keys()})"
+         )
+ 
+-    return A.PadIfNeeded(
++    return PadIfNeeded(
+         min_height=min_height,
+         min_width=min_width,
+         pad_height_divisor=pad_height_divisor,
+@@ -210,11 +297,12 @@ def build_resize_transforms(resize_cfg: dict) -> list[A.BasicTransform]:
+     if resize_cfg.get("keep_ratio", True):
+         transforms.append(KeepAspectRatioResize(width=width, height=height, mode="pad"))
+         transforms.append(
+-            A.PadIfNeeded(
++            PadIfNeeded(
+                 min_height=height,
+                 min_width=width,
+                 border_mode=cv2.BORDER_CONSTANT,
+-                position=A.PadIfNeeded.PositionType.TOP_LEFT,
++                value=0,
++                position=_PAD_POSITION_TOP_LEFT,
+             )
+         )
+     else:
+@@ -233,7 +321,11 @@ class HFlip(A.HorizontalFlip):
+             self._symmetries[j] = i
+ 
+     def apply_to_keypoints(self, keypoints, **params):
+-        swapped_keypoints = [keypoints[self._symmetries.get(kpt_idx, kpt_idx)] for kpt_idx in range(len(keypoints))]
++        order = [self._symmetries.get(kpt_idx, kpt_idx) for kpt_idx in range(len(keypoints))]
++        if _ALBUMENTATIONS_BATCHED_TARGETS and len(order):
++            swapped_keypoints = np.asarray(keypoints, dtype=float)[order]
++        else:
++            swapped_keypoints = [keypoints[idx] for idx in order]
+         return super().apply_to_keypoints(swapped_keypoints, **params)
+ 
+ 
+@@ -259,7 +351,7 @@ class KeypointAwareCrop(A.RandomCrop):
+         max_shift: float = 0.4,
+         crop_sampling: str = "hybrid",
+     ):
+-        super().__init__(height, width, always_apply=True)
++        super().__init__(height=height, width=width, p=1.0)
+         # Clamp to 40% of crop size to ensure that at least
+         # the center keypoint remains visible after the offset is applied.
+         self.max_shift = max(0.0, min(max_shift, 0.4))
+@@ -314,21 +406,36 @@ class KeypointAwareCrop(A.RandomCrop):
+             center = np.clip(center, 0, np.nextafter(1, 0))  # Clip to 1 exclusive
+         return {"h_start": center[1], "w_start": center[0]}
+ 
++    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
++        from albumentations.augmentations.crops import functional as crops_functional
++
++        start = self.get_params_dependent_on_targets(
++            {"image": data["image"], "keypoints": data.get("keypoints", [])}
++        )
++        return {
++            "crop_coords": crops_functional.get_crop_coords(
++                params["shape"][:2],
++                (self.height, self.width),
++                start["h_start"],
++                start["w_start"],
++            )
++        }
++
+     def apply_to_keypoints(
+         self,
+         keypoints,
+         **params,
+     ) -> list[tuple[float]]:
+-        keypoints = super().apply_to_keypoints(keypoints, **params)
++        cropped = super().apply_to_keypoints(keypoints, **params)
+         new_keypoints = []
+-        for kp in keypoints:
++        for kp in _keypoints_to_tuples(cropped):
+             x, y = kp[:2]
+             if not (0 <= x < self.width and 0 <= y < self.height):
+                 kp = list(kp)
+                 kp[:2] = np.nan, np.nan
+                 kp = tuple(kp)
+             new_keypoints.append(kp)
+-        return new_keypoints
++        return _keypoints_from_tuples(new_keypoints, cropped)
+ 
+     def get_transform_init_args_names(self) -> tuple[str, ...]:
+         return "width", "height", "max_shift", "crop_sampling"
+@@ -368,22 +475,38 @@ class KeepAspectRatioResize(A.DualTransform):
+         # Bounding box coordinates are scale invariant
+         return bbox
+ 
++    def apply_to_bboxes(self, bboxes, **params):
++        # Bounding box coordinates are scale invariant
++        return bboxes
++
+     def apply_to_keypoint(self, keypoint, scale=0, **params):
+         keypoint = A.keypoint_scale(keypoint, scale, scale)
+         return keypoint
+ 
++    def apply_to_keypoints(self, keypoints, scale=0, **params):
++        if not _ALBUMENTATIONS_BATCHED_TARGETS:
++            return super().apply_to_keypoints(keypoints, scale=scale, **params)
++
++        from albumentations.augmentations.geometric import functional as geometric_functional
++
++        return geometric_functional.keypoints_scale(np.asarray(keypoints, dtype=float), scale, scale)
++
+     @property
+     def targets_as_params(self) -> list[str]:
+         return ["image"]
+ 
++    def _scale_for(self, height: int, width: int) -> float:
++        if self.mode == "pad":
++            return min(self.height / height, self.width / width)
++        return max(self.height / height, self.width / width)
++
+     def get_params_dependent_on_targets(self, params: dict[str, Any]) -> dict[str, Any]:
+         h, w, _ = params["image"].shape
+-        if self.mode == "pad":
+-            scale = min(self.height / h, self.width / w)
+-        else:
+-            scale = max(self.height / h, self.width / w)
++        return {"scale": self._scale_for(h, w)}
+ 
+-        return {"scale": scale}
++    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
++        h, w = params["shape"][:2]
++        return {"scale": self._scale_for(h, w)}
+ 
+     def get_transform_init_args_names(self):
+         return "height", "width", "mode", "interpolation"
+@@ -408,7 +531,10 @@ class Grayscale(A.ToGray):
+             * If a tuple ``(a, b)``, a random value from the range
+               ``a <= x <= b`` will be sampled per image.
+         """
+-        super().__init__(always_apply, p)
++        if _ALBUMENTATIONS_BATCHED_TARGETS:
++            super().__init__(p=1.0 if always_apply else p)
++        else:
++            super().__init__(always_apply, p)
+         if isinstance(alpha, (float, int)):
+             self._alpha = self._validate_alpha(alpha)
+         elif isinstance(alpha, tuple):
+@@ -452,43 +578,95 @@ class ElasticTransform(A.ElasticTransform):
+         same_dxdy: bool = True,  # Here too
+         p: float = 0.5,
+     ):
+-        super().__init__(
+-            alpha,
+-            sigma,
+-            alpha_affine,
+-            interpolation,
+-            border_mode,
+-            value,
+-            mask_value,
+-            always_apply,
+-            approximate,
+-            same_dxdy,
+-            p,
+-        )
++        if _ALBUMENTATIONS_BATCHED_TARGETS:
++            # alpha_affine is gone; DeepLabCut only ever passes 0.0, which disabled
++            # the affine step that newer albumentations no longer performs at all.
++            if alpha_affine:
++                raise ValueError(
++                    f"alpha_affine={alpha_affine} is not supported with albumentations "
++                    f"{A.__version__}; it was removed in albumentations 1.4.15."
++                )
++            super().__init__(
++                alpha=alpha,
++                sigma=sigma,
++                interpolation=interpolation,
++                border_mode=border_mode,
++                value=value,
++                mask_value=mask_value,
++                approximate=approximate,
++                same_dxdy=same_dxdy,
++                p=1.0 if always_apply else p,
++            )
++        else:
++            super().__init__(
++                alpha,
++                sigma,
++                alpha_affine,
++                interpolation,
++                border_mode,
++                value,
++                mask_value,
++                always_apply,
++                approximate,
++                same_dxdy,
++                p,
++            )
++        self.alpha_affine = alpha_affine
+         self._neighbor_dist = 3
+         self._neighbor_dist_square = self._neighbor_dist**2
+ 
++    @staticmethod
++    def _remap_heatmaps(heatmaps: NDArray, map_x: NDArray, map_y: NDArray, border_mode: int, border_value) -> NDArray:
++        """Apply an albumentations displacement field to a stack of heatmaps.
++
++        cv2.remap handles at most four channels at a time, and there is one heatmap
++        per keypoint, so the stack is remapped in chunks.
++        """
++        out = np.empty_like(heatmaps)
++        for start in range(0, heatmaps.shape[2], 4):
++            chunk = heatmaps[:, :, start : start + 4]
++            remapped = cv2.remap(
++                chunk,
++                map_x,
++                map_y,
++                interpolation=cv2.INTER_NEAREST,
++                borderMode=border_mode,
++                borderValue=0 if border_value is None else border_value,
++            )
++            out[:, :, start : start + 4] = remapped.reshape(chunk.shape)
++        return out
++
+     def apply_to_keypoints(self, keypoints: Sequence[float], random_state: int | None = None, **params) -> list[float]:
+-        heatmaps = np.zeros((params["rows"], params["cols"], len(keypoints)), dtype=np.float32)
+-        grid = np.mgrid[: params["rows"], : params["cols"]].transpose((1, 2, 0))
++        original_keypoints = keypoints
++        keypoints = _keypoints_to_tuples(keypoints)
++        rows, cols = _target_shape(params)
++        heatmaps = np.zeros((rows, cols, len(keypoints)), dtype=np.float32)
++        grid = np.mgrid[:rows, :cols].transpose((1, 2, 0))
+         kpts = np.array([(k[1], k[0]) for k in keypoints])
+         valid_kpts = np.all(kpts > 0.0, axis=1)
+         dist = ((grid - kpts[:, None, None]) ** 2).sum(axis=3)
+         mask = (dist <= self._neighbor_dist_square) & valid_kpts[:, None, None]
+         heatmaps[mask.transpose(1, 2, 0)] = 1
+ 
+-        heatmaps_aug = F.elastic_transform(
+-            heatmaps,
+-            self.alpha,
+-            self.sigma,
+-            self.alpha_affine,
+-            cv2.INTER_NEAREST,
+-            self.border_mode,
+-            self.mask_value,
+-            np.random.RandomState(random_state),
+-            self.approximate,
+-            self.same_dxdy,
+-        )
++        if _ALBUMENTATIONS_BATCHED_TARGETS:
++            # Newer albumentations samples the displacement field once per call and
++            # hands it to every target, so reuse the very field applied to the image.
++            heatmaps_aug = self._remap_heatmaps(
++                heatmaps, params["map_x"], params["map_y"], self.border_mode, self.mask_value
++            )
++        else:
++            heatmaps_aug = F.elastic_transform(
++                heatmaps,
++                self.alpha,
++                self.sigma,
++                self.alpha_affine,
++                cv2.INTER_NEAREST,
++                self.border_mode,
++                self.mask_value,
++                np.random.RandomState(random_state),
++                self.approximate,
++                self.same_dxdy,
++            )
+ 
+         inds = np.indices(heatmaps_aug.shape[:2])[::-1]
+         mask = np.transpose(heatmaps_aug == 1, (2, 0, 1))
+@@ -501,7 +679,7 @@ class ElasticTransform(A.ElasticTransform):
+             kp = list(kp)
+             kp[:2] = new_coords
+             new_keypoints.append(tuple(kp))
+-        return new_keypoints
++        return _keypoints_from_tuples(new_keypoints, original_keypoints)
+ 
+ 
+ class CoarseDropout(A.CoarseDropout):
+@@ -518,21 +696,31 @@ class CoarseDropout(A.CoarseDropout):
+         always_apply: bool = False,
+         p: float = 0.5,
+     ):
+-        super().__init__(
+-            max_holes,
+-            max_height,
+-            max_width,
+-            min_holes,
+-            min_height,
+-            min_width,
+-            fill_value,
+-            mask_fill_value,
+-            always_apply,
+-            p,
++        kwargs = dict(
++            max_holes=max_holes,
++            max_height=max_height,
++            max_width=max_width,
++            min_holes=min_holes,
++            min_height=min_height,
++            min_width=min_width,
++            fill_value=fill_value,
++            mask_fill_value=mask_fill_value,
++            p=p,
+         )
++        if _ALBUMENTATIONS_BATCHED_TARGETS:
++            # The deprecated max_/min_ names are still honoured and are translated
++            # onto num_holes_range/hole_height_range/hole_width_range internally.
++            with warnings.catch_warnings():
++                warnings.simplefilter("ignore", DeprecationWarning)
++                if always_apply:
++                    kwargs["p"] = 1.0
++                super().__init__(**kwargs)
++        else:
++            super().__init__(always_apply=always_apply, **kwargs)
+ 
+     def apply_to_bboxes(self, bboxes: Sequence[float], **params) -> list[float]:
+-        return list(bboxes)
++        # Dropout holes must not remove annotations
++        return bboxes
+ 
+     def apply_to_keypoints(
+         self,
+@@ -541,7 +729,7 @@ class CoarseDropout(A.CoarseDropout):
+         **params,
+     ) -> list[float]:
+         new_keypoints = []
+-        for kp in keypoints:
++        for kp in _keypoints_to_tuples(keypoints):
+             in_hole = False
+             for hole in holes:
+                 if self._keypoint_in_hole(kp, hole):
+@@ -552,7 +740,7 @@ class CoarseDropout(A.CoarseDropout):
+                 kp[:2] = np.nan, np.nan
+                 kp = tuple(kp)
+             new_keypoints.append(kp)
+-        return new_keypoints
++        return _keypoints_from_tuples(new_keypoints, keypoints)
+ 
+     def _keypoint_in_hole(self, keypoint, hole: tuple[int, int, int, int]) -> bool:
+         """Reimplemented from Albumentations as was removed in v1.4.0."""
+@@ -640,8 +828,8 @@ class RandomBBoxTransform(A.DualTransform):
+         # add the extra information back; tuples for albumentations<=1.4.3
+         bboxes_out = [tuple(bbox) for bbox in bbox_xyxy]
+         if bboxes_extra is not None:
+-            bboxes_out = [bbox + extra for bbox, extra in zip(bboxes_out, bboxes_extra, strict=False)]
+-        return bboxes_out
++            bboxes_out = [tuple(bbox) + tuple(extra) for bbox, extra in zip(bboxes_out, bboxes_extra, strict=False)]
++        return _bboxes_from_sequence(bboxes_out, bboxes)
+ 
+     def get_transform_init_args_names(self):
+         return "shift_factor", "shift_prob", "scale_factor", "scale_prob", "sampling"
+@@ -663,7 +851,10 @@ class RandomBBoxTransform(A.DualTransform):
+ 
+ class ScaleToUnitRange(A.ImageOnlyTransform):
+     def __init__(self, always_apply=True, p=1.0):
+-        super().__init__(always_apply=always_apply, p=p)
++        if _ALBUMENTATIONS_BATCHED_TARGETS:
++            super().__init__(p=1.0 if always_apply else p)
++        else:
++            super().__init__(always_apply=always_apply, p=p)
+ 
+     def apply(self, img, **params):
+         return img.astype(np.float32) / 255.0
+diff --git a/pyproject.toml b/pyproject.toml
+index 598a7cf..d015229 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -29,7 +29,7 @@ classifiers = [
+   "Topic :: Scientific/Engineering :: Image Processing",
+ ]
+ dependencies = [
+-  "albumentations<=1.4.3",
++  "albumentations>=1.4,<2",
+   "dlclibrary>=0.0.12",
+   "einops",
+   "filelock>=3.12",
