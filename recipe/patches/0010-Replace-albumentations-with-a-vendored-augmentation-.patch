@@ -1,4 +1,4 @@
-From dbff982a9ba230456d0180ea7fec65a0242fab88 Mon Sep 17 00:00:00 2001
+From 4d07c9b0eb4b8152427b9fc8bce5e1686d0296f6 Mon Sep 17 00:00:00 2001
 From: Mark Harfouche <mark.harfouche@gmail.com>
 Date: Fri, 4 Sep 2026 14:48:06 -0400
 Subject: [PATCH] Replace albumentations with a vendored augmentation module
@@ -13,17 +13,20 @@ silently accepts the removed keyword arguments and then ignores them, so a
 version bump can change the augmentation actually applied without any error.
 
 Replace the dependency with deeplabcut/pose_estimation_pytorch/data/augmentation.py,
-which implements just what DeepLabCut uses, with conventions chosen to be
-explicit rather than clever:
+implementing just what DeepLabCut uses, with conventions chosen to be explicit
+rather than clever:
 
 * images are (H, W, C); keypoints are (N, C) arrays whose first two columns are
   x and y, with any further columns carried through untouched and no keypoint
-  ever dropped; bounding boxes are (M, 4), exchanged with Compose in COCO layout
-  and held internally as absolute corners;
+  ever dropped; bounding boxes are exchanged in COCO layout and held internally
+  as absolute corners. Labels may be given through label_fields or appended to
+  each box;
 * every transform samples from an explicit numpy Generator, so a pipeline can be
   made reproducible by passing a seed to Compose;
 * transforms expose the parameters they sampled, so annotations are always moved
-  by exactly the geometry applied to the image.
+  by exactly the geometry applied to the image;
+* a transform can be called on its own with keyword targets, exactly as inside a
+  Compose, and returns the same dictionary.
 
 Provided: Compose, KeypointParams, BboxParams and the BasicTransform /
 DualTransform / ImageOnlyTransform bases, plus HorizontalFlip, Resize,
@@ -47,6 +50,16 @@ bounding boxes:
   vendored implementation places keypoints within 0.2 px of where the pixels
   actually went, against 0.5-1.1 px for albumentations.
 
+DeepLabCut's own test suite was also run against this module. The augmentation
+tests live in the repository rather than the sdist; pointing the three that do
+`import albumentations as A` at this module instead, the whole suite passes
+(3335 passed), with the only remaining failures needing the examples/ demo
+project that the conda package does not ship. Those tests are what pinned down
+the public surface here: transforms callable on their own, CoarseDropout keeping
+its max_/min_ parameter names, Grayscale keeping its `alpha` property, keypoints
+returned as a list of tuples, label_fields being required once declared, and
+OpenCV's habit of dropping a trailing singleton channel axis.
+
 Behavioural notes:
 
 * PadIfNeeded translates annotations and never mirrors them into a reflected
@@ -65,14 +78,14 @@ value (default_augmenter) so existing projects keep loading.
  .../pose_estimation_pytorch/apis/training.py  |   6 +-
  .../pose_estimation_pytorch/apis/utils.py     |  14 +-
  .../pose_estimation_pytorch/apis/videos.py    |   4 +-
- .../data/augmentation.py                      | 819 ++++++++++++++++++
+ .../data/augmentation.py                      | 898 ++++++++++++++++++
  .../pose_estimation_pytorch/data/base.py      |   4 +-
  .../pose_estimation_pytorch/data/dataset.py   |   4 +-
  .../data/preprocessor.py                      |  10 +-
- .../data/transforms.py                        | 468 +++++-----
+ .../data/transforms.py                        | 452 ++++-----
  .../pose_estimation_pytorch/data/utils.py     |   6 +-
  pyproject.toml                                |   1 -
- 11 files changed, 1061 insertions(+), 281 deletions(-)
+ 11 files changed, 1135 insertions(+), 270 deletions(-)
  create mode 100644 deeplabcut/pose_estimation_pytorch/data/augmentation.py
 
 diff --git a/deeplabcut/pose_estimation_pytorch/apis/evaluation.py b/deeplabcut/pose_estimation_pytorch/apis/evaluation.py
@@ -244,10 +257,10 @@ index 019103d..c6ba01d 100644
      animal_names: list[str] | None = None,
 diff --git a/deeplabcut/pose_estimation_pytorch/data/augmentation.py b/deeplabcut/pose_estimation_pytorch/data/augmentation.py
 new file mode 100644
-index 0000000..0a9dbd7
+index 0000000..4da17aa
 --- /dev/null
 +++ b/deeplabcut/pose_estimation_pytorch/data/augmentation.py
-@@ -0,0 +1,819 @@
+@@ -0,0 +1,898 @@
 +#
 +# DeepLabCut Toolbox (deeplabcut.org)
 +# © A. & M.W. Mathis Labs
@@ -357,6 +370,18 @@ index 0000000..0a9dbd7
 +    return bboxes
 +
 +
++def _keypoints_out(keypoints: NDArray) -> list[tuple]:
++    """Return keypoints as a list of tuples, the layout callers already expect."""
++    return [tuple(row) for row in np.asarray(keypoints, dtype=float)]
++
++
++def _match_channels(result: NDArray, reference: NDArray) -> NDArray:
++    """Restore a trailing singleton channel axis, which OpenCV drops."""
++    if reference.ndim == 3 and result.ndim == 2:
++        return result[:, :, None]
++    return result
++
++
 +def _as_keypoints(keypoints: Any) -> NDArray:
 +    keypoints = np.asarray(keypoints, dtype=float)
 +    if keypoints.size == 0:
@@ -364,11 +389,27 @@ index 0000000..0a9dbd7
 +    return keypoints.reshape(len(keypoints), -1)
 +
 +
-+def _as_bboxes(bboxes: Any) -> NDArray:
-+    bboxes = np.asarray(bboxes, dtype=float)
-+    if bboxes.size == 0:
++def _split_bboxes(bboxes: Any) -> tuple[NDArray, list[tuple]]:
++    """Split boxes into their four coordinates and any trailing label values.
++
++    Labels may be supplied either through ``label_fields`` or appended to each box,
++    in which case they can be of any type and are carried through untouched.
++    """
++    rows = [] if bboxes is None else list(bboxes)
++    if len(rows) == 0:
++        return np.zeros((0, 4), dtype=float), []
++    coords = np.asarray([[float(value) for value in row[:4]] for row in rows], dtype=float)
++    tails = [tuple(row[4:]) for row in rows]
++    return coords, tails
++
++
++def _join_bboxes(bboxes: NDArray, tails: Sequence[tuple]) -> Any:
++    """Re-attach trailing label values to boxes."""
++    if not len(bboxes):
 +        return np.zeros((0, 4), dtype=float)
-+    return bboxes.reshape(len(bboxes), -1)[:, :4]
++    if not any(tails):
++        return bboxes
++    return [tuple(box) + tuple(tail) for box, tail in zip(bboxes, tails)]
 +
 +
 +class BasicTransform:
@@ -396,13 +437,14 @@ index 0000000..0a9dbd7
 +    def apply_to_bboxes(self, bboxes: NDArray, **params: Any) -> NDArray:
 +        return bboxes
 +
-+    def __call__(
++    def apply_all(
 +        self,
 +        image: NDArray,
 +        keypoints: NDArray,
 +        bboxes: NDArray,
 +        rng: np.random.Generator,
 +    ) -> tuple[NDArray, NDArray, NDArray]:
++        """Apply the transform to every target, or to none of them."""
 +        if self.p < 1.0 and rng.random() >= self.p:
 +            return image, keypoints, bboxes
 +        params = self.get_params(image, keypoints, bboxes, rng)
@@ -411,6 +453,34 @@ index 0000000..0a9dbd7
 +            self.apply_to_keypoints(keypoints, **params),
 +            self.apply_to_bboxes(bboxes, **params),
 +        )
++
++    def __call__(
++        self,
++        image: NDArray,
++        keypoints: Any = None,
++        bboxes: Any = None,
++        rng: np.random.Generator | None = None,
++        **extra: Any,
++    ) -> dict[str, Any]:
++        """Apply the transform to a single sample given as keyword targets.
++
++        Bounding boxes are taken and returned in COCO layout, as for
++        :class:`Compose`. Any further keyword arguments are passed through
++        untouched, so label fields survive a bare transform call.
++        """
++        rng = np.random.default_rng() if rng is None else rng
++        kpts = _as_keypoints([] if keypoints is None else keypoints)
++        boxes_coco, tails = _split_bboxes(bboxes)
++        boxes = coco_to_corners(boxes_coco) if len(boxes_coco) else np.zeros((0, 4), dtype=float)
++
++        image, kpts, boxes = self.apply_all(image, kpts, boxes, rng)
++
++        result = dict(extra)
++        result["image"] = image
++        result["keypoints"] = _keypoints_out(kpts)
++        boxes = np.asarray(boxes, dtype=float)
++        result["bboxes"] = _join_bboxes(corners_to_coco(boxes) if len(boxes) else boxes, tails)
++        return result
 +
 +
 +class ImageOnlyTransform(BasicTransform):
@@ -514,9 +584,17 @@ index 0000000..0a9dbd7
 +    def __call__(self, image: NDArray, **data: Any) -> dict[str, Any]:
 +        rng = np.random.default_rng(self.seed) if self.seed is not None else np.random.default_rng()
 +
++        for params in (self.keypoint_params, self.bbox_params):
++            for field in getattr(params, "label_fields", []):
++                if field not in data:
++                    raise ValueError(
++                        f"{field!r} is declared in label_fields, so it must be passed to the "
++                        f"pipeline alongside the targets it labels."
++                    )
++
 +        image = np.asarray(image)
 +        keypoints = _as_keypoints(data.get("keypoints", []))
-+        bboxes_coco = _as_bboxes(data.get("bboxes", []))
++        bboxes_coco, tails = _split_bboxes(data.get("bboxes", []))
 +        bboxes = coco_to_corners(bboxes_coco) if len(bboxes_coco) else np.zeros((0, 4), dtype=float)
 +
 +        labels = {}
@@ -525,13 +603,13 @@ index 0000000..0a9dbd7
 +                labels[field] = list(data.get(field, []))
 +
 +        for transform in self.transforms:
-+            image, keypoints, bboxes = transform(image, keypoints, bboxes, rng)
++            image, keypoints, bboxes = transform.apply_all(image, keypoints, bboxes, rng)
 +            keypoints = _as_keypoints(keypoints)
 +            bboxes = np.asarray(bboxes, dtype=float).reshape(-1, 4) if len(bboxes) else np.zeros((0, 4), dtype=float)
 +
 +        result = dict(data)
 +        result["image"] = image
-+        result["keypoints"] = keypoints
++        result["keypoints"] = _keypoints_out(keypoints)
 +
 +        if len(bboxes):
 +            height, width = image.shape[:2]
@@ -541,10 +619,11 @@ index 0000000..0a9dbd7
 +            areas = (clipped[:, 2] - clipped[:, 0]) * (clipped[:, 3] - clipped[:, 1])
 +            keep = areas > self.bbox_params.min_area if self.bbox_params else areas > 0
 +            bboxes = clipped[keep]
++            tails = [tail for tail, keep_it in zip(tails, keep) if keep_it]
 +            for field, values in labels.items():
 +                labels[field] = [value for value, keep_it in zip(values, keep) if keep_it]
 +
-+        result["bboxes"] = corners_to_coco(bboxes) if len(bboxes) else np.zeros((0, 4), dtype=float)
++        result["bboxes"] = _join_bboxes(corners_to_coco(bboxes) if len(bboxes) else bboxes, tails)
 +        result.update(labels)
 +        return result
 +
@@ -591,7 +670,7 @@ index 0000000..0a9dbd7
 +        return {"scale_x": self.width / w, "scale_y": self.height / h}
 +
 +    def apply(self, image: NDArray, **params: Any) -> NDArray:
-+        return cv2.resize(image, (self.width, self.height), interpolation=self.interpolation)
++        return _match_channels(cv2.resize(image, (self.width, self.height), interpolation=self.interpolation), image)
 +
 +    def apply_to_keypoints(self, keypoints: NDArray, scale_x: float = 1.0, scale_y: float = 1.0, **params: Any) -> NDArray:
 +        return keypoints_scale(keypoints, scale_x, scale_y)
@@ -618,7 +697,8 @@ index 0000000..0a9dbd7
 +        h, w = image.shape[:2]
 +        # round() rather than int(): matches the sizing used by the reference
 +        # implementation this replaces, and keeps the longest side exactly max_size.
-+        return cv2.resize(image, (int(round(w * scale)), int(round(h * scale))), interpolation=self.interpolation)
++        resized = cv2.resize(image, (int(round(w * scale)), int(round(h * scale))), interpolation=self.interpolation)
++        return _match_channels(resized, image)
 +
 +    def apply_to_keypoints(self, keypoints: NDArray, scale: float = 1.0, **params: Any) -> NDArray:
 +        return keypoints_scale(keypoints, scale, scale)
@@ -699,10 +779,11 @@ index 0000000..0a9dbd7
 +        value = self.value
 +        if self.border_mode == cv2.BORDER_CONSTANT and value is None:
 +            value = 0
-+        return cv2.copyMakeBorder(
++        padded = cv2.copyMakeBorder(
 +            image, pad_top, pad_bottom, pad_left, pad_right, self.border_mode,
 +            value=value if self.border_mode == cv2.BORDER_CONSTANT else None,
 +        )
++        return _match_channels(padded, image)
 +
 +    def apply_to_keypoints(self, keypoints: NDArray, pad_top: int = 0, pad_left: int = 0, **params: Any) -> NDArray:
 +        keypoints = keypoints.copy()
@@ -794,10 +875,11 @@ index 0000000..0a9dbd7
 +
 +    def apply(self, image: NDArray, matrix: NDArray | None = None, shape: tuple[int, int] = (0, 0), **params: Any) -> NDArray:
 +        h, w = shape
-+        return cv2.warpAffine(
++        warped = cv2.warpAffine(
 +            image, matrix, (w, h), flags=self.interpolation,
 +            borderMode=self.border_mode, borderValue=self.value,
 +        )
++        return _match_channels(warped, image)
 +
 +    @staticmethod
 +    def _transform_points(points: NDArray, matrix: NDArray) -> NDArray:
@@ -912,7 +994,7 @@ index 0000000..0a9dbd7
 +        return {"kernel": kernel / total}
 +
 +    def apply(self, image: NDArray, kernel: NDArray | None = None, **params: Any) -> NDArray:
-+        return cv2.filter2D(image, ddepth=-1, kernel=kernel)
++        return _match_channels(cv2.filter2D(image, ddepth=-1, kernel=kernel), image)
 +
 +
 +class GaussNoise(ImageOnlyTransform):
@@ -996,10 +1078,11 @@ index 0000000..0a9dbd7
 +        return {"map_x": np.float32(x + dx), "map_y": np.float32(y + dy)}
 +
 +    def apply(self, image: NDArray, map_x: NDArray | None = None, map_y: NDArray | None = None, **params: Any) -> NDArray:
-+        return cv2.remap(
++        remapped = cv2.remap(
 +            image, map_x, map_y, interpolation=self.interpolation,
 +            borderMode=self.border_mode, borderValue=self.value,
 +        )
++        return _match_channels(remapped, image)
 +
 +    def apply_to_keypoints(self, keypoints: NDArray, map_x: NDArray | None = None, map_y: NDArray | None = None, **params: Any) -> NDArray:
 +        """Move keypoints by inverting the displacement field at their location.
@@ -1028,21 +1111,30 @@ index 0000000..0a9dbd7
 +
 +    def __init__(
 +        self,
-+        num_holes_range: tuple[int, int] = (1, 1),
-+        hole_height_range: tuple[int, int] = (8, 8),
-+        hole_width_range: tuple[int, int] = (8, 8),
++        max_holes: int = 8,
++        max_height: int | float = 8,
++        max_width: int | float = 8,
++        min_holes: int | None = None,
++        min_height: int | float | None = None,
++        min_width: int | float | None = None,
 +        fill_value: float | Sequence[float] = 0,
 +        p: float = 0.5,
 +    ) -> None:
++        """Sizes given as floats are fractions of the image, as integers they are pixels.
++
++        A missing minimum means "the same as the maximum".
++        """
 +        super().__init__(p=p)
-+        self.num_holes_range = num_holes_range
-+        self.hole_height_range = hole_height_range
-+        self.hole_width_range = hole_width_range
++        self.max_holes = max_holes
++        self.max_height = max_height
++        self.max_width = max_width
++        self.min_holes = max_holes if min_holes is None else min_holes
++        self.min_height = max_height if min_height is None else min_height
++        self.min_width = max_width if min_width is None else min_width
 +        self.fill_value = fill_value
 +
 +    @staticmethod
-+    def _size(bounds: tuple[int, int], extent: int, rng: np.random.Generator) -> int:
-+        low, high = bounds
++    def _size(low: int | float, high: int | float, extent: int, rng: np.random.Generator) -> int:
 +        if isinstance(low, float) or isinstance(high, float):
 +            low, high = int(low * extent), int(high * extent)
 +        return int(rng.integers(low, high + 1)) if high > low else int(low)
@@ -1051,12 +1143,12 @@ index 0000000..0a9dbd7
 +        self, image: NDArray, keypoints: NDArray, bboxes: NDArray, rng: np.random.Generator
 +    ) -> dict[str, Any]:
 +        h, w = image.shape[:2]
-+        low, high = self.num_holes_range
++        low, high = self.min_holes, self.max_holes
 +        count = int(rng.integers(low, high + 1)) if high > low else int(low)
 +        holes = []
 +        for _ in range(count):
-+            hole_h = self._size(self.hole_height_range, h, rng)
-+            hole_w = self._size(self.hole_width_range, w, rng)
++            hole_h = self._size(self.min_height, self.max_height, h, rng)
++            hole_w = self._size(self.min_width, self.max_width, w, rng)
 +            y1 = int(rng.integers(0, max(1, h - hole_h + 1)))
 +            x1 = int(rng.integers(0, max(1, w - hole_w + 1)))
 +            holes.append((x1, y1, min(x1 + hole_w, w), min(y1 + hole_h, h)))
@@ -1180,7 +1272,7 @@ index 7314c99..ddda0e9 100644
  
      @staticmethod
 diff --git a/deeplabcut/pose_estimation_pytorch/data/transforms.py b/deeplabcut/pose_estimation_pytorch/data/transforms.py
-index c17a789..6184214 100644
+index c17a789..2b7d8c0 100644
 --- a/deeplabcut/pose_estimation_pytorch/data/transforms.py
 +++ b/deeplabcut/pose_estimation_pytorch/data/transforms.py
 @@ -14,23 +14,44 @@ import warnings
@@ -1271,7 +1363,7 @@ index c17a789..6184214 100644
              )
          )
          transforms.append(
-@@ -105,17 +126,15 @@ def build_transforms(augmentations: dict) -> A.BaseCompose:
+@@ -105,9 +126,9 @@ def build_transforms(augmentations: dict) -> A.BaseCompose:
          )
  
      if augmentations.get("hist_eq", False):
@@ -1283,18 +1375,7 @@ index c17a789..6184214 100644
      if augmentations.get("covering", False):
          transforms.append(
              CoarseDropout(
--                max_holes=10,
--                max_height=0.05,
--                min_height=0.01,
--                max_width=0.05,
--                min_width=0.01,
-+                num_holes_range=(1, 10),
-+                hole_height_range=(0.01, 0.05),
-+                hole_width_range=(0.01, 0.05),
-                 p=0.5,
-             )
-         )
-@@ -128,11 +147,10 @@ def build_transforms(augmentations: dict) -> A.BaseCompose:
+@@ -128,11 +149,10 @@ def build_transforms(augmentations: dict) -> A.BaseCompose:
          if not isinstance(noise, (int, float)):
              noise = 0.05 * 255
          transforms.append(
@@ -1309,7 +1390,7 @@ index c17a789..6184214 100644
                  p=0.5,
              )
          )
-@@ -141,15 +159,15 @@ def build_transforms(augmentations: dict) -> A.BaseCompose:
+@@ -141,15 +161,15 @@ def build_transforms(augmentations: dict) -> A.BaseCompose:
          transforms.append(build_auto_padding(**augmentations["auto_padding"]))
  
      if augmentations.get("normalize_images"):
@@ -1329,7 +1410,7 @@ index c17a789..6184214 100644
      )
  
  
-@@ -158,26 +176,25 @@ def build_auto_padding(
+@@ -158,26 +178,25 @@ def build_auto_padding(
      min_width: int | None = None,
      pad_height_divisor: int | None = 1,
      pad_width_divisor: int | None = 1,
@@ -1364,7 +1445,7 @@ index c17a789..6184214 100644
  
      Returns:
          the auto-padding transform
-@@ -191,7 +208,7 @@ def build_auto_padding(
+@@ -191,7 +210,7 @@ def build_auto_padding(
              f"Unknown border mode for auto_padding: {border_mode} (valid values are: {border_modes.keys()})"
          )
  
@@ -1373,7 +1454,7 @@ index c17a789..6184214 100644
          min_height=min_height,
          min_width=min_width,
          pad_height_divisor=pad_height_divisor,
-@@ -203,26 +220,27 @@ def build_auto_padding(
+@@ -203,26 +222,27 @@ def build_auto_padding(
      )
  
  
@@ -1406,7 +1487,7 @@ index c17a789..6184214 100644
      """Horizontal Flip which swaps symmetric keypoints."""
  
      def __init__(self, symmetries: list[tuple[int, int]], *args, **kwargs) -> None:
-@@ -232,12 +250,13 @@ class HFlip(A.HorizontalFlip):
+@@ -232,12 +252,13 @@ class HFlip(A.HorizontalFlip):
              self._symmetries[i] = j
              self._symmetries[j] = i
  
@@ -1424,7 +1505,7 @@ index c17a789..6184214 100644
      """Random crop for an image around keypoints.
  
      Args:
-@@ -259,7 +278,7 @@ class KeypointAwareCrop(A.RandomCrop):
+@@ -259,7 +280,7 @@ class KeypointAwareCrop(A.RandomCrop):
          max_shift: float = 0.4,
          crop_sampling: str = "hybrid",
      ):
@@ -1433,7 +1514,7 @@ index c17a789..6184214 100644
          # Clamp to 40% of crop size to ensure that at least
          # the center keypoint remains visible after the offset is applied.
          self.max_shift = max(0.0, min(max_shift, 0.4))
-@@ -275,25 +294,22 @@ class KeypointAwareCrop(A.RandomCrop):
+@@ -275,25 +296,22 @@ class KeypointAwareCrop(A.RandomCrop):
          mat = squareform(d <= radius * radius, checks=False)
          return np.sum(mat, axis=0)
  
@@ -1468,7 +1549,7 @@ index c17a789..6184214 100644
              kpts = kpts[~np.isnan(kpts).all(axis=1)]
              n_kpts = kpts.shape[0]
              inds = np.arange(n_kpts)
-@@ -307,34 +323,28 @@ class KeypointAwareCrop(A.RandomCrop):
+@@ -307,34 +325,28 @@ class KeypointAwareCrop(A.RandomCrop):
                  p = n_neighbors / n_neighbors.sum()
              else:
                  p = np.ones_like(inds) / n_kpts
@@ -1517,7 +1598,7 @@ index c17a789..6184214 100644
      """Resizes images while preserving their aspect ratio.
  
      In 'pad' mode, the image will be rescaled to the largest possible size such that it
-@@ -353,49 +363,38 @@ class KeepAspectRatioResize(A.DualTransform):
+@@ -353,49 +365,42 @@ class KeepAspectRatioResize(A.DualTransform):
          mode: str = "pad",
          interpolation: Any = cv2.INTER_LINEAR,
          p: float = 1.0,
@@ -1562,9 +1643,13 @@ index c17a789..6184214 100644
 -        return "height", "width", "mode", "interpolation"
 +    def apply(self, image: NDArray, scale: float = 1.0, **params: Any) -> NDArray:
 +        h, w = image.shape[:2]
-+        return cv2.resize(
++        resized = cv2.resize(
 +            image, (int(round(w * scale)), int(round(h * scale))), interpolation=self.interpolation
 +        )
++        # OpenCV drops a trailing singleton channel axis
++        if image.ndim == 3 and resized.ndim == 2:
++            resized = resized[:, :, None]
++        return resized
  
 +    def apply_to_keypoints(self, keypoints: NDArray, scale: float = 1.0, **params: Any) -> NDArray:
 +        return keypoints_scale(keypoints, scale, scale)
@@ -1585,7 +1670,7 @@ index c17a789..6184214 100644
          """
          Args:
              alpha: int, float or tuple of floats, optional
-@@ -408,7 +407,7 @@ class Grayscale(A.ToGray):
+@@ -408,7 +413,7 @@ class Grayscale(A.ToGray):
              * If a tuple ``(a, b)``, a random value from the range
                ``a <= x <= b`` will be sampled per image.
          """
@@ -1594,7 +1679,7 @@ index c17a789..6184214 100644
          if isinstance(alpha, (float, int)):
              self._alpha = self._validate_alpha(alpha)
          elif isinstance(alpha, tuple):
-@@ -416,7 +415,7 @@ class Grayscale(A.ToGray):
+@@ -416,7 +421,7 @@ class Grayscale(A.ToGray):
                  raise ValueError("`alpha` must be a tuple of two numbers.")
              self._alpha = tuple([self._validate_alpha(val) for val in alpha])
          else:
@@ -1603,33 +1688,22 @@ index c17a789..6184214 100644
  
      @staticmethod
      def _validate_alpha(val: float) -> float:
-@@ -424,144 +423,124 @@ class Grayscale(A.ToGray):
-             warnings.warn("`alpha` will be clipped to the interval [0.0, 1.0].", stacklevel=2)
-         return min(1.0, max(0.0, val))
- 
--    @property
--    def alpha(self) -> float:
--        if isinstance(self._alpha, float):
--            return self._alpha
--        return np.random.uniform(*self._alpha)
-+    def get_params(
-+        self, image: NDArray, keypoints: NDArray, bboxes: NDArray, rng: np.random.Generator
-+    ) -> dict[str, Any]:
-+        if isinstance(self._alpha, tuple):
-+            return {"alpha": float(rng.uniform(*self._alpha))}
-+        return {"alpha": float(self._alpha)}
-+
-+    def apply(self, image: NDArray, alpha: float = 1.0, **params: Any) -> NDArray:
-+        img_gray = super().apply(image, **params)
-+        img_blend = image * (1 - alpha) + img_gray * alpha
-+        return img_blend.astype(image.dtype)
+@@ -430,138 +435,118 @@ class Grayscale(A.ToGray):
+             return self._alpha
+         return np.random.uniform(*self._alpha)
  
 -    def apply(self, img: NDArray, **params) -> NDArray:
 -        img_gray = super().apply(img, **params)
--        alpha = self.alpha
++    def apply(self, image: NDArray, **params: Any) -> NDArray:
++        img_gray = super().apply(image, **params)
+         alpha = self.alpha
 -        img_blend = img * (1 - alpha) + img_gray * alpha
 -        return img_blend.astype(img.dtype)
++        img_blend = image * (1 - alpha) + img_gray * alpha
++        return img_blend.astype(image.dtype)
  
+ 
+-class ElasticTransform(A.ElasticTransform):
 +class ElasticTransform(BaseElasticTransform):
 +    """Elastic deformation which relocates keypoints via warped keypoint heatmaps.
 +
@@ -1638,8 +1712,7 @@ index c17a789..6184214 100644
 +    the very field applied to the image, and the keypoint is placed at the centre of
 +    mass of the warped disc.
 +    """
- 
--class ElasticTransform(A.ElasticTransform):
++
      def __init__(
          self,
          alpha: float = 20.0,
@@ -1740,13 +1813,13 @@ index c17a789..6184214 100644
 -            kp[:2] = new_coords
 -            new_keypoints.append(tuple(kp))
 -        return new_keypoints
+-
 +        with np.errstate(invalid="ignore", divide="ignore"):
 +            xy = sum_indices / div[:, None]
 +        # keypoints whose disc was warped out of the image keep their coordinates
 +        moved = np.isfinite(xy).all(axis=1)
 +        keypoints[moved, :2] = xy[moved]
 +        return keypoints
- 
  
 -class CoarseDropout(A.CoarseDropout):
 -    def __init__(
@@ -1774,7 +1847,7 @@ index c17a789..6184214 100644
 -            always_apply,
 -            p,
 -        )
--
+ 
 -    def apply_to_bboxes(self, bboxes: Sequence[float], **params) -> list[float]:
 -        return list(bboxes)
 +class CoarseDropout(BaseCoarseDropout):
@@ -1832,7 +1905,7 @@ index c17a789..6184214 100644
      """Random jittering for bounding boxes for top-down pose estimation models.
  
      Implementation based on the mmpose `RandomBBoxTransform`. For more information,
-@@ -584,43 +563,38 @@ class RandomBBoxTransform(A.DualTransform):
+@@ -584,43 +569,38 @@ class RandomBBoxTransform(A.DualTransform):
          self.scale_prob = scale_prob
          self.sampling = sampling
  
@@ -1892,7 +1965,7 @@ index c17a789..6184214 100644
              )
  
          bbox_wh = bboxes_xyxy[:, 2:] - bboxes_xyxy[:, :2]
-@@ -637,33 +611,21 @@ class RandomBBoxTransform(A.DualTransform):
+@@ -637,33 +617,21 @@ class RandomBBoxTransform(A.DualTransform):
          bbox_xyxy[:, 2:] = bbox_cxcy + bbox_half_wh
          bbox_xyxy = np.clip(bbox_xyxy, 0, 1)
  
