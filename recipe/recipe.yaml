@@ -15,9 +15,15 @@ source:
     - patches/0002-Replace-NumPy-2.0-removed-array-APIs-with-supported-.patch
     # https://github.com/DeepLabCut/DeepLabCut/commit/252183c22d35fbf5577bc5e9aa4ebf81ab06e340
     - patches/0003-Estimate-tracklet-rank-with-a-dense-SVD-instead-of-i.patch
-    - patches/0004-Use-qtpy-instead-of-PySide6.patch
-    - patches/0005-Add-outputs-required-for-multi-animal-model-export.patch
-    - patches/0006-Loosen-dependency-bounds.patch
+    # https://github.com/DeepLabCut/DeepLabCut/commit/aafaa2e77a1f6f1a4c0d6ad3d4d9ba0e5e1a0a2d
+    - patches/0004-Guard-CoW-read-only-.to_numpy-.values-mutations-3362.patch
+    # https://github.com/DeepLabCut/DeepLabCut/commit/18bc897c
+    - patches/0005-Guard-remaining-CoW-read-only-.to_numpy-.values-mutat.patch
+    # https://github.com/DeepLabCut/DeepLabCut/commit/7c997771a5326588363563306be2d9a9cdea5ed0
+    - patches/0006-Add-copy-True-to-to_numpy-in-evaluate_multianimal-pea.patch
+    - patches/0007-Use-qtpy-instead-of-PySide6.patch
+    - patches/0008-Add-outputs-required-for-multi-animal-model-export.patch
+    - patches/0009-Loosen-dependency-bounds.patch
 
 build:
   number: 0
@@ -80,13 +86,16 @@ tests:
       - python -c "import numpy; print(numpy.__version__); assert numpy.__version__.split('.')[0] == '2'"
       - python -c "import albumentations as A; A.keypoint_scale"
       - python -c "import numpy as np; from deeplabcut.pose_estimation_pytorch.data.transforms import build_transforms; t = build_transforms(dict(resize=dict(height=64, width=64, keep_ratio=True), normalize_images=True)); r = t(image=np.zeros((80, 50, 3), dtype=np.uint8), keypoints=[(10.0, 10.0)], class_labels=[0], bboxes=[], bbox_labels=[]); assert r['image'].shape[:2] == (64, 64); print('transforms ok', r['keypoints'])"
+      - python -c "import pandas; print(pandas.__version__); assert pandas.__version__.split('.')[0] == '3'"
       - python -c "from deeplabcut.refine_training_dataset.stitch import Tracklet"
+      - python -c "import deeplabcut.post_processing.filtering, deeplabcut.utils.make_labeled_video, deeplabcut.pose_estimation_3d.triangulation"
       - dlc --help
     requirements:
       run:
         - pip
         - python ${{ python_min }}.*
         - numpy >=2
+        - pandas >=3
         - opencv *headless*
 
 about:

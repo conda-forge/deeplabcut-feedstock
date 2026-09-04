@@ -1,0 +1,125 @@
+From aafaa2e7df392234f53d18422b21b8a2f7e2c13f Mon Sep 17 00:00:00 2001
+From: "Axel.Cffrd.Dnty" <150222552+AxelNoun@users.noreply.github.com>
+Date: Sun, 19 Jul 2026 19:04:10 +0200
+Subject: [PATCH] Guard CoW read-only .to_numpy()/.values mutations (#3362)
+
+Under pandas 3.0 Copy-on-Write, .to_numpy()/.values return read-only
+arrays for single-dtype selections; in-place mutation raises
+ValueError. Use copy=True at the five affected sites. Pin unchanged.
+Backported from upstream DeepLabCut, which carries this on the `dev`
+branch but has not yet released it:
+https://github.com/DeepLabCut/DeepLabCut/commit/aafaa2e7df392234f53d18422b21b8a2f7e2c13f
+
+---
+ deeplabcut/pose_estimation_3d/plotting3D.py     | 17 ++++++++++++++---
+ deeplabcut/pose_estimation_3d/triangulation.py  |  9 +++++++--
+ deeplabcut/pose_estimation_pytorch/data/ctd.py  |  7 +++++--
+ deeplabcut/post_processing/filtering.py         |  6 ++++--
+ deeplabcut/refine_training_dataset/tracklets.py |  5 +++--
+ 5 files changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/deeplabcut/pose_estimation_3d/plotting3D.py b/deeplabcut/pose_estimation_3d/plotting3D.py
+index d39967a8..0b11f17b 100644
+--- a/deeplabcut/pose_estimation_3d/plotting3D.py
++++ b/deeplabcut/pose_estimation_3d/plotting3D.py
+@@ -215,15 +215,26 @@ def create_labeled_video_3d(
+             bodyparts2plot = list(np.unique([val for sublist in bodyparts2connect for val in sublist]))
+ 
+             # Format data
++            # copy=True: under pandas 3 CoW, to_numpy() may be read-only.
+             mask2d = df_cam1.columns.get_level_values("bodyparts").isin(bodyparts2plot)
+-            xy1 = df_cam1.iloc[: len(df_3d)].loc[:, mask2d].to_numpy().reshape((len(df_3d), -1, 3))
++            xy1 = (
++                df_cam1.iloc[: len(df_3d)]
++                .loc[:, mask2d]
++                .to_numpy(copy=True)
++                .reshape((len(df_3d), -1, 3))
++            )
+             visible1 = xy1[..., 2] >= pcutoff
+             xy1[~visible1] = np.nan
+-            xy2 = df_cam2.iloc[: len(df_3d)].loc[:, mask2d].to_numpy().reshape((len(df_3d), -1, 3))
++            xy2 = (
++                df_cam2.iloc[: len(df_3d)]
++                .loc[:, mask2d]
++                .to_numpy(copy=True)
++                .reshape((len(df_3d), -1, 3))
++            )
+             visible2 = xy2[..., 2] >= pcutoff
+             xy2[~visible2] = np.nan
+             mask = df_3d.columns.get_level_values("bodyparts").isin(bodyparts2plot)
+-            xyz = df_3d.loc[:, mask].to_numpy().reshape((len(df_3d), -1, 3))
++            xyz = df_3d.loc[:, mask].to_numpy(copy=True).reshape((len(df_3d), -1, 3))
+             xyz[~(visible1 & visible2)] = np.nan
+ 
+             bpts = df_3d.columns.get_level_values("bodyparts")[mask][::3]
+diff --git a/deeplabcut/pose_estimation_3d/triangulation.py b/deeplabcut/pose_estimation_3d/triangulation.py
+index c213bfd3..b57d79a2 100644
+--- a/deeplabcut/pose_estimation_3d/triangulation.py
++++ b/deeplabcut/pose_estimation_3d/triangulation.py
+@@ -326,8 +326,13 @@ def triangulate(
+             num_frames = dataFrame_camera1_undistort.shape[0]
+             ### Assign nan to [X,Y] of low likelihood predictions ###
+             # Convert the data to a np array to easily mask out the low likelihood predictions
+-            data_cam1_tmp = dataFrame_camera1_undistort.to_numpy().reshape((num_frames, -1, 3))
+-            data_cam2_tmp = dataFrame_camera2_undistort.to_numpy().reshape((num_frames, -1, 3))
++            # copy=True: under pandas 3 CoW, to_numpy() may be read-only.
++            data_cam1_tmp = dataFrame_camera1_undistort.to_numpy(copy=True).reshape(
++                (num_frames, -1, 3)
++            )
++            data_cam2_tmp = dataFrame_camera2_undistort.to_numpy(copy=True).reshape(
++                (num_frames, -1, 3)
++            )
+             # Assign [X,Y] = nan to low likelihood predictions
+             data_cam1_tmp[data_cam1_tmp[..., 2] < pcutoff, :2] = np.nan
+             data_cam2_tmp[data_cam2_tmp[..., 2] < pcutoff, :2] = np.nan
+diff --git a/deeplabcut/pose_estimation_pytorch/data/ctd.py b/deeplabcut/pose_estimation_pytorch/data/ctd.py
+index b192f512..8f6dfb39 100644
+--- a/deeplabcut/pose_estimation_pytorch/data/ctd.py
++++ b/deeplabcut/pose_estimation_pytorch/data/ctd.py
+@@ -238,8 +238,11 @@ class CondFromFile(CondProvider):
+         """
+ 
+         def _parse_row(df_row) -> np.ndarray:
+-            # Row to numpy and reshape
+-            pose = df_row.to_numpy().reshape((num_conditions, num_bodyparts, 3))
++            # Row to numpy and reshape. copy=True: under pandas 3 CoW,
++            # to_numpy() may return a read-only view.
++            pose = df_row.to_numpy(copy=True).reshape(
++                (num_conditions, num_bodyparts, 3)
++            )
+ 
+             # Remove missing data
+             missing_keypoints = np.any(np.isnan(pose) | (pose < 0), axis=2)
+diff --git a/deeplabcut/post_processing/filtering.py b/deeplabcut/post_processing/filtering.py
+index e3759177..32340920 100644
+--- a/deeplabcut/post_processing/filtering.py
++++ b/deeplabcut/post_processing/filtering.py
+@@ -245,8 +245,10 @@ def filterpredictions(
+         elif filtertype == "spline":
+             data = df.copy()
+             mask_data = data.columns.get_level_values("coords").isin(("x", "y"))
+-            xy = data.loc[:, mask_data].values
+-            prob = data.loc[:, ~mask_data].values
++            # copy=True: under pandas 3 CoW, homogeneous float selections
++            # via .values/.to_numpy() are read-only views.
++            xy = data.loc[:, mask_data].to_numpy(copy=True)
++            prob = data.loc[:, ~mask_data].to_numpy(copy=True)
+             missing = np.isnan(xy)
+             xy_filled = columnwise_spline_interp(xy, windowlength)
+             filled = ~np.isnan(xy_filled)
+diff --git a/deeplabcut/refine_training_dataset/tracklets.py b/deeplabcut/refine_training_dataset/tracklets.py
+index 4e07e02d..50b49a97 100644
+--- a/deeplabcut/refine_training_dataset/tracklets.py
++++ b/deeplabcut/refine_training_dataset/tracklets.py
+@@ -221,8 +221,9 @@ class TrackletManager:
+         self.filename = filename
+         df = pd.read_hdf(filename)
+ 
+-        # Fill existing gaps
+-        data = df.to_numpy()
++        # Fill existing gaps. copy=True: under pandas 3 CoW, to_numpy() may
++        # return a read-only view that cannot be mutated in place.
++        data = df.to_numpy(copy=True)
+         mask = ~df.columns.get_level_values(level="coords").str.contains("likelihood")
+         xy = data[:, mask]
+         prob = data[:, ~mask]
