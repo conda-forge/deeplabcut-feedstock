@@ -1,0 +1,37 @@
+From 00da625953f4a89d4df9c5fe222b1f67d797205d Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Fri, 4 Sep 2026 12:37:32 -0400
+Subject: [PATCH 2/3] Add outputs required for multi-animal model export
+
+Exporting a multi-animal model produced a graph without the part-affinity
+field and peak tensors, so the exported model could not assemble individuals
+at inference time.
+
+Original patch by jefromson.
+---
+ deeplabcut/pose_estimation_tensorflow/export.py | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/export.py b/deeplabcut/pose_estimation_tensorflow/export.py
+index a9eb7fc..ed539a0 100644
+--- a/deeplabcut/pose_estimation_tensorflow/export.py
++++ b/deeplabcut/pose_estimation_tensorflow/export.py
+@@ -126,7 +126,17 @@ def load_model(cfg, shuffle=1, trainingsetindex=0, TFGPUinference=True, modelpre
+     dlc_cfg["batch_size"] = None
+ 
+     # load network
+-    if TFGPUinference:
++    if "multi-animal" in dlc_cfg["dataset_type"]:
++        # Multi-animal graphs additionally need the part-affinity field and the
++        # peak-index tensors to be able to assemble individuals at inference time.
++        sess, _, _ = predict.setup_pose_prediction(dlc_cfg)
++        output = [
++            "Sigmoid",
++            "pose/locref_pred/block4/BiasAdd",
++            "pose/pairwise_pred/block4/BiasAdd",
++            "Cast_2",
++        ]
++    elif TFGPUinference:
+         sess, _, _ = predict.setup_GPUpose_prediction(dlc_cfg)
+         output = ["concat_1"]
+     else:

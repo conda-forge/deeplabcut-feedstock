@@ -1,0 +1,97 @@
+From 1107360d59f813341b3222d71c15b3a79f899daa Mon Sep 17 00:00:00 2001
+From: natsukium <tomoya.otabi@gmail.com>
+Date: Mon, 20 Jul 2026 18:46:42 +0900
+Subject: [PATCH] Replace NumPy 2.0-removed array APIs with supported
+ equivalents
+
+np.trapz, np.product, and np.percentile's interpolation keyword raise
+AttributeError or TypeError on recent NumPy 2.x, where the core pipeline
+already runs. Switch to np.trapezoid (np.trapz fallback for NumPy 1),
+np.prod, and np.percentile(method=); all behave identically from NumPy
+1.22, the lower bound, up.
+
+https://numpy.org/doc/stable/numpy_2_0_migration_guide.html#main-namespace
+https://numpy.org/doc/stable/reference/generated/numpy.percentile.html
+Backported from upstream DeepLabCut, which carries this on the `dev`
+branch but has not yet released it:
+https://github.com/DeepLabCut/DeepLabCut/commit/1107360d59f813341b3222d71c15b3a79f899daa
+
+---
+ deeplabcut/core/crossvalutils.py                               | 3 ++-
+ deeplabcut/core/inferenceutils.py                              | 2 +-
+ deeplabcut/core/trackingutils.py                               | 2 +-
+ deeplabcut/pose_estimation_pytorch/apis/prune_paf_graph.py     | 3 ++-
+ .../pose_estimation_tensorflow/core/predict_multianimal.py     | 3 ++-
+ 5 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/deeplabcut/core/crossvalutils.py b/deeplabcut/core/crossvalutils.py
+index ca1447c6..d35498a9 100644
+--- a/deeplabcut/core/crossvalutils.py
++++ b/deeplabcut/core/crossvalutils.py
+@@ -97,7 +97,8 @@ def _calc_separability(vals_left, vals_right, n_bins=101, metric="jeffries", max
+     if metric == "jeffries":
+         sep = np.sqrt(2 * (1 - np.sum(np.sqrt(hist_left * hist_right))))  # Jeffries-Matusita distance
+     else:
+-        sep = np.trapz(np.cumsum(hist_left), tpr)
++        # np.trapezoid requires NumPy 2.0+; drop the np.trapz fallback once NumPy 1 is unsupported
++        sep = (np.trapezoid if hasattr(np, "trapezoid") else np.trapz)(np.cumsum(hist_left), tpr)
+     if max_sensitivity:
+         threshold = bins[max(1, np.argmax(tpr > 0))]
+     else:
+diff --git a/deeplabcut/core/inferenceutils.py b/deeplabcut/core/inferenceutils.py
+index b31bd858..f9f697ed 100644
+--- a/deeplabcut/core/inferenceutils.py
++++ b/deeplabcut/core/inferenceutils.py
+@@ -1085,7 +1085,7 @@ def find_outlier_assemblies(dict_of_assemblies, criterion="area", qs=(5, 95)):
+             tuples.append((frame_ind, getattr(assembly, criterion)))
+     frame_inds, vals = zip(*tuples, strict=False)
+     vals = np.asarray(vals)
+-    lo, up = np.percentile(vals, qs, interpolation="nearest")
++    lo, up = np.percentile(vals, qs, method="nearest")
+     inds = np.flatnonzero((vals < lo) | (vals > up)).tolist()
+     return list(set(frame_inds[i] for i in inds))
+ 
+diff --git a/deeplabcut/core/trackingutils.py b/deeplabcut/core/trackingutils.py
+index e0b094a7..c82c2c5a 100644
+--- a/deeplabcut/core/trackingutils.py
++++ b/deeplabcut/core/trackingutils.py
+@@ -539,7 +539,7 @@ class SORTSkeleton(SORTBase):
+         xx = x[mask]
+         yy = y[mask]
+         dist = np.linalg.norm(xx - yy, axis=1)
+-        scale = np.sqrt(np.product(np.ptp(yy, axis=0)))  # square root of bounding box area
++        scale = np.sqrt(np.prod(np.ptp(yy, axis=0)))  # square root of bounding box area
+         oks = np.exp(-0.5 * (dist / (0.05 * scale)) ** 2)
+         return np.mean(oks)
+ 
+diff --git a/deeplabcut/pose_estimation_pytorch/apis/prune_paf_graph.py b/deeplabcut/pose_estimation_pytorch/apis/prune_paf_graph.py
+index 0fb26e14..f34d0c0f 100644
+--- a/deeplabcut/pose_estimation_pytorch/apis/prune_paf_graph.py
++++ b/deeplabcut/pose_estimation_pytorch/apis/prune_paf_graph.py
+@@ -181,7 +181,8 @@ def _calc_separability(
+     if metric == "jeffries":
+         sep = np.sqrt(2 * (1 - np.sum(np.sqrt(hist_left * hist_right))))  # Jeffries-Matusita distance
+     else:
+-        sep = np.trapz(np.cumsum(hist_left), tpr)
++        # np.trapezoid requires NumPy 2.0+; drop the np.trapz fallback once NumPy 1 is unsupported
++        sep = (np.trapezoid if hasattr(np, "trapezoid") else np.trapz)(np.cumsum(hist_left), tpr)
+     if max_sensitivity:
+         threshold = bins[max(1, np.argmax(tpr > 0))]
+     else:
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/predict_multianimal.py b/deeplabcut/pose_estimation_tensorflow/core/predict_multianimal.py
+index 52af04e3..b8ce69d5 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/predict_multianimal.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/predict_multianimal.py
+@@ -120,7 +120,8 @@ def compute_edge_costs(
+         xy[..., 1],
+         edge_inds.reshape((-1, 1)),
+     ]
+-    integ = np.trapz(y, xy[..., ::-1], axis=1)
++    # np.trapezoid requires NumPy 2.0+; drop the np.trapz fallback once NumPy 1 is unsupported
++    integ = (np.trapezoid if hasattr(np, "trapezoid") else np.trapz)(y, xy[..., ::-1], axis=1)
+     affinities = np.linalg.norm(integ, axis=1).astype(np.float32)
+     # unit_vecs = vecs / lengths[:, np.newaxis]
+     # affinities = np.squeeze(y @ np.expand_dims(unit_vecs, axis=2)).sum(axis=1)
+-- 
+2.55.0
+

@@ -1,0 +1,72 @@
+From c8689e6d6b203339d1d68d6def3709ebe6787240 Mon Sep 17 00:00:00 2001
+From: natsukium <tomoya.otabi@gmail.com>
+Date: Sun, 19 Jul 2026 20:49:51 +0900
+Subject: [PATCH] Move imgaug from core dependencies to TensorFlow extras
+
+imgaug has not had a release since 0.4.0 (February 2020). Its pinned
+transitive dependencies hold back updates of many other packages and
+block adoption of newer Python versions, which is increasingly painful
+to maintain in the base install.
+Backported from upstream DeepLabCut, which carries this on the `dev`
+branch but has not yet released it:
+https://github.com/DeepLabCut/DeepLabCut/commit/c8689e6d6b203339d1d68d6def3709ebe6787240
+
+---
+ pyproject.toml | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index cec3b607..6e49bfbe 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -37,7 +37,6 @@ dependencies = [
+   "h5py>=3.15.1; platform_system=='Darwin'",
+   "huggingface-hub>=0.23",
+   "imageio-ffmpeg",
+-  "imgaug>=0.4",
+   "matplotlib>=3.3,<3.9,!=3.7,!=3.7.1",
+   "networkx>=2.6",
+   "numba>=0.54",
+@@ -93,6 +92,7 @@ dev-docs = [
+ fmpose3d = [ "fmpose3d>=0.0.8" ]
+ # Use only one of [tf, tf-cu11, tf-cu12, tf-latest]. Do not combine extras.
+ tf = [
++  "imgaug>=0.4",
+   "protobuf<7",
+   "tensorflow>=2.12,<2.16; python_version<'3.12'",
+   "tensorflow>=2.16.1,<2.18; python_version>='3.12'",
+@@ -105,6 +105,7 @@ tf = [
+   "tf-slim>=1.1",
+ ]
+ tf-cu11 = [
++  "imgaug>=0.4",
+   "protobuf<7",
+   "tensorflow==2.14",
+   "tensorflow-io-gcs-filesystem==0.31; platform_system=='Windows'",
+@@ -116,6 +117,7 @@ tf-cu11 = [
+   "torchvision<0.16",
+ ]
+ tf-cu12 = [
++  "imgaug>=0.4",
+   "protobuf<7",
+   "tensorflow==2.18",
+   "tensorflow-metal==1.2; platform_system=='Darwin'",
+@@ -126,6 +128,7 @@ tf-cu12 = [
+   "torchvision<0.26",
+ ]
+ tf-latest = [
++  "imgaug>=0.4",
+   "protobuf<7",
+   "tensorflow>=2.18",
+   "tensorflow-metal>=1.2; platform_system=='Darwin'",
+@@ -135,6 +138,7 @@ tf-latest = [
+ ]
+ # apple_mchips is kept for older systems, prefer [tf] in new projects.
+ apple_mchips = [
++  "imgaug>=0.4; platform_system=='Darwin'",
+   "protobuf<7; platform_system=='Darwin'",
+   "tensorflow>=2.12,<2.15; platform_system=='Darwin' and python_version<'3.12'",
+   "tensorflow>=2.15,<2.18; platform_system=='Darwin' and python_version>='3.12'",
+-- 
+2.55.0
+
