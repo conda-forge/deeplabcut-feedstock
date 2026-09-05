@@ -1,0 +1,197 @@
+From e08a003c61258f2638259001520c8b839f21e5b1 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Fri, 4 Sep 2026 20:58:16 -0400
+Subject: [PATCH] Use batch-norm moving averages at inference in the MuNet
+ decoder
+
+The multi-stage decoder in PoseMultiNet (MuNet/DLCRNet, used when
+pose_cfg.yaml sets stride < 8 together with multi_stage: true) wraps its
+five decoder_parallel_* convolutions in
+
+    slim.arg_scope([slim.conv2d], normalizer_fn=slim.layers.batch_norm, ...)
+
+without any normalizer_params.  tf_slim's batch_norm defaults to
+is_training=True, so those layers normalise with the *current batch's*
+statistics in every graph DeepLabCut builds -- including the inference
+graphs built by BasePoseNet.test() and BasePoseNet.inference().  Dumping
+the graph confirms it: under decoder_filters all five FusedBatchNormV3
+nodes carry is_training=True, while the 53 backbone nodes correctly carry
+is_training=False, since extract_features passes is_training=False to
+resnet_v1.  The inference graph even registers ten dangling moving-average
+update ops in tf.GraphKeys.UPDATE_OPS that nothing ever runs.
+
+Consequence: the prediction for a given frame depends on which other
+frames happen to share its batch.  Measured on a MuNet (resnet_50,
+stride 4, multi_stage) trained for 10k iterations, running
+deeplabcut.analyze_videos over the same 16-frame video:
+
+    batchsize 1 vs batchsize 8   mean 0.323 px, p95 0.929 px, max 2.665 px
+
+Holding the batch size at 4 and changing only which images accompany a
+fixed probe image moves that image's own keypoints by up to 0.30 px for
+natural companions and up to 8.9 px when the companions are blank frames.
+Because evaluate_network forces batch_size = 1 while analyze_videos
+defaults to batch_size = 8, the reported evaluation error and the
+keypoints written out for a video were not even produced by the same
+normalisation.
+
+Fix: thread an is_training flag from the three graph-building entry points
+(train / test / inference) down to the decoder's arg_scope and pass it to
+batch_norm through normalizer_params.  train() keeps is_training=True, so
+training is unchanged -- the training graph still contains the same five
+is_training=True nodes and the same ten UPDATE_OPS, which
+slim.learning.create_train_op continues to apply as control dependencies
+of the loss.  Only the test/inference graphs change, and they now use the
+moving averages that training has been accumulating all along.
+
+Those moving statistics are genuinely trained, so this is fixable at
+inference time and does not need retraining.  Reading the decoder
+BatchNorm variables straight out of the snapshots shows them leaving their
+(mean 0, variance 1) initialisation throughout training: mean
+|moving_mean| 0.148 -> 1.198 and mean moving_variance 0.991 -> 3.914
+between iteration 250 and iteration 10000.  Note that slim's default decay
+of 0.999 makes the estimates lag by roughly a thousand iterations, so a
+model stopped after only a few hundred iterations still carries a visible
+trace of the initialisation.
+
+This changes results for existing trained models.  Same checkpoint, same
+video, batchsize 1: keypoints move by mean 0.81 px, max 2.63 px relative
+to the unpatched code.  That is the same order as the batch-composition
+noise the bug was already introducing, and accuracy does not degrade.
+Distance from each ground-truth keypoint to the nearest detected peak,
+over five snapshots between 250 and 10000 iterations, is equal or slightly
+better with the fix; at 10000 iterations it is 3.595 px unpatched at
+batchsize 1, 3.655 px unpatched at batchsize 8 and 3.581 px patched at any
+batch size.  Predictions become exactly independent of batch composition
+(0.00000 px across every comparison above).
+
+Scope: only PoseMultiNet's multi_stage decoder changes behaviour.  In
+DeepLabCut 3.0.1 that decoder is reached only when pose_cfg.yaml carries
+stride < 8, and no code path writes such a value, so a stock project is
+not affected by this change at all.  The other get_net implementations
+merely gain the keyword argument so they still satisfy the base-class
+signature.
+
+Deliberately not fixed here: PoseMobileNet has the same defect on a larger
+scale.  Its extract_features calls mobilenet_v2.training_scope() with no
+arguments and that helper defaults to is_training=True, so all 52
+MobilenetV2 FusedBatchNormV3 nodes also run in training mode in the
+inference graph.  Unlike the decoder that path is reachable from a stock
+project (net_type=mobilenet_v2_*), so it deserves its own change and its
+own before/after measurements.
+
+Not reported upstream: multi.py carries this arg_scope unchanged on
+origin/dev, origin/main, origin/jaap/prepare_tf_deprecation and
+origin/backup/tf-deprecation, and no matching issue exists.
+---
+ deeplabcut/pose_estimation_tensorflow/nnets/base.py       | 8 ++++----
+ .../pose_estimation_tensorflow/nnets/efficientnet.py      | 2 +-
+ deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py  | 2 +-
+ deeplabcut/pose_estimation_tensorflow/nnets/multi.py      | 6 ++++--
+ deeplabcut/pose_estimation_tensorflow/nnets/resnet.py     | 2 +-
+ 5 files changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/base.py b/deeplabcut/pose_estimation_tensorflow/nnets/base.py
+index 1737ba2..5f5fcca 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/base.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/base.py
+@@ -27,10 +27,10 @@ class BasePoseNet(metaclass=abc.ABCMeta):
+     def extract_features(self, inputs): ...
+ 
+     @abc.abstractmethod
+-    def get_net(self, inputs): ...
++    def get_net(self, inputs, is_training=False): ...
+ 
+     def train(self, batch):
+-        heads = self.get_net(batch[Batch.inputs])
++        heads = self.get_net(batch[Batch.inputs], is_training=True)
+         if self.cfg["weigh_part_predictions"]:
+             part_score_weights = batch[Batch.part_score_weights]
+         else:
+@@ -80,7 +80,7 @@ class BasePoseNet(metaclass=abc.ABCMeta):
+         return loss
+ 
+     def test(self, inputs):
+-        heads = self.get_net(inputs)
++        heads = self.get_net(inputs, is_training=False)
+         return self.add_inference_layers(heads)
+ 
+     def prediction_layers(
+@@ -127,7 +127,7 @@ class BasePoseNet(metaclass=abc.ABCMeta):
+ 
+         Added with: https://arxiv.org/abs/1909.11229
+         """
+-        heads = self.get_net(inputs)
++        heads = self.get_net(inputs, is_training=False)
+         locref = heads["locref"]
+         probs = tf.sigmoid(heads["part_pred"])
+ 
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/efficientnet.py b/deeplabcut/pose_estimation_tensorflow/nnets/efficientnet.py
+index 3da6d3c..04b8eba 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/efficientnet.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/efficientnet.py
+@@ -44,7 +44,7 @@ class PoseEfficientNet(BasePoseNet):
+             )
+         return net, end_points
+ 
+-    def get_net(self, inputs, use_batch_norm=False, use_drop_out=False):
++    def get_net(self, inputs, use_batch_norm=False, use_drop_out=False, is_training=False):
+         net, _ = self.extract_features(inputs, use_batch_norm, use_drop_out)
+         return self.prediction_layers(net)
+ 
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py b/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py
+index 1d4f4ad..ffd34aa 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py
+@@ -93,6 +93,6 @@ class PoseMobileNet(BasePoseNet):
+                 )
+         return out
+ 
+-    def get_net(self, inputs):
++    def get_net(self, inputs, is_training=False):
+         net, end_points = self.extract_features(inputs)
+         return self.prediction_layers(net, end_points)
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/multi.py b/deeplabcut/pose_estimation_tensorflow/nnets/multi.py
+index 28c08fd..47fca71 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/multi.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/multi.py
+@@ -145,6 +145,7 @@ class PoseMultiNet(BasePoseNet):
+         input_shape,
+         scope="pose",
+         reuse=None,
++        is_training=False,
+     ):
+         net_type = self.cfg["net_type"]
+         if self.cfg["multi_stage"]:  # MuNet! (multi_stage decoder + multi_fusion)
+@@ -171,6 +172,7 @@ class PoseMultiNet(BasePoseNet):
+                 [slim.conv2d],
+                 padding="SAME",
+                 normalizer_fn=slim.layers.batch_norm,
++                normalizer_params={"is_training": is_training},
+                 activation_fn=tf.nn.relu,
+                 weights_regularizer=slim.l2_regularizer(self.cfg["weight_decay"]),
+             ):
+@@ -400,6 +402,6 @@ class PoseMultiNet(BasePoseNet):
+         out["features"] = features
+         return out
+ 
+-    def get_net(self, inputs):
++    def get_net(self, inputs, is_training=False):
+         net, end_points = self.extract_features(inputs)
+-        return self.prediction_layers(net, end_points, tf.shape(input=inputs))
++        return self.prediction_layers(net, end_points, tf.shape(input=inputs), is_training=is_training)
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/resnet.py b/deeplabcut/pose_estimation_tensorflow/nnets/resnet.py
+index b97bb13..a2a579f 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/resnet.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/resnet.py
+@@ -73,6 +73,6 @@ class PoseResnet(BasePoseNet):
+                 )
+         return out
+ 
+-    def get_net(self, inputs):
++    def get_net(self, inputs, is_training=False):
+         net, end_points = self.extract_features(inputs)
+         return self.prediction_layers(net, end_points)
+-- 
+2.55.0
+
