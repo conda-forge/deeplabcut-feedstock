@@ -1,0 +1,477 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 19:10:00 -0400
+Subject: [PATCH] Replace the pandas APIs pandas 3.0 changed or deleted
+
+Upstream capped `pandas[hdf5,performance]>=2.2,<3` and "Loosen dependency
+bounds" removed the cap on the grounds that nothing in the code depends on
+the capped major being absent. That was asserted rather than checked, and it
+is wrong for three call sites. The recipe solves pandas 3.0.5.
+
+Two of the three raise, one is silent, and the silent one is the one that
+matters most.
+
+* `utils/skeleton.py`, `SkeletonBuilder.pick_labeled_frame` -- silent, then
+  fatal two lines later. `DataFrame.stack()` swapped to the `future_stack`
+  implementation in 3.0, which no longer drops rows that are entirely NA.
+  The function masks the per-animal label counts down to the maximum with
+  `.where` and relied on `stack()` dropping those NaNs, so only maximally
+  labelled `(frame, animal)` pairs survived -- that is the whole of "Find the
+  most 'complete' animal". On pandas 3 every pair survives, including animals
+  with no labels at all, and the pick is uniform over all of them. `__init__`
+  then reshapes the picked animal's coordinates and hands them to
+  `scipy.spatial.KDTree`, which rejects NaN, so the loud failure is
+  `ValueError: data must be finite, check for nan or inf values` in a
+  function that never mentions pandas. On a synthetic four-animal project
+  where exactly one `(frame, animal)` pair is complete, 20 draws out of 20
+  pick an incomplete animal on 3.0.5 against 0 out of 20 on 2.2.3, and the
+  constructor completes on 2.2.3 and raises on 3.0.5. `SkeletonBuilder` is
+  exported from the top level and is the GUI's "Build skeleton" button.
+
+  `mask.stack(future_stack=True).dropna()` restores the drop the old
+  implementation performed. `future_stack=True` is accepted by 2.2 and by 3.0
+  -- where it is the default -- and the `.dropna()` is a no-op under the old
+  implementation, so the result is index-for-index the pandas 2.2 list on
+  both versions. Spelling it explicitly also silences the deprecation
+  FutureWarning a bare `stack()` raises on 2.2.
+
+* `gui/tracklet_toolbox.py`, `TrackletVisualizer.export_to_training_data` --
+  `DataFrame.groupby(axis=...)` was deprecated in 2.1 and deleted in 3.0:
+  `TypeError: DataFrame.groupby() got an unexpected keyword argument 'axis'`.
+  Reached from the "Refine tracklets" GUI, `gui/tabs/refine_tracklets.py`.
+  The replacement is `df.T.groupby(...).apply(...).T`, the idiom the rest of
+  the package already uses (`refine_training_dataset/outlier_frames.py`,
+  `utils/skeleton.py`, `utils/make_labeled_video.py`), with the inner
+  function's `cols.iloc[:, 2]` and `cols.loc[mask]` transposed to
+  `rows.iloc[2]` and `rows.loc[:, mask]`. Checked rather than assumed: on
+  2.2.3, with the individuals and bodyparts deliberately out of alphabetical
+  order so a regrouping would show, the rewrite gives the same column order,
+  the same values and the same NaN count as the original.
+
+* `benchmark/metrics.py`, `_format_gt_data` -- `DataFrame.stack(dropna=...)`
+  is likewise gone: `ValueError: dropna must be unspecified as the new
+  implementation does not introduce rows of NA values`. The call needs the
+  rectangular result to reshape to `(n_frames, n_animals, n_bodyparts, 2)`,
+  which is exactly what `dropna=False` bought. `future_stack=True` gives a
+  frame that `.equals()` the `dropna=False` one on 2.2.3 and is the default
+  on 3.0.
+
+What was checked and is fine, so that the tail is known rather than hoped:
+
+* Diffing `dir()` of the top-level namespace, `DataFrame`, `Series`, `Index`,
+  `MultiIndex`, `DataFrameGroupBy`, `HDFStore` and the option namespaces
+  between 2.2.3 and 3.0.5 gives `applymap`, `append`, `bool`, `first`,
+  `last`, `pad`, `backfill`, `swapaxes`, `to_gbq`/`read_gbq`, `Series.view`,
+  `Series.ravel`, `Index.format`, `Index.sort`, `Index.is_*`,
+  `holds_integer`, `GroupBy.grouper`, `GroupBy.dtypes`, `GroupBy.fillna`,
+  `options.mode.use_inf_as_na`, `options.mode.data_manager` and top-level
+  `value_counts`. None is called anywhere in the package; the `.append(`,
+  `.swapaxes(`, `.sort(`, `.view(` and `.pad(` hits are all list, NumPy,
+  PyTorch or TensorFlow.
+* `np.std` inside `df.agg([...])` really does change meaning -- 2.2 routed it
+  to `Series.std` (ddof=1) and 3.0 calls NumPy (ddof=0), a silent
+  `sqrt(n/(n-1))` shift. The only occurrence is
+  `pose_estimation_tensorflow/core/evaluate_multianimal._compute_stats`,
+  which nothing calls at 3.0.1, so it is left alone rather than fixed
+  blind.
+* `pose_estimation_tensorflow/core/evaluate.py` picks up rows from
+  `.stack(level="individuals")` that it used to drop, but its only consumer
+  is `.mean()`, which skips NA; the per-keypoint error table is numerically
+  identical on both versions.
+* The three sites carrying upstream's own "this will break on pandas 3"
+  TODOs -- the `future.no_silent_downcasting` option context and
+  `.infer_objects(copy=False)` in `evaluate_multianimal.py`, and
+  `select_dtypes(include="object")` in
+  `inferenceutils.parse_ground_truth_data_file` -- all still behave
+  identically on 3.0.5. `select_dtypes(include="object")` still matches
+  columns that are now reported as the new `str` dtype, and `.replace` of a
+  `str`-dtype column against an int mapping still yields int64.
+* `.to_numpy()` and `.values` come back read-only under copy-on-write on 3.0.
+  A sweep over the 45 pandas-importing modules for a mutation of such a
+  result finds nothing the backported CoW guards missed; every hit is a
+  variable rebound to `np.zeros` first.
+* `to_hdf`/`read_hdf` and `to_csv`/`read_csv` round-trips of the keypoint
+  frames are value-, index- and column-identical, including through a
+  string-valued coordinate column.
+* The upstream test suite at v3.0.1 gives an identical result on pandas 2.2.3
+  and 3.0.5 -- same 13 failures, 3380 passes, 32 skips, 5 xfails and 25
+  errors, by name -- before and after this patch. That is why these three
+  sites had to be found by hand.
+
+`tests/test_pandas3_api.py` covers the three, and pairs two kinds of check
+because the two failure modes need different ones. Running a call site
+catches a deleted keyword, but only on pandas >= 3, so each deleted keyword
+also gets an AST check over the whole package that is red on any pandas
+version; the silent `stack` change has no exception to catch, so those tests
+assert which frame is picked. `tracklet_toolbox.py` needs a Qt binding to
+import, so its statement is lifted out of the module's AST and executed
+directly -- the shipped source runs, without Qt.
+
+Reverting each hunk on its own, on pandas 3.0.5:
+
+* `utils/skeleton.py` -- `test_pick_labeled_frame_only_ever_returns_a_maximally_labeled_animal`,
+  `test_pick_labeled_frame_single_animal_branch` and
+  `test_skeleton_builder_constructs_on_a_mostly_unlabeled_project` fail, the
+  last with the `KDTree` `ValueError`.
+* `gui/tracklet_toolbox.py` -- `test_export_to_training_data_blanks_uncertain_keypoints`
+  fails with the `groupby` `TypeError`, and `test_no_call_passes_axis_to_groupby`
+  fails on pandas 2.2.3 as well.
+* `benchmark/metrics.py` -- `test_format_gt_data_keeps_a_row_for_every_animal`
+  fails with the `stack` `ValueError`, and `test_no_call_passes_dropna_to_stack`
+  fails on pandas 2.2.3 as well.
+
+All seven pass on 2.2.3 and on 3.0.5, and the full suite is unchanged on both.
+---
+ deeplabcut/benchmark/metrics.py    |   2 +-
+ deeplabcut/gui/tracklet_toolbox.py |  10 +-
+ deeplabcut/utils/skeleton.py       |   2 +-
+ tests/test_pandas3_api.py          | 289 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 296 insertions(+), 7 deletions(-)
+ create mode 100644 tests/test_pandas3_api.py
+
+diff --git a/deeplabcut/benchmark/metrics.py b/deeplabcut/benchmark/metrics.py
+index 7faf598..d670bff 100644
+--- a/deeplabcut/benchmark/metrics.py
++++ b/deeplabcut/benchmark/metrics.py
+@@ -35,7 +35,7 @@
+     guarantee_multiindex_rows(df)
+     file_paths = [Path(*row) for row in df.index.to_list()]
+     temp = (
+-        df.stack("individuals", dropna=False)
++        df.stack("individuals", future_stack=True)
+         .reindex(animals, level="individuals")
+         .reindex(kpts, level="bodyparts", axis=1)
+     )
+diff --git a/deeplabcut/gui/tracklet_toolbox.py b/deeplabcut/gui/tracklet_toolbox.py
+index bbedcb9..465fbb5 100644
+--- a/deeplabcut/gui/tracklet_toolbox.py
++++ b/deeplabcut/gui/tracklet_toolbox.py
+@@ -879,12 +879,12 @@
+         # Uncertain keypoints are ignored
+         # TODO @deruyter92 2026-06-10 (#3362):
+         # pandas migration 3.0 forbids in-place mutations of dataframe subset views.
+-        def filter_low_prob(cols, prob):
+-            mask = cols.iloc[:, 2] < prob
+-            cols.loc[mask] = np.nan
+-            return cols
++        def filter_low_prob(rows, prob):
++            mask = rows.iloc[2] < prob
++            rows.loc[:, mask] = np.nan
++            return rows
+ 
+-        df = df.groupby(level="bodyparts", axis=1, group_keys=False).apply(filter_low_prob, prob=pcutoff)
++        df = df.T.groupby(level="bodyparts", group_keys=False).apply(filter_low_prob, prob=pcutoff).T
+         df.index = pd.MultiIndex.from_tuples(index)
+ 
+         machinefile = tmpfolder / ("machinelabels-iter" + str(self.manager.cfg["iteration"]) + ".h5")
+diff --git a/deeplabcut/utils/skeleton.py b/deeplabcut/utils/skeleton.py
+index 3131d35..132a98d 100644
+--- a/deeplabcut/utils/skeleton.py
++++ b/deeplabcut/utils/skeleton.py
+@@ -137,7 +137,7 @@
+         else:
+             count = self.df.count(axis=1).to_frame()
+         mask = count.where(count == count.to_numpy().max())
+-        kept = mask.stack().index.to_list()
++        kept = mask.stack(future_stack=True).dropna().index.to_list()
+         np.random.shuffle(kept)
+         picked = kept.pop()
+         row = picked[:-1]
+diff --git a/tests/test_pandas3_api.py b/tests/test_pandas3_api.py
+new file mode 100644
+index 0000000..b98bfe5
+--- /dev/null
++++ b/tests/test_pandas3_api.py
+@@ -0,0 +1,289 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""The pandas call sites that pandas 3.0 changed under DeepLabCut.
++
++Three of them, and they fail in three different ways:
++
++* ``DataFrame.groupby(axis=1)`` and ``DataFrame.stack(dropna=...)`` were
++  deprecated in pandas 2.1/2.2 and deleted in 3.0, so they raise.  A test that
++  runs the call site catches those -- but only on pandas >= 3, so each is
++  paired with an AST check that is red on any pandas version.
++* ``DataFrame.stack()`` swapping to the ``future_stack`` implementation is
++  *silent*: it no longer drops the rows that are entirely NA.  Nothing raises;
++  the caller simply gets rows it used to be shielded from.  Only a test that
++  asserts the value catches that one, so the ``SkeletonBuilder`` tests below
++  assert which frame is picked, not that picking did not blow up.
++
++Every assertion here is the pandas 2.2 result, i.e. an oracle from the
++behaviour that upstream's ``pandas<3`` cap used to guarantee.
++"""
++
++from __future__ import annotations
++
++import ast
++import types
++from pathlib import Path
++
++import matplotlib
++
++matplotlib.use("Agg")
++
++import numpy as np
++import pandas as pd
++import pytest
++
++import deeplabcut
++from deeplabcut.utils.skeleton import SkeletonBuilder
++
++PACKAGE_ROOT = Path(deeplabcut.__file__).parent
++
++SCORER = "sc"
++INDIVIDUALS = ["ind1", "ind2", "ind3", "ind4"]
++BODYPARTS = ["snout", "tail", "left", "right"]
++
++
++def _multi_animal_frame(n_frames: int = 6, seed: int = 0) -> pd.DataFrame:
++    """Only ``(img0, ind1)`` is fully labelled; ``ind4`` never is."""
++    columns = pd.MultiIndex.from_product(
++        [[SCORER], INDIVIDUALS, BODYPARTS, ["x", "y"]],
++        names=["scorer", "individuals", "bodyparts", "coords"],
++    )
++    index = pd.MultiIndex.from_tuples(
++        [("labeled-data", "vid", f"img{i}.png") for i in range(n_frames)]
++    )
++    rng = np.random.default_rng(seed)
++    df = pd.DataFrame(rng.uniform(10, 90, (n_frames, len(columns))), index=index, columns=columns)
++    for i in range(n_frames):
++        for j, individual in enumerate(INDIVIDUALS):
++            if i == 0 and j == 0:
++                continue
++            if individual == "ind4":
++                df.loc[index[i], (SCORER, individual)] = np.nan
++            else:
++                df.loc[index[i], (SCORER, individual, BODYPARTS[(i + j) % len(BODYPARTS)])] = np.nan
++    return df
++
++
++def _single_animal_frame(n_frames: int = 6, seed: int = 0) -> pd.DataFrame:
++    """Only ``img5`` is fully labelled."""
++    columns = pd.MultiIndex.from_product(
++        [[SCORER], BODYPARTS, ["x", "y"]],
++        names=["scorer", "bodyparts", "coords"],
++    )
++    index = pd.MultiIndex.from_tuples(
++        [("labeled-data", "vid", f"img{i}.png") for i in range(n_frames)]
++    )
++    rng = np.random.default_rng(seed)
++    df = pd.DataFrame(rng.uniform(10, 90, (n_frames, len(columns))), index=index, columns=columns)
++    for i in range(n_frames - 1):
++        df.loc[index[i], (SCORER, BODYPARTS[i % len(BODYPARTS)])] = np.nan
++    return df
++
++
++# --------------------------------------------------------------------------- #
++# deeplabcut/utils/skeleton.py -- SkeletonBuilder.pick_labeled_frame
++# --------------------------------------------------------------------------- #
++def test_pick_labeled_frame_only_ever_returns_a_maximally_labeled_animal():
++    """``pick_labeled_frame`` docstring: "Find the most 'complete' animal"."""
++    df = _multi_animal_frame()
++    builder = types.SimpleNamespace(df=df)
++    picks = set()
++    for seed in range(40):
++        np.random.seed(seed)
++        picks.add(SkeletonBuilder.pick_labeled_frame(builder))
++
++    # (img0, ind1) is the only animal without a missing bodypart.
++    assert picks == {(("labeled-data", "vid", "img0.png"), "ind1")}
++
++    for row, col in picks:
++        xy = df.xs(col, axis=1, level="individuals").loc[row].to_numpy().reshape((-1, 2))
++        assert not np.isnan(xy).any()
++
++
++def test_pick_labeled_frame_single_animal_branch():
++    df = _single_animal_frame()
++    builder = types.SimpleNamespace(df=df)
++    picks = set()
++    for seed in range(40):
++        np.random.seed(seed)
++        picks.add(SkeletonBuilder.pick_labeled_frame(builder))
++
++    assert picks == {(("labeled-data", "vid", "img5.png"), 0)}
++
++    for row, _ in picks:
++        assert not np.isnan(df.loc[row].to_numpy()).any()
++
++
++def test_skeleton_builder_constructs_on_a_mostly_unlabeled_project(tmp_path):
++    """The crash the silent ``stack`` change produces two lines further down.
++
++    ``__init__`` feeds the picked animal's coordinates to ``scipy.spatial.KDTree``,
++    which rejects NaN, so picking an incompletely labelled animal is not a
++    degradation but a hard failure.
++    """
++    iio = pytest.importorskip("imageio.v3")
++
++    labeled = tmp_path / "labeled-data" / "vid"
++    labeled.mkdir(parents=True)
++    df = _multi_animal_frame()
++    df.to_hdf(labeled / f"CollectedData_{SCORER}.h5", key="df_with_missing", mode="w")
++    for i in range(len(df)):
++        iio.imwrite(labeled / f"img{i}.png", np.zeros((100, 100, 3), np.uint8))
++
++    config = tmp_path / "config.yaml"
++    config.write_text(
++        "Task: t\n"
++        f"scorer: {SCORER}\n"
++        "date: d\n"
++        f"project_path: {tmp_path}\n"
++        "individuals:\n" + "".join(f"- {i}\n" for i in INDIVIDUALS) + "multianimalbodyparts:\n"
++        + "".join(f"- {b}\n" for b in BODYPARTS)
++        + "uniquebodyparts: []\n"
++        "bodyparts: MULTI!\n"
++        "skeleton: []\n"
++        "skeleton_color: black\n"
++        "dotsize: 8\n"
++        "alphavalue: 0.7\n"
++        "colormap: rainbow\n"
++        "video_sets: {}\n"
++        "iteration: 0\n"
++    )
++
++    np.random.seed(0)
++    builder = SkeletonBuilder(str(config))
++    assert not np.isnan(builder.xy).any()
++
++
++# --------------------------------------------------------------------------- #
++# deeplabcut/benchmark/metrics.py -- _format_gt_data
++# --------------------------------------------------------------------------- #
++def test_format_gt_data_keeps_a_row_for_every_animal(tmp_path):
++    from deeplabcut.benchmark import metrics
++
++    df = _multi_animal_frame(n_frames=3)
++    h5 = tmp_path / "CollectedData_sc.h5"
++    df.to_hdf(h5, key="df_with_missing", mode="w")
++
++    out = metrics._format_gt_data(str(h5))
++    assert out["metadata"]["animals"] == INDIVIDUALS
++    assert out["metadata"]["keypoints"] == BODYPARTS
++    assert len(out["annotations"]) == 3
++    for arr in out["annotations"].values():
++        # (n_animals, n_bodyparts, 2) -- ind4 is all NaN but must still be there.
++        assert arr.shape == (len(INDIVIDUALS), len(BODYPARTS), 2)
++    first = out["annotations"][Path("labeled-data", "vid", "img0.png")]
++    assert not np.isnan(first[0]).any()
++    assert np.isnan(first[3]).all()
++
++
++# --------------------------------------------------------------------------- #
++# deeplabcut/gui/tracklet_toolbox.py -- TrackletVisualizer.export_to_training_data
++# --------------------------------------------------------------------------- #
++def _export_to_training_data_filter():
++    """Compile the keypoint filter out of ``tracklet_toolbox.py``.
++
++    The statement lives inside a Qt widget method, so it is read from the
++    source rather than imported: the test must not need a Qt binding to run.
++    """
++    source = (PACKAGE_ROOT / "gui" / "tracklet_toolbox.py").read_text()
++    tree = ast.parse(source)
++    (visualizer,) = [
++        node
++        for node in tree.body
++        if isinstance(node, ast.ClassDef) and node.name == "TrackletVisualizer"
++    ]
++    (export,) = [
++        node
++        for node in visualizer.body
++        if isinstance(node, ast.FunctionDef) and node.name == "export_to_training_data"
++    ]
++    body = []
++    for node in export.body:
++        if isinstance(node, ast.FunctionDef) and node.name == "filter_low_prob":
++            body.append(node)
++        elif body and isinstance(node, ast.Assign):
++            body.append(node)
++            break
++    assert len(body) == 2, "the keypoint filter moved; update this test"
++
++    module = ast.Module(body=body, type_ignores=[])
++    ast.fix_missing_locations(module)
++    code = compile(module, "<tracklet_toolbox>", "exec")
++
++    def run(df, pcutoff):
++        namespace = {"np": np, "pd": pd, "df": df, "pcutoff": pcutoff}
++        exec(code, namespace)
++        return namespace["df"]
++
++    return run
++
++
++def test_export_to_training_data_blanks_uncertain_keypoints():
++    """Runs the shipped statement; on pandas >= 3 ``axis=1`` raises TypeError."""
++    columns = pd.MultiIndex.from_product(
++        [[SCORER], ["ind2", "ind1"], ["tail", "snout"], ["x", "y", "likelihood"]],
++        names=["scorer", "individuals", "bodyparts", "coords"],
++    )
++    rng = np.random.default_rng(3)
++    df = pd.DataFrame(rng.random((4, len(columns))), columns=columns)
++
++    out = _export_to_training_data_filter()(df.copy(), 0.5)
++
++    # Column order and identity survive the grouping.
++    assert out.columns.equals(df.columns)
++
++    # pandas 2.2 reference: within each bodypart group the rows whose *first*
++    # likelihood column is below the cutoff are blanked across the group.
++    expected = df.copy()
++    for bodypart in df.columns.get_level_values("bodyparts").unique():
++        group = df.loc[:, df.columns.get_level_values("bodyparts") == bodypart]
++        mask = group.iloc[:, 2] < 0.5
++        expected.loc[mask, group.columns] = np.nan
++    pd.testing.assert_frame_equal(out, expected)
++    assert out.isna().to_numpy().any(), "the fixture must exercise the cutoff"
++
++
++# --------------------------------------------------------------------------- #
++# Package-wide: the two keywords pandas 3.0 deleted
++# --------------------------------------------------------------------------- #
++def _calls(name):
++    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
++        try:
++            tree = ast.parse(path.read_text())
++        except SyntaxError:  # pragma: no cover - not our source
++            continue
++        for node in ast.walk(tree):
++            if (
++                isinstance(node, ast.Call)
++                and isinstance(node.func, ast.Attribute)
++                and node.func.attr == name
++            ):
++                yield path, node
++
++
++def test_no_call_passes_axis_to_groupby():
++    """``DataFrame.groupby(axis=...)`` was deleted in pandas 3.0."""
++    offenders = [
++        f"{path.relative_to(PACKAGE_ROOT)}:{node.lineno}"
++        for path, node in _calls("groupby")
++        if any(kw.arg == "axis" for kw in node.keywords)
++    ]
++    assert offenders == []
++
++
++def test_no_call_passes_dropna_to_stack():
++    """``DataFrame.stack(dropna=...)`` was deleted in pandas 3.0."""
++    offenders = [
++        f"{path.relative_to(PACKAGE_ROOT)}:{node.lineno}"
++        for path, node in _calls("stack")
++        if any(kw.arg == "dropna" for kw in node.keywords)
++    ]
++    assert offenders == []
+-- 
+2.51.0
+

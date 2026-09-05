@@ -48,6 +48,7 @@ source:
       - patches/0032-Cover-the-vendored-augmentation-module-s-geometry.patch
       - patches/0033-Restore-the-augmentation-behaviour-albumentations-1.patch
       - patches/0034-Replace-matplotlib.cm.get_cmap-removed-in-matplotlib.patch
+      - patches/0035-Replace-the-pandas-APIs-pandas-3.0-changed-or-deleted.patch
 
   - url: https://github.com/DeepLabCut/DeepLabCut/archive/refs/tags/v${{ version }}.tar.gz
     sha256: e25a98a352d8afd32e1f08d936a339dc1e79dc5979bd0edf407d1f4f49b5f20f

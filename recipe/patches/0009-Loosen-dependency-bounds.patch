@@ -9,8 +9,14 @@ requires, which needlessly holds back the whole environment:
 * numpy: drop the `<2` cap. The three upstream commits backported ahead of
   this patch are what make that safe; the floor is raised to 1.22.4 to match
   the np.percentile(method=) spelling they introduce.
-* filelock, matplotlib, pandas, pydantic: drop the upper caps. Nothing in the
-  code depends on the capped majors being absent.
+* filelock, matplotlib, pandas, pydantic: drop the upper caps, and fix the code
+  where a cap was load-bearing rather than defensive. Audited one at a time
+  rather than assumed: filelock is never imported at all (its pin came from a
+  resolver workaround, upstream 508c8db0), and pydantic 3 does not exist yet
+  while nothing here uses pydantic-v1-deprecated API. matplotlib and pandas
+  were both genuinely holding something back, and later patches in this series
+  fix those call sites -- matplotlib.cm.get_cmap in 0034, and three pandas 3.0
+  removals in 0035.
 
 Only upper bounds are touched. Lower bounds are left exactly as upstream set
 them, including `packaging>=26`, which is far in excess of what the code uses
