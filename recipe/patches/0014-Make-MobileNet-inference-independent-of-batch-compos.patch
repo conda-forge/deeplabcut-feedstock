@@ -50,12 +50,24 @@ This deliberately does NOT switch inference to the moving averages, which
 is what the equivalent MuNet fix does and what the arg_scope was
 presumably meant to do.  That was tried first and it is badly wrong here:
 the same snapshot evaluated with the stored moving averages gives 11.85 px
-train / 12.79 px test, a 2.7x regression, because DeepLabCut trains this
-backbone at batch_size 1 -- batch-norm in training mode is then instance
-normalisation, and the accumulated averages describe the heavily augmented
-training stream (global_scale 0.8, scale jitter 0.5-1.25, crops, CLAHE,
-motion blur, covering, elastic transform) rather than the images inference
-actually sees.  Freezing the backbone at the ImageNet statistics instead,
+train / 12.79 px test, a 2.7x regression.
+
+The reason is not the training batch size.  That was the first hypothesis --
+this backbone trains at batch_size 1, so training-mode batch norm is
+effectively instance normalisation -- but it was tested directly and does
+not hold: a MuNet decoder trained at batch_size 1 on the same data with the
+same augmentation still prefers its moving averages (5.321 -> 5.053 px test
+at 5000 iterations).  Nor do the stored MobileNet statistics fail to
+describe what inference sees; in aggregate they match it well (mean shift
+0.018 sd, median variance ratio 0.99).
+
+What distinguishes the two cases is the extent and depth of the normalised
+stack.  MobileNet's 52 batch-norm layers are the entire feature extractor,
+chained: the first layer's per-image variance is about 27% of the stored
+population variance, an 18.7% relative perturbation that compounds to a 72%
+relative change in the scoremap by layer 52.  The MuNet decoder is five
+convolutions in two parallel branches at most three deep, sitting on a
+resnet backbone already frozen at is_training=False.  Freezing the backbone at the ImageNet statistics instead,
 the way resnet.py and efficientnet.py do, is no better: retraining for
 10000 iterations that way gives 9.68 px / 12.68 px.  For the record the
 population statistics can be made usable, but only by recomputing them:

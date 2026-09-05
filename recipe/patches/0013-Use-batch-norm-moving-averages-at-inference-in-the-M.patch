@@ -56,8 +56,19 @@ trace of the initialisation.
 
 This changes results for existing trained models.  Same checkpoint, same
 video, batchsize 1: keypoints move by mean 0.81 px, max 2.63 px relative
-to the unpatched code.  That is the same order as the batch-composition
-noise the bug was already introducing, and accuracy does not degrade.
+to the unpatched code on a synthetic 16-frame project, and by mean 2.13 px,
+p95 4.56 px, max 7.63 px on a model trained on real frames with stock
+augmentation.  That is an order of magnitude larger than the 0.175 px of
+batch-composition noise the bug was introducing, so it is a real change and
+not a rounding difference.
+
+What justifies accepting it is that the predictions get better, not merely
+different.  On a real single-animal clip of 32 frames, where 128
+bodypart-frames should each yield one peak, the unpatched network emits 172
+detections -- 38 bodypart-frames carrying two or three peaks -- while the
+patched one emits 129, of which 127 are exactly right.  It removes 43 of the
+44 spurious peaks that would otherwise be fed to the assembler and the
+tracker.  Accuracy does not degrade.
 Distance from each ground-truth keypoint to the nearest detected peak,
 over five snapshots between 250 and 10000 iterations, is equal or slightly
 better with the fix; at 10000 iterations it is 3.595 px unpatched at
