@@ -1,0 +1,514 @@
+From ea07395f05ea581e6ebc941c1047c5e2c2391dbf Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 14:38:00 -0400
+Subject: [PATCH] Test the Path/str boundaries fixed in the pathlib follow-up
+
+Reverting all twelve hunks of "Fix Path/str confusion left over from the
+pathlib migration" and running the suite gives a byte-identical result --
+`6 failed, 3560 passed, 31 skipped, 44 errors` either way. None of its eight
+fixes was exercised by anything, including the two that produce silently
+wrong output rather than an exception.
+
+`tests/test_path_str_boundaries.py` covers all eight call sites, asserting
+the result rather than the absence of an exception, because for the two
+silent ones there is no exception to catch. Reverting each hunk on its own
+turns the matching test red:
+
+* `generate_training_dataset/frame_extraction.py`, `extract_frames` --
+  `assert [] == [False]`; the `set[Path]` the GUI passes matched no video in
+  `video_sets`, the extraction loop never ran, and `all([])` reported
+  "Frame extraction failed. Video files must be corrupted." about a video
+  the test had just written.
+* `refine_training_dataset/outlier_frames.py`,
+  `ExtractFramesbasedonPreselection` -- `assert None == (5, 40, 7, 30)`; the
+  crop from `video_sets` was dropped, so frames come out uncropped and the
+  labels are plotted un-offset.
+* `refine_training_dataset/outlier_frames.py`, `find_outliers_in_raw_data`
+  -- `AttributeError: 'PosixPath' object has no attribute 'endswith'`.
+* `utils/conversioncode.py`, `analyze_videos_converth5_to_csv` --
+  `AttributeError: 'str' object has no attribute 'name'`; and
+  `analyze_videos_converth5_to_nwb`, checked one call earlier because
+  `dlc2nwb` is optional.
+* `pose_estimation_tensorflow/modelzoo/api/superanimal_inference.py` --
+  `AttributeError: 'PosixPath' object has no attribute 'split'`.
+* `utils/plotting.py`, `plot_trajectories` -- `TypeError: sequence item 0:
+  expected str instance, PosixPath found`.
+* `pose_estimation_tensorflow/predict_videos.py`, `AnalyzeVideo` --
+  `cv2.error: ... Can't convert object of type 'PosixPath' to 'str' for
+  'filename'`, which is the crash that started the patch.
+* `gui/tabs/create_videos.py`, `CreateVideos.create_videos` -- `TypeError:
+  sequence item 0: expected str instance, PosixPath found`.
+
+Each site is tested with both a `Path` and a `str`, since two of these fixes
+are for the reverse confusion.
+
+The videos are real, written with `cv2` into `tmp_path`, and the project is
+a real one from `create_new_project`, so the configs are the real thing.
+Where a call site cannot be reached without a trained model or a running
+QApplication the surrounding machinery is stubbed and the boundary itself is
+left alone: the GUI test calls `CreateVideos.create_videos` unbound on an
+object carrying the attributes the method reads, which needs `qtpy` to
+import the module but no display and no `QApplication`.
+---
+ tests/test_path_str_boundaries.py | 452 ++++++++++++++++++++++++++++++
+ 1 file changed, 452 insertions(+)
+ create mode 100644 tests/test_path_str_boundaries.py
+
+diff --git a/tests/test_path_str_boundaries.py b/tests/test_path_str_boundaries.py
+new file mode 100644
+index 0000000..cd48a99
+--- /dev/null
++++ b/tests/test_path_str_boundaries.py
+@@ -0,0 +1,452 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""Boundaries where a ``Path`` meets an API that still wants a ``str``.
++
++The pathlib migration turned a number of values into ``Path`` without updating
++every consumer.  Two of the resulting defects are silent -- a dropped crop and
++a selection that matches nothing -- so each test here asserts the *result*, not
++that the call did not raise: reverting the fix has to make the test red, and a
++test that only checks for an exception would stay green for both silent ones.
++
++Each test names the call site it covers.
++"""
++import pickle
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++import pytest
++
++VIDEO_FRAMES = 24
++VIDEO_SIZE = (64, 48)  # width, height
++
++
++def _write_video(path, n_frames=VIDEO_FRAMES, size=VIDEO_SIZE):
++    """A small, real, openable video -- ``cv2`` is what these call sites use."""
++    import cv2
++
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fourcc = getattr(cv2, "VideoWriter_fourcc", None) or cv2.VideoWriter.fourcc
++    writer = cv2.VideoWriter(str(path), fourcc(*"MJPG"), 10.0, size)
++    assert writer.isOpened(), f"could not write a test video to {path}"
++    rng = np.random.RandomState(0)
++    for _ in range(n_frames):
++        writer.write(rng.randint(0, 256, (size[1], size[0], 3), dtype=np.uint8))
++    writer.release()
++    assert path.is_file()
++    return path
++
++
++@pytest.fixture(scope="module")
++def project(tmp_path_factory):
++    """A real single-animal project, so the configs here are the real thing."""
++    from deeplabcut import create_new_project
++
++    root = tmp_path_factory.mktemp("dlc_paths")
++    video = _write_video(root / "raw" / "reaching.avi")
++    config = create_new_project("PathTest", "tester", [str(video)], working_directory=str(root), copy_videos=True)
++    assert config != "nothingcreated"
++    config = Path(config)
++    videos = sorted((config.parent / "videos").glob("*.avi"))
++    assert len(videos) == 1
++    return config, videos[0]
++
++
++# ---------------------------------------------------------------------------
++# generate_training_dataset/frame_extraction.py, extract_frames
++#
++# The GUI passes its selection as ``set[Path]`` (gui/window.py: files: set[Path]).
++# Comparing that against the ``str`` keys of ``video_sets`` selects nothing, the
++# extraction loop never runs, and ``all([])`` is True -- so the user is told the
++# video is corrupted.  Silent, and it is the GUI's normal Extract Frames path.
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("as_path", [True, False], ids=["set-of-Path", "list-of-str"])
++def test_extract_frames_selects_the_video_whatever_type_the_caller_used(project, as_path):
++    from deeplabcut.generate_training_dataset import extract_frames
++    from deeplabcut.utils import auxiliaryfunctions
++
++    config, video = project
++    selection = {Path(video)} if as_path else [str(video)]
++
++    frames_dir = config.parent / "labeled-data" / video.stem
++    for stale in frames_dir.glob("*.png"):
++        stale.unlink()
++
++    has_failed = extract_frames(
++        str(config),
++        mode="automatic",
++        algo="uniform",
++        crop=False,
++        userfeedback=False,
++        videos_list=selection,
++    )
++
++    # The bug's signature: an empty selection, an empty has_failed, and
++    # "Frame extraction failed. Video files must be corrupted." about a video
++    # that is perfectly fine.
++    assert has_failed == [False], (
++        f"{selection!r} matched no video in video_sets "
++        f"({list(auxiliaryfunctions.read_config(config)['video_sets'])})"
++    )
++    assert sorted(p.name for p in frames_dir.glob("*.png")), "no frames were extracted"
++
++
++# ---------------------------------------------------------------------------
++# refine_training_dataset/outlier_frames.py, ExtractFramesbasedonPreselection
++#
++# ``video_sets`` is keyed by ``str``; looking a ``Path`` up in it returns None
++# and the per-video crop is dropped, so outlier frames come out uncropped and
++# the labels are plotted at un-offset coordinates.  Silent.
++# ---------------------------------------------------------------------------
++class _RecordingVideo:
++    """Stand-in for ``auxfun_videos.VideoWriter``: records ``set_bbox``."""
++
++    def __init__(self, video_path):
++        self.video_path = video_path
++        self.fps = 10.0
++        self.bbox = None
++        self.closed = False
++
++    def calc_duration(self):
++        return 2.4
++
++    def set_bbox(self, *coords):
++        self.bbox = tuple(coords)
++
++    def close(self):
++        self.closed = True
++
++
++@pytest.fixture()
++def preselection_stubs(monkeypatch):
++    """Stop ``ExtractFramesbasedonPreselection`` right after the crop lookup."""
++    from deeplabcut.refine_training_dataset import outlier_frames
++
++    made = []
++
++    def factory(video_path):
++        made.append(_RecordingVideo(video_path))
++        return made[-1]
++
++    monkeypatch.setattr(outlier_frames, "VideoWriter", factory)
++    monkeypatch.setattr(outlier_frames.frameselectiontools, "UniformFramescv2", lambda *a, **kw: [])
++    return made
++
++
++@pytest.mark.parametrize("as_path", [True, False], ids=["Path", "str"])
++def test_outlier_extraction_keeps_the_crop_whatever_type_the_video_is(project, preselection_stubs, as_path):
++    from deeplabcut.refine_training_dataset.outlier_frames import (
++        ExtractFramesbasedonPreselection,
++    )
++    from deeplabcut.utils import auxiliaryfunctions
++
++    config, video = project
++    cfg = dict(auxiliaryfunctions.read_config(config))
++    cfg["cropping"] = True
++    cfg["video_sets"] = {str(video): {"crop": "5, 40, 7, 30"}}
++
++    ExtractFramesbasedonPreselection(
++        Index=[0, 1, 2],
++        extractionalgorithm="uniform",
++        data=pd.DataFrame(np.zeros((10, 2))),
++        video=Path(video) if as_path else str(video),
++        cfg=cfg,
++        config=str(config),
++        opencv=True,
++        savelabeled=False,
++        with_annotations=False,
++    )
++
++    assert len(preselection_stubs) == 1
++    assert preselection_stubs[0].bbox == (5, 40, 7, 30), (
++        "the crop from video_sets was dropped, so frames are extracted uncropped"
++    )
++
++
++# ---------------------------------------------------------------------------
++# refine_training_dataset/outlier_frames.py, find_outliers_in_raw_data
++#
++# ``pickle_file.endswith(...)`` on a parameter documented as ``str | Path``.
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("as_path", [True, False], ids=["Path", "str"])
++def test_find_outliers_in_raw_data_accepts_the_types_it_documents(
++    project, preselection_stubs, monkeypatch, as_path
++):
++    from deeplabcut.refine_training_dataset import outlier_frames
++
++    config, video = project
++    pickle_file = video.with_name(f"{video.stem}DLC_resnet50_full.pickle")
++    detections = {
++        "metadata": {"all_joints_names": ["bpt"], "nframes": 2},
++        "frame0000": {"coordinates": ([np.zeros((1, 2))],), "confidence": [np.array([[0.01]])]},
++        "frame0001": {"coordinates": ([np.zeros((1, 2))],), "confidence": [np.array([[0.99]])]},
++    }
++    with pickle_file.open("wb") as handle:
++        pickle.dump(detections, handle)
++
++    calls = []
++    monkeypatch.setattr(
++        outlier_frames,
++        "ExtractFramesbasedonPreselection",
++        lambda *args, **kwargs: calls.append((args, kwargs)),
++    )
++
++    outlier_frames.find_outliers_in_raw_data(
++        str(config),
++        Path(pickle_file) if as_path else str(pickle_file),
++        video_file=str(video),
++        extraction_algo="uniform",
++    )
++    # A str-only implementation raises AttributeError on the Path half before
++    # getting here; anything that reached the extractor parsed the file name.
++    assert len(calls) == 1
++
++
++# ---------------------------------------------------------------------------
++# utils/conversioncode.py, analyze_videos_converth5_to_csv / _to_nwb
++#
++# The ``listofvideos=True`` branch passes the caller's list straight to
++# ``_convert_h5_files_to``, which was migrated to ``Path`` and uses
++# ``video.name`` / ``video.stem`` -- so the documented list of ``str`` raises.
++# ---------------------------------------------------------------------------
++def _fake_analysis_output(video, scorer="DLC_resnet50_PathTest"):
++    """A minimal analyze_videos-shaped .h5 next to ``video``."""
++    columns = pd.MultiIndex.from_product(
++        [[scorer], ["bpt"], ["x", "y", "likelihood"]],
++        names=["scorer", "bodyparts", "coords"],
++    )
++    frame = pd.DataFrame(np.zeros((3, 3)), columns=columns)
++    h5 = Path(video).with_name(f"{Path(video).stem}{scorer}.h5")
++    frame.to_hdf(h5, key="df_with_missing", mode="w")
++    return h5
++
++
++@pytest.mark.parametrize("as_path", [True, False], ids=["Path", "str"])
++def test_converth5_to_csv_accepts_the_list_the_gui_passes(tmp_path, as_path):
++    from deeplabcut.utils.conversioncode import analyze_videos_converth5_to_csv
++
++    video = _write_video(tmp_path / "videos" / "clip.avi")
++    h5 = _fake_analysis_output(video)
++
++    analyze_videos_converth5_to_csv([video if as_path else str(video)], listofvideos=True)
++
++    assert h5.with_suffix(".csv").is_file(), "the h5 next to the video was not converted"
++
++
++@pytest.mark.parametrize("as_path", [True, False], ids=["Path", "str"])
++def test_converth5_to_nwb_normalises_the_list_before_using_it(tmp_path, monkeypatch, as_path):
++    # dlc2nwb is an optional dependency, so this checks the same normalisation
++    # one call earlier: what _convert_h5_files_to is handed.
++    from deeplabcut.utils import conversioncode
++
++    video = _write_video(tmp_path / "videos" / "clip.avi")
++    _fake_analysis_output(video)
++    seen = {}
++    monkeypatch.setattr(
++        conversioncode,
++        "_convert_h5_files_to",
++        lambda filetype, config, h5_files, videos: seen.update(videos=list(videos)),
++    )
++
++    conversioncode.analyze_videos_converth5_to_nwb(
++        "config.yaml", [video if as_path else str(video)], listofvideos=True
++    )
++
++    assert seen["videos"], "no video reached _convert_h5_files_to"
++    assert all(isinstance(v, Path) for v in seen["videos"]), (
++        f"_convert_h5_files_to uses video.name and video.stem, got {seen['videos']}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# utils/plotting.py, plot_trajectories
++#
++# ``failures`` collects elements of the ``Path`` list collect_video_paths
++# returns; ``",".join`` over them raises TypeError instead of printing the
++# diagnostic the branch exists for, after all the per-video work is done.
++# ---------------------------------------------------------------------------
++def test_plot_trajectories_reports_unanalysed_videos_instead_of_raising(project, monkeypatch, capsys):
++    from deeplabcut.utils import plotting
++
++    config, video = project
++    monkeypatch.setattr(
++        plotting.auxiliaryfunctions,
++        "get_scorer_name",
++        lambda *args, **kwargs: ("DLC_resnet50_absent", "DLC_resnet50_absent_legacy"),
++    )
++
++    plotting.plot_trajectories(str(config), [str(video)], video_extensions="avi")
++
++    out = capsys.readouterr().out
++    assert "Plots could not be created for" in out
++    assert video.name in out
++
++
++# ---------------------------------------------------------------------------
++# pose_estimation_tensorflow/modelzoo/api/superanimal_inference.py
++#
++# ``video.split(".")[-1]`` on an element of ``videos``, which
++# modelzoo/video_inference.py never coerces.
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("as_path", [True, False], ids=["Path", "str"])
++def test_superanimal_video_inference_derives_the_extension_from_either_type(tmp_path, monkeypatch, as_path):
++    pytest.importorskip("tensorflow")
++    from deeplabcut.pose_estimation_tensorflow.modelzoo import api
++    from deeplabcut.pose_estimation_tensorflow.modelzoo.api import superanimal_inference
++
++    video = tmp_path / "some.dotted.dir" / "clip.avi"
++    video.parent.mkdir(parents=True)
++    video.write_bytes(b"")
++    seen = {}
++
++    class _Adapter:
++        def __init__(self, video, superanimal_name, modelfolder, video_extensions, scale_list):
++            seen["video_extensions"] = video_extensions
++
++        def before_adapt_inference(self, **kwargs):
++            seen["ran"] = True
++
++    monkeypatch.setattr(api, "SpatiotemporalAdaptation", _Adapter)
++
++    superanimal_inference._video_inference_superanimal(
++        [Path(video) if as_path else str(video)],
++        "superanimal",
++        "topviewmouse",
++        video_adapt=False,
++    )
++
++    assert seen.get("ran")
++    assert seen["video_extensions"] == "avi"
++
++
++# ---------------------------------------------------------------------------
++# pose_estimation_tensorflow/predict_videos.py, AnalyzeVideo
++#
++# cv2.VideoCapture only accepts str; collect_video_paths and
++# compat.analyze_videos both hand it a Path.  Hard crash, single-animal
++# TensorFlow video analysis is unusable.
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("as_path", [True, False], ids=["Path", "str"])
++def test_analyze_video_opens_a_path(tmp_path, monkeypatch, as_path):
++    pytest.importorskip("tensorflow")
++    from deeplabcut.pose_estimation_tensorflow import predict_videos
++
++    video = _write_video(tmp_path / "videos" / "clip.avi")
++    saved = {}
++
++    def fake_load_analyzed_data(*args, **kwargs):
++        raise FileNotFoundError("nothing analysed yet")
++
++    def fake_pose(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes):
++        saved["nframes_seen"] = nframes
++        return np.zeros((nframes, 3)), nframes
++
++    def fake_save_data(predictions, metadata, dataname, pdindex, imagenames, save_as_csv):
++        saved["dataname"] = Path(dataname)
++        saved["n"] = len(predictions)
++
++    monkeypatch.setattr(predict_videos.auxiliaryfunctions, "load_analyzed_data", fake_load_analyzed_data)
++    monkeypatch.setattr(predict_videos.auxiliaryfunctions, "save_data", fake_save_data)
++    monkeypatch.setattr(predict_videos, "GetPoseS_GTF", fake_pose)
++
++    scorer = predict_videos.AnalyzeVideo(
++        Path(video) if as_path else str(video),
++        "DLC_scorer",
++        "DLC_scorer_legacy",
++        0.95,
++        {"cropping": False, "iteration": 0},
++        {"batch_size": 1},
++        sess=None,
++        inputs=None,
++        outputs=None,
++        pdindex=None,
++        save_as_csv=False,
++        TFGPUinference=True,
++    )
++
++    assert scorer == "DLC_scorer"
++    assert saved["nframes_seen"] == VIDEO_FRAMES
++    assert saved["n"] == VIDEO_FRAMES
++
++
++# ---------------------------------------------------------------------------
++# gui/tabs/create_videos.py, CreateVideos.create_videos
++#
++# ``", ".join(failed_videos)`` over the tab's ``set[Path]``.  Reached simply by
++# running the tab twice on the same video: create_labeled_video returns None
++# for a labeled video that already exists.
++# ---------------------------------------------------------------------------
++class _Value:
++    def __init__(self, value):
++        self._value = value
++
++    def value(self):
++        return self._value
++
++    def isChecked(self):
++        return self._value
++
++    def currentText(self):
++        return self._value
++
++
++class _Writer:
++    def __init__(self):
++        self.lines = []
++
++    def write(self, line):
++        self.lines.append(line)
++
++
++class _Root:
++    def __init__(self, config_path, writer):
++        self.config_path = config_path
++        self.shuffle_value = 1
++        self.writer = writer
++
++
++class _Tab:
++    """Stand-in for the tab widget: ``create_videos`` only reads attributes.
++
++    Building the real ``CreateVideos`` needs a main window and a running
++    QApplication; the method under test is plain Python, so it is called
++    unbound on an object carrying exactly the attributes it touches.
++    """
++
++
++def test_create_videos_tab_reports_failed_paths(tmp_path, monkeypatch):
++    pytest.importorskip("qtpy")
++    import deeplabcut
++
++    create_videos_tab = pytest.importorskip("deeplabcut.gui.tabs.create_videos")
++
++    failed = tmp_path / "videos" / "clip.avi"
++    writer = _Writer()
++    tab = _Tab()
++    tab.root = _Root(str(tmp_path / "config.yaml"), writer)
++    tab.files = {failed}
++    tab.trail_points = _Value(0)
++    tab.use_filtered_data_checkbox = _Value(False)
++    tab.bodyparts_to_use = []
++    tab.plot_all_bodyparts = _Value(True)
++    tab.create_high_quality_video = _Value(False)
++    tab.pcutoff_selector = _Value(0.6)
++    tab.draw_skeleton_checkbox = _Value(False)
++    tab.overwrite_videos = _Value(False)
++    tab.plot_trajectories = _Value(False)
++
++    monkeypatch.setattr(deeplabcut, "create_labeled_video", lambda **kwargs: [None])
++
++    create_videos_tab.CreateVideos.create_videos(tab)
++
++    assert writer.lines, "the failure was never reported"
++    assert failed.name in writer.lines[-1]

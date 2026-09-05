@@ -1,0 +1,130 @@
+From 7da991b9debe63d0a62728149544d7abc7d31ab4 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 14:38:00 -0400
+Subject: [PATCH] Cover the EfficientNet and MobileNet Keras ports in the
+ equivalence test
+
+`tests/test_nnets_keras_equivalence.py` is the only test that compares the
+eager Keras pose nets against the `tf_slim` graph they replace tensor for
+tensor, and its `CASES` covered ResNet-50 and MuNet only. The EfficientNet
+(patch "Port the EfficientNet backbone to eager TensorFlow 2 Keras") and
+MobileNet (patch "Port the MobileNet backbone to eager TensorFlow 2 Keras")
+backbones -- 126 KB of new numerical code -- had no numerical test at all.
+The other Keras test modules check weight names, weight counts, head shapes
+and config hygiene, none of which is sensitive to arithmetic: changing
+`relu_fn=tf.nn.swish` to `tf.nn.relu6` in `backbones/efficientnet_keras.py`,
+which moves the feature-map standard deviation by a factor of 500, left the
+suite green, and so did deleting the `- mean_pixel` subtraction from
+`MobilenetV2Keras.call`.
+
+Five cases are added, all of them by the existing mechanism, so nothing about
+the harness changes:
+
+* `mobilenet` and `mobilenet_batch4` -- the latter is the one that exercises
+  the per-image batch-norm reduction, since `PoseMobileNet.extract_features`
+  feeds `tf_slim` one image at a time for a batch larger than one;
+* `mobilenet_interm` -- intermediate supervision, i.e. the second head fed
+  from an end point rather than from the features;
+* `efficientnet` and `efficientnet_paf` -- single- and multi-animal.
+
+With the mutations above, all five fail: relative deltas of 448 and 460 for
+EfficientNet and 0.77 to 0.95 for MobileNet, against bounds of 1e-5 and 3e-4.
+They cost 14 s to 23 s each, i.e. the same as the ResNet case.
+
+Two smaller changes are needed to make the comparison say what it claims:
+
+* DeepLabCut is now imported before `tf_slim`. That is the order every
+  DeepLabCut entry point produces -- `deeplabcut` imports `tf_slim` itself,
+  from `nnets/mobilenet.py` -- and it is not cosmetic. Importing `tf_slim`
+  first makes TF1 name EfficientNet's 16 depthwise kernels
+  `efficientnet/efficientnet-b0/model/blocks_3/depthwise_conv2d_3/...`
+  instead of `efficientnet/efficientnet-b0/blocks_3/depthwise_conv2d/...`:
+  an extra `model/` scope and a graph-global counter. The module's
+  `pytest.importorskip("tf_slim")` at import time was enough to trigger it,
+  and the comparison would then have been against a graph no DeepLabCut
+  process ever builds.
+
+* MobileNet gets its own relative bound. It is the one backbone whose
+  inference batch norm reduces over the activations rather than restoring
+  stored statistics, so `tf.nn.fused_batch_norm`'s reduction and the port's
+  `reduce_mean` disagree at float32 rounding, 52 layers deep. The measured
+  relative delta is 3.0e-05 to 3.3e-05 across sizes and batch sizes, which
+  does not fit under `RTOL = 1e-5` and cleared `ATOL = 2e-4` by only 7%.
+  3e-4 leaves an order of magnitude of headroom and is still four orders of
+  magnitude tighter than the mutations above.
+---
+ tests/test_nnets_keras_equivalence.py | 36 ++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/tests/test_nnets_keras_equivalence.py b/tests/test_nnets_keras_equivalence.py
+index c8b0645..0668a94 100644
+--- a/tests/test_nnets_keras_equivalence.py
++++ b/tests/test_nnets_keras_equivalence.py
+@@ -28,6 +28,13 @@ import sys
+ import pytest
+ 
+ pytest.importorskip("tensorflow")
++# Import DeepLabCut before tf_slim, which is the order every DeepLabCut entry
++# point produces: ``deeplabcut`` pulls tf_slim in itself, through
++# ``nnets/mobilenet.py``.  It matters.  Importing tf_slim first changes the TF1
++# names of EfficientNet's 16 depthwise kernels -- they gain a ``model/`` scope
++# and a graph-global counter -- so the tf_slim graph would no longer be the one
++# ``deeplabcut`` builds and the comparison would be against a fiction.
++pytest.importorskip("deeplabcut.pose_estimation_tensorflow.nnets")
+ pytest.importorskip("tf_slim")
+ 
+ #: max |delta| accepted between the two engines, in the units of each tensor.
+@@ -48,6 +55,20 @@ WEIGHT_SCALE = 0.05
+ SEED = 20260905
+ #: max |delta| accepted on a predicted keypoint, in pixels.
+ POSE_ATOL = 1e-3
++#: per-case relative bound, where :data:`RTOL` is too tight to be meaningful.
++#:
++#: MobileNet is the one backbone whose inference batch norm reduces over the
++#: activations themselves rather than restoring stored statistics (see
++#: ``backbones/mobilenet_v2_keras.py``), so ``tf.nn.fused_batch_norm``'s
++#: reduction and this port's ``reduce_mean`` differ at float32 rounding, 52
++#: times over.  Measured relative delta is 3.0e-05 to 3.3e-05 across sizes and
++#: batch sizes; 3e-4 leaves an order of magnitude of headroom and is still four
++#: orders tighter than any of the mutations these cases exist to catch.
++RTOL_BY_CASE = {
++    "mobilenet": 3e-4,
++    "mobilenet_batch4": 3e-4,
++    "mobilenet_interm": 3e-4,
++}
+ 
+ 
+ def _pose_cfg(**kwargs):
+@@ -99,6 +120,18 @@ CASES = {
+     "resnet50_batch4": (_pose_cfg(batch_size=4), [(200, 168)]),
+     "munet_stride4": (_multi_animal(stride=4, multi_stage=True), [(200, 168), (201, 169)]),
+     "dual_fusion_stride4": (_multi_animal(stride=4), [(200, 168)]),
++    "mobilenet": (_pose_cfg(net_type="mobilenet_v2_1.0"), [(200, 168), (201, 169)]),
++    "mobilenet_batch4": (_pose_cfg(net_type="mobilenet_v2_1.0", batch_size=4), [(200, 168)]),
++    "mobilenet_interm": (
++        _pose_cfg(
++            net_type="mobilenet_v2_1.0",
++            intermediate_supervision=True,
++            intermediate_supervision_layer=12,
++        ),
++        [(200, 168)],
++    ),
++    "efficientnet": (_pose_cfg(net_type="efficientnet-b0"), [(200, 168), (201, 169)]),
++    "efficientnet_paf": (_multi_animal(net_type="efficientnet-b0"), [(200, 168)]),
+ }
+ 
+ 
+@@ -291,11 +324,12 @@ def test_keras_matches_tf_slim(tmp_path, case):
+     assert verdict["n_loaded"] == verdict["n_slim_variables"]
+     assert verdict["n_checkpoint_tensors_unused"] == 0
+ 
++    rtol = RTOL_BY_CASE.get(case, RTOL)
+     for size, errors in verdict["sizes"].items():
+         for key, error in errors.items():
+             assert isinstance(error, list), f"{case} {size} {key}: {error}"
+             absolute, relative = error
+-            assert absolute < ATOL or relative < RTOL, (
++            assert absolute < ATOL or relative < rtol, (
+                 f"{case} {size} {key}: max |delta| = {absolute} ({relative} relative)"
+             )
+ 

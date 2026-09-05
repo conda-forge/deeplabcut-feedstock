@@ -1,0 +1,178 @@
+From d5e07460c432c3291e640bc9a0b111dcb62c6ea6 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 14:38:00 -0400
+Subject: [PATCH] Fail the run when the TensorFlow tests are skipped wholesale
+
+The 162 Keras pose-net tests are skippable twice over, and both skips are
+silent:
+
+* each of the five modules starts with `pytest.importorskip("tensorflow")`,
+  so in an environment without TensorFlow all 162 disappear and pytest exits
+  0. The conda recipe runs no pytest at all, so nothing would notice.
+
+* eager execution is per-process global state that only ever flips one way,
+  so anything that builds a TF1 graph earlier in the same run makes
+  `ensure_eager_execution` raise for the rest of the session, and each
+  module's autouse fixture turns that into a skip. Building one placeholder
+  before calling `pytest.main` on the five modules gives `157 skipped`, exit
+  code 0.
+
+Both shapes have already happened during this port -- once a fixture left
+eager disabled and silently skipped 49 tests while reporting green, once a
+subprocess imported the installed package instead of the tree under test --
+and both times the run was green.
+
+`tests/conftest.py` now records, per tracked module, how many tests were
+collected and how many actually reached their call phase, and fails the
+session if a module was collected but contributed nothing. The two cases
+above become, respectively, five "skipped while being imported" lines and
+four "all N collected tests were skipped" lines, plus exit code 1.
+
+One session-scoped guard rather than a change to each module's eager
+fixture: a fixture that raised instead of skipping would catch the ordering
+half only and would say nothing about modules that were never imported, and
+it would have to be repeated in every module that is added later. The
+counting is done with `trylast=True` so that `-k`/`-m` deselection is not
+mistaken for a mass skip, and `DLC_ALLOW_SKIPPED_TF_TESTS=1` waives the
+guard for a run that deliberately has no TensorFlow -- it has to be typed,
+which is the point.
+
+The sdist ships no `tests/conftest.py`; upstream's git tree does, and there
+this file's hooks belong at the end of it.
+---
+ tests/conftest.py | 126 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 126 insertions(+)
+ create mode 100644 tests/conftest.py
+
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..9765d5c
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,126 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""Refuse to report success when the TensorFlow test modules quietly vanish.
++
++The Keras pose-net tests are skippable twice over, and both skips are silent:
++
++* every one of them sits behind ``pytest.importorskip("tensorflow")``, so in an
++  environment without TensorFlow all 162 of them disappear and pytest exits 0;
++* eager execution is per-process global state that only ever flips one way, so
++  anything that builds a TF1 graph earlier in the same run -- another test
++  module, a plugin, a stray import -- makes ``ensure_eager_execution`` raise for
++  the rest of the session, and the modules' autouse fixture turns that into a
++  skip.  ``python -c "import tensorflow, deeplabcut...; build a placeholder"``
++  followed by pytest gives ``157 skipped``, exit code 0.
++
++Both have already happened during this port, and both looked green.  This guard
++turns either into a failing run: a tracked module that was collected must
++contribute at least one test that actually ran.
++
++One session-scoped guard rather than a change to each module's eager fixture,
++because only this shape catches *both* causes -- a fixture that raised instead
++of skipping would say nothing about the modules that never got imported -- and
++because it keeps working when a sixth Keras test module is added without
++remembering the convention.
++
++Set ``DLC_ALLOW_SKIPPED_TF_TESTS=1`` to run the rest of the suite in an
++environment that deliberately has no TensorFlow.  It has to be typed, which is
++the whole point.
++"""
++import os
++
++import pytest
++
++#: Modules that exist only to test the eager TensorFlow port.  Skipping any of
++#: them entirely means the run tested nothing about it.
++TF_TEST_MODULES = (
++    "test_nnets_efficientnet_keras.py",
++    "test_nnets_keras.py",
++    "test_nnets_keras_equivalence.py",
++    "test_nnets_keras_mobilenet.py",
++    "test_nnets_losses.py",
++)
++
++#: Environment variable that waives the guard.
++WAIVER_ENV = "DLC_ALLOW_SKIPPED_TF_TESTS"
++
++_collected = {}
++_ran = {}
++_import_skipped = {}
++
++
++def _tracked(nodeid):
++    """The tracked module ``nodeid`` belongs to, or ``None``."""
++    name = nodeid.split("::", 1)[0].replace(os.sep, "/").rsplit("/", 1)[-1]
++    return name if name in TF_TEST_MODULES else None
++
++
++def pytest_collectreport(report):
++    # A module that raises Skipped while being imported -- which is what
++    # pytest.importorskip does -- is reported here and produces no items at all.
++    name = _tracked(report.nodeid)
++    if name is not None and report.outcome == "skipped":
++        _import_skipped[name] = str(report.longrepr)
++
++
++@pytest.hookimpl(trylast=True)
++def pytest_collection_modifyitems(items):
++    # trylast: count what the run will really attempt, after -k/-m deselection,
++    # so that `pytest -k resnet` is not reported as a mass skip.
++    for item in items:
++        name = _tracked(item.nodeid)
++        if name is not None:
++            _collected[name] = _collected.get(name, 0) + 1
++
++
++def pytest_runtest_logreport(report):
++    # A skipped test never reaches its call phase, so this counts exactly the
++    # tests whose body ran, passing or failing.
++    if report.when != "call" or report.outcome == "skipped":
++        return
++    name = _tracked(report.nodeid)
++    if name is not None:
++        _ran[name] = _ran.get(name, 0) + 1
++
++
++def _problems(config=None):
++    if config is not None and config.option.collectonly:
++        return []  # nothing was meant to run
++    problems = []
++    for name in TF_TEST_MODULES:
++        if name in _import_skipped:
++            problems.append(f"{name}: skipped while being imported -- {_import_skipped[name]}")
++        elif _collected.get(name) and not _ran.get(name):
++            problems.append(f"{name}: all {_collected[name]} collected tests were skipped")
++    return problems
++
++
++def pytest_sessionfinish(session):
++    if _problems(session.config) and not os.environ.get(WAIVER_ENV):
++        session.exitstatus = pytest.ExitCode.TESTS_FAILED
++
++
++def pytest_terminal_summary(terminalreporter):
++    problems = _problems(terminalreporter.config)
++    if not problems:
++        return
++    waived = bool(os.environ.get(WAIVER_ENV))
++    terminalreporter.write_sep("=", "TensorFlow tests were skipped wholesale", red=not waived)
++    for problem in problems:
++        terminalreporter.write_line(problem)
++    if waived:
++        terminalreporter.write_line(f"({WAIVER_ENV} is set, so this run is not failed for it.)")
++    else:
++        terminalreporter.write_line(
++            "This run tested nothing about the eager TensorFlow port.  Install "
++            "TensorFlow, or find what built a TF1 graph before these modules ran "
++            f"(eager cannot be turned back on), or set {WAIVER_ENV}=1 on purpose."
++        )

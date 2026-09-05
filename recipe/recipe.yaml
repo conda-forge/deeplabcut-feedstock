@@ -42,6 +42,9 @@ source:
     - patches/0025-Dispatch-multi-animal-TensorFlow-training-on-the-pos.patch
     - patches/0026-Set-training-logging-up-before-the-config-is-read.patch
     - patches/0027-Restore-EfficientNet-ImageNet-weights-in-the-eager-t.patch
+    - patches/0028-Cover-the-EfficientNet-and-MobileNet-Keras-ports-in-.patch
+    - patches/0029-Fail-the-run-when-the-TensorFlow-tests-are-skipped-w.patch
+    - patches/0030-Test-the-Path-str-boundaries-fixed-in-the-pathlib-fo.patch
 
 build:
   number: 0
