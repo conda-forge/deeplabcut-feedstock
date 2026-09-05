@@ -33,6 +33,7 @@ source:
     - patches/0016-Derive-the-score-map-size-the-way-the-networks-actua.patch
     - patches/0017-Remove-tf.compat.v1-from-the-TensorFlow-entry-points.patch
     - patches/0018-Port-the-multi-animal-training-loop-to-eager-Tensor.patch
+    - patches/0019-Keep-the-caller-s-pose_cfg-out-of-Keras-attribute-tr.patch
 
 build:
   number: 0

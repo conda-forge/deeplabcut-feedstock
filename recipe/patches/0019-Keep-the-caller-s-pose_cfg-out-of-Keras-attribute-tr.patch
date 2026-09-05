@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 08:40:03 -0400
+Subject: [PATCH] Keep the caller's pose_cfg out of Keras attribute tracking
+
+BaseKerasPoseNet stored the config with a plain
+
+    self.cfg = cfg
+
+and the class is a tf.keras.Model, so that assignment went through
+tf.keras.Model.__setattr__.  That replaces any list or dict it is handed with
+a ListWrapper or DictWrapper so the contents can be checkpointed, and for a
+nested structure it does so *in place*.  Building a Keras pose net therefore
+handed the caller back its own pose_cfg dict with the lists inside it
+replaced by trackable objects.
+
+Reading tests/data/pose_cfg.yaml and building either Keras net leaves six of
+its top-level values wrapped -- all_joints, all_joints_names, multi_step,
+partaffinityfield_graph, motion_blur and mean_pixel -- and all_joints, a list
+of lists, is wrapped recursively.
+
+Nothing raises at that point, which is why it was first seen as harmless in a
+training loop.  The damage happens later: DeepLabCut writes these dicts back
+to disk with yaml.dump in several places --
+auxiliaryfunctions.write_plainconfig, core.config.write_config, and the
+pose_cfg round trip in create_training_dataset -- and a ListWrapper does not
+dump as a YAML list.  Dumping that same config produces 90 lines carrying
+
+    !!python/object/apply:tensorflow.python.trackable.data_structures.ListWrapper
+
+so the first thing that re-saved a config after a Keras net had been built
+would have written a pose_cfg.yaml or config.yaml full of Python object tags.
+That is silent, persistent and user visible, and it survives the process that
+caused it.
+
+Fix: assign cfg with object.__setattr__, wrapped in a set_untracked() helper
+that carries the explanation, so Keras never sees the assignment.  Layers and
+weights still go through normal attribute assignment and stay tracked, so
+checkpointing, trainable_variables and slim_weight_map() are unaffected.
+
+Deliberately not a deepcopy.  Keeping the identity of the dict is what
+BasePoseNet does, and PoseMultiNet relies on it: its __init__ writes
+cfg["multi_stage"] = multi_stage and "resnet" in net_type back into the
+caller's dict.  A copy would have silently dropped that write-through and made
+the Keras net diverge from the tf_slim one.  There is a test for that
+specifically, so a future deepcopy "fix" fails instead of changing behaviour
+quietly.
+
+set_untracked() is also the answer for the backbones still being ported: a
+Keras backbone that keeps its own reference to cfg, or to anything else the
+caller owns, has to use it too.  Both the helper and the BaseKerasPoseNet
+docstring say so.
+
+Verified by round-tripping a real config: dump tests/data/pose_cfg.yaml,
+build a net, dump again, and the two are byte-identical with no !!python tags,
+both through yaml.dump directly and through DeepLabCut's own
+write_plainconfig / read_plainconfig.  Eleven new assertions in
+tests/test_nnets_keras.py cover it, and all eleven fail without this change.
+The last of them is parametrised over net_type rather than over the nets
+registered today, so a backbone added later is covered without editing the
+test; it skips with the factory's own message while there is no
+implementation.
+
+Full TensorFlow test suite: 2461 passed, 7 skipped, 5 xfailed.
+---
+ .../pose_estimation_tensorflow/nnets/base.py  |  35 +++++-
+ tests/test_nnets_keras.py                     | 100 ++++++++++++++++++
+ 2 files changed, 134 insertions(+), 1 deletion(-)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/base.py b/deeplabcut/pose_estimation_tensorflow/nnets/base.py
+index ce142052..b82b0af2 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/base.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/base.py
+@@ -235,6 +235,31 @@ class BasePoseNet(metaclass=abc.ABCMeta):
+         return inputs - mean
+ 
+ 
++def set_untracked(obj, name, value):
++    """Assign an attribute on a Keras object without Keras tracking it.
++
++    ``tf.keras.Model.__setattr__`` replaces any list or dict it is handed with
++    a ``ListWrapper``/``DictWrapper`` so the objects inside can be checkpointed,
++    and for a nested structure it does that **in place**.  A pose net that
++    simply did ``self.cfg = cfg`` would therefore hand the caller back its own
++    ``pose_cfg`` dict with every list and sub-dict replaced by a trackable
++    wrapper.  Nothing fails at that point, but DeepLabCut writes those dicts
++    back out with ``yaml.dump`` -- ``auxiliaryfunctions.write_plainconfig``,
++    ``write_config``, the ``pose_cfg`` round trip in
++    ``create_training_dataset`` -- and a wrapper does not dump as a plain YAML
++    list; it dumps as a ``!!python/object/apply`` tag, which corrupts the
++    user's ``pose_cfg.yaml`` or ``config.yaml`` permanently.
++
++    Bypassing the tracking also keeps the attribute the very same object the
++    caller passed, which is what ``BasePoseNet`` does and what
++    ``PoseMultiNet`` relies on when it writes ``cfg["multi_stage"]`` back.
++
++    Use this for anything a caller owns.  Layers and weights must NOT go
++    through it: those have to stay tracked.
++    """
++    object.__setattr__(obj, name, value)
++
++
+ def ensure_eager_execution():
+     """Make sure eager execution is on, and say so loudly when it cannot be.
+ 
+@@ -279,12 +304,20 @@ class BaseKerasPoseNet(tf.keras.Model, BasePoseNet):
+     There is no ``Session``, no placeholder, no ``variable_scope`` and no
+     ``arg_scope``: the ``tf_slim`` scope names survive only as strings, in the
+     ``slim_scope`` of each layer.
++
++    ``cfg`` is stored with :func:`set_untracked`, so building a net leaves the
++    caller's ``pose_cfg`` dict exactly as it was.  A subclass or a backbone
++    that keeps its own reference to ``cfg``, or to anything else the caller
++    owns, has to do the same.
+     """
+ 
+     def __init__(self, cfg, **kwargs):
+         ensure_eager_execution()
+         tf.keras.Model.__init__(self, **kwargs)
+-        self.cfg = cfg
++        # The caller owns cfg; keep it out of Keras's attribute tracking, which
++        # would otherwise rewrite its lists and dicts in place.  See
++        # set_untracked().
++        set_untracked(self, "cfg", cfg)
+         self._heads = {}
+ 
+     # -- layer construction helpers ----------------------------------------
+diff --git a/tests/test_nnets_keras.py b/tests/test_nnets_keras.py
+index 92726926..00cd2317 100644
+--- a/tests/test_nnets_keras.py
++++ b/tests/test_nnets_keras.py
+@@ -332,3 +332,103 @@ def test_a_few_sgd_steps_lower_the_loss():
+         optimizer.apply_gradients(zip(tape.gradient(loss, model.trainable_variables), model.trainable_variables))
+         losses.append(float(loss))
+     assert losses[-1] < losses[0]
++
++
++# ---------------------------------------------------------------------------
++# the caller's config dict
++# ---------------------------------------------------------------------------
++def _trackable_values(cfg):
++    """Values Keras has replaced with one of its tracking wrappers."""
++    found = {}
++    for key, value in cfg.items():
++        name = type(value).__name__
++        if name in ("ListWrapper", "_DictWrapper", "_ListWrapper", "DictWrapper", "_TupleWrapper"):
++            found[key] = name
++    return found
++
++
++@pytest.mark.parametrize("name,cfg,n_slim_variables", CONFIGS, ids=[c[0] for c in CONFIGS])
++def test_building_a_net_leaves_the_callers_config_alone(name, cfg, n_slim_variables):
++    """A pose net must not rewrite the dict it was handed.
++
++    tf.keras.Model.__setattr__ replaces lists and dicts with ListWrapper /
++    DictWrapper in place, so a plain ``self.cfg = cfg`` would hand the caller
++    back a pose_cfg whose lists are trackable objects.  yaml.dump writes those
++    as ``!!python/object/apply`` tags, and DeepLabCut saves these dicts back to
++    disk in several places, so the user's pose_cfg.yaml would be corrupted.
++    """
++    yaml = pytest.importorskip("yaml")
++    cfg = dict(cfg)
++    before = yaml.dump(cfg, default_flow_style=False)
++
++    model = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++
++    after = yaml.dump(cfg, default_flow_style=False)
++    assert _trackable_values(cfg) == {}
++    assert "!!python" not in after
++    assert after == before
++    # and the net keeps the caller's dict itself, as BasePoseNet does
++    assert model.cfg is cfg
++
++
++def test_config_survives_deeplabcuts_own_yaml_writers(tmp_path):
++    """The real corruption path: build a net, then let DeepLabCut save the config."""
++    yaml = pytest.importorskip("yaml")
++    from deeplabcut.utils.auxiliaryfunctions import read_plainconfig, write_plainconfig
++
++    cfg = multi_animal_cfg(stride=4, multi_stage=True)
++    cfg["all_joints"] = [[i] for i in range(cfg["num_joints"])]
++    cfg["multi_step"] = [[0.005, 10000], [0.02, 430000]]
++
++    reference = tmp_path / "pose_cfg_before.yaml"
++    write_plainconfig(str(reference), cfg)
++
++    PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++
++    written = tmp_path / "pose_cfg_after.yaml"
++    write_plainconfig(str(written), cfg)
++
++    assert "!!python" not in written.read_text()
++    assert written.read_text() == reference.read_text()
++    assert read_plainconfig(str(written)) == read_plainconfig(str(reference))
++    del yaml
++
++
++def test_multi_stage_is_written_back_like_the_tf_slim_net():
++    """PoseMultiNet edits cfg["multi_stage"] in place; the Keras net must too."""
++    from deeplabcut.pose_estimation_tensorflow.nnets.multi import PoseMultiNet
++
++    for net_type, expected in (("resnet_50", True), ("mobilenet_v2_1.0", False)):
++        slim_cfg = multi_animal_cfg(stride=4, multi_stage=True, net_type=net_type)
++        PoseMultiNet(slim_cfg)
++        assert slim_cfg["multi_stage"] is expected
++
++    keras_cfg = multi_animal_cfg(stride=4, multi_stage=True, net_type="resnet_50")
++    PoseNetFactory.create(keras_cfg, engine=KERAS_ENGINE)
++    assert keras_cfg["multi_stage"] is True
++
++
++@pytest.mark.parametrize(
++    "net_type",
++    ["resnet_50", "resnet_101", "mobilenet_v2_1.0", "mobilenet_v2_0.35", "efficientnet-b0"],
++)
++@pytest.mark.parametrize("stride", [8, 4])
++def test_no_registered_keras_net_touches_the_callers_config(net_type, stride):
++    """Same guarantee, for every backbone that has a Keras implementation.
++
++    Parametrised over net_types rather than over the nets registered today, so
++    a backbone added later is covered without editing this test.
++    """
++    yaml = pytest.importorskip("yaml")
++    cfg = multi_animal_cfg(stride=stride, multi_stage=stride < 8, net_type=net_type)
++    before = yaml.dump(cfg, default_flow_style=False)
++    try:
++        model = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++    except ValueError as err:
++        pytest.skip(f"no Keras implementation yet: {err}")
++    cfg["multi_stage"] = "resnet" in net_type and stride < 8  # the one edit that is by design
++    assert _trackable_values(cfg) == {}
++    after = yaml.dump(cfg, default_flow_style=False)
++    assert "!!python" not in after
++    assert after == before
++    assert model.cfg is cfg
