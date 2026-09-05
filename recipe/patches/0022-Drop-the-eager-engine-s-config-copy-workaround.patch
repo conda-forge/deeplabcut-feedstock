@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 09:30:00 -0400
+Subject: [PATCH] Drop the eager engine's config-copy workaround
+
+core/eager_session.plain() deep-converted pose_cfg before handing it to
+PoseNetFactory, and again before export_model dumped it to YAML, because
+BaseKerasPoseNet stored the config with a plain `self.cfg = cfg` and
+tf.keras.Model.__setattr__ rewrote the caller's lists and dicts into
+ListWrapper/DictWrapper in place.  Without it export_model died with
+"RepresenterError: cannot represent an object: ListWrapper([...])".
+
+That is fixed at source now: BaseKerasPoseNet assigns cfg through
+set_untracked(), so Keras never sees the assignment.  Building either Keras
+net from a real pose_cfg with no plain() anywhere leaves zero wrappers in the
+caller's dict, yaml.dump round-trips it unchanged, and the dump carries no
+!!python tags -- through DeepLabCut's own dumper as well as yaml's.
+
+Carrying both mechanisms would not just be redundant, it would be wrong.
+PoseMultiNetKeras.__init__ writes cfg["multi_stage"] = multi_stage and
+"resnet" in net_type back into the caller's dict, exactly as PoseMultiNet
+does, and set_untracked() was written to keep that write-through working --
+its commit message says so and there is a test for it.  Handing the factory
+plain(cfg) hands it a copy, which silently swallows that write and makes the
+Keras net diverge from the tf_slim one.  Nothing in the engine reads
+multi_stage after the net is built, so it was latent, but it was the very
+divergence the fix went out of its way to avoid.
+
+Re-verified after the removal, against the tf_slim engine: inference on 16
+real frames is bit-identical for resnet_50 at batch 1 and for resnet_50 +PAF
+at batch 8 (part_prob, locref, pairwise_pred all 0.0e+00, peak indices and
+decoded keypoints identical); export_model still resolves every node name,
+with concat_1 bit-identical and the multi-animal outputs at 2.7e-07 / 3.0e-06
+/ 3.9e-06 and Cast_2 identical; the exported pose_cfg.yaml reloads as a plain
+dict with no !!python tags; train_network still runs eagerly end to end and
+writes a snapshot the tf_slim graph reads back.
+---
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/eager_session.py b/deeplabcut/pose_estimation_tensorflow/core/eager_session.py
+index 1e6fa5c..a77118f 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/eager_session.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/eager_session.py
+@@ -29,23 +29,6 @@ import numpy as np
+ import tensorflow as tf
+ 
+ 
+-def plain(value):
+-    """Strip Keras's attribute-tracking wrappers out of a config.
+-
+-    ``BaseKerasPoseNet.__init__`` assigns ``cfg`` to an attribute of a
+-    ``tf.keras.Model``, which replaces its lists and dicts with ``ListWrapper``
+-    and ``_DictWrapper``.  Those are not YAML serialisable, so writing the
+-    exported pose_cfg.yaml fails.  Networks are handed a plain copy and
+-    anything on its way back out to YAML is converted back.
+-    """
+-    if isinstance(value, dict):
+-        return {k: plain(v) for k, v in value.items()}
+-    if isinstance(value, (list, tuple)):
+-        converted = [plain(v) for v in value]
+-        return tuple(converted) if isinstance(value, tuple) else converted
+-    return value
+-
+-
+ class Fetch:
+     """Stands in for a graph tensor in the (sess, inputs, outputs) contract."""
+ 
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/predict.py b/deeplabcut/pose_estimation_tensorflow/core/predict.py
+index 99dac18..7148b0f 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/predict.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/predict.py
+@@ -23,7 +23,7 @@ from deeplabcut.pose_estimation_tensorflow.nnets.factory import (
+ )
+ 
+ from . import legacy_tf1
+-from .eager_session import EagerSession, Fetch, plain
++from .eager_session import EagerSession, Fetch
+ from .train_eager import configure_gpu_memory_growth
+ from .openvino.session import OpenVINOSession
+ 
+@@ -31,11 +31,12 @@ from .openvino.session import OpenVINOSession
+ def build_eager_net(cfg, trace_batch=1):
+     """Build the Keras pose net and restore ``cfg["init_weights"]`` into it.
+ 
+-    The network is handed a plain copy of the config because
+-    ``BaseKerasPoseNet`` stores it on a ``tf.keras.Model``, which would replace
+-    its lists and dicts with Keras tracking wrappers.
++    ``cfg`` is passed through untouched: ``BaseKerasPoseNet`` stores it with
++    ``set_untracked``, and ``PoseMultiNetKeras`` writes ``cfg["multi_stage"]``
++    back into it the way the tf_slim net does, so it has to be the caller's own
++    dict and not a copy.
+     """
+-    net = PoseNetFactory.create(plain(cfg), engine=KERAS_ENGINE)
++    net = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
+     net.build_for([trace_batch, 64, 64, 3])
+     checkpoint.load_tf1_checkpoint(net, cfg["init_weights"])
+     return net
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/train.py b/deeplabcut/pose_estimation_tensorflow/core/train.py
+index 9565508..7ad8dd5 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/train.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/train.py
+@@ -32,7 +32,6 @@ from deeplabcut.pose_estimation_tensorflow.util.logging import setup_logging
+ from deeplabcut.utils import auxiliaryfunctions, auxfun_models
+ 
+ from . import legacy_tf1
+-from .eager_session import plain
+ 
+ # The eager training helpers are shared with core/train_multianimal.py; this
+ # module used to own LearningRate, but importing it turned eager execution off
+@@ -151,7 +150,7 @@ def _train_eager(
+     """
+     configure_gpu_memory_growth(allow_growth)
+ 
+-    net = PoseNetFactory.create(plain(cfg), engine=KERAS_ENGINE)
++    net = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
+     include, start_iter = _restore_plan(cfg, keepdeconvweights)
+ 
+     batches = iter(make_dataset(dataset, get_batch_spec(cfg)))
+diff --git a/deeplabcut/pose_estimation_tensorflow/export.py b/deeplabcut/pose_estimation_tensorflow/export.py
+index 1ccabd4..25eabcd 100644
+--- a/deeplabcut/pose_estimation_tensorflow/export.py
++++ b/deeplabcut/pose_estimation_tensorflow/export.py
+@@ -21,7 +21,6 @@ from tensorflow.python.framework.convert_to_constants import (
+ from deeplabcut.core.config import get_yaml_dumper, get_yaml_loader
+ from deeplabcut.pose_estimation_tensorflow.config import load_config
+ from deeplabcut.pose_estimation_tensorflow.core import legacy_tf1, predict
+-from deeplabcut.pose_estimation_tensorflow.core.eager_session import plain
+ from deeplabcut.pose_estimation_tensorflow.nnets.factory import KERAS_ENGINE, resolve_engine
+ from deeplabcut.utils import auxiliaryfunctions
+ 
+@@ -309,7 +308,7 @@ def export_model(
+     ### write pose config file
+ 
+     # sort dlc_cfg keys alphabetically, then save to pose_cfg.yaml in export directory
+-    dlc_cfg = plain(dict(dlc_cfg))
++    dlc_cfg = dict(dlc_cfg)
+     sorted_cfg = {}
+     for key, value in sorted(dlc_cfg.items()):
+         if wipepaths:
