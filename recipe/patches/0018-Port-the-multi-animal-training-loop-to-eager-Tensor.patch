@@ -1,0 +1,631 @@
+From 2a856ccaf338472251e839e6b71622743394e272 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 08:27:12 -0400
+Subject: [PATCH] Port the multi-animal training loop and the EfficientNet
+ helpers to TF2
+
+core/train_multianimal.py is the multi-animal training loop: a
+tf.compat.v1.Session driving a graph built once, fed by a FIFOQueue that a
+Python thread fills through a Coordinator, optimised by
+slim.learning.create_train_op and checkpointed by tf.compat.v1.train.Saver.
+All 11 of its tf.compat.v1 references are that machinery.  This rewrites it
+as an eager loop and removes every one of them.  nnets/utils.py loses 11 of
+its 14; the 3 that remain are named below and cannot go on their own.
+
+What replaces what, in core/train_eager.py -- new, and meant to be shared
+with core/train.py when that loop is ported:
+
+  make_dataset            the FIFOQueue(20), the 14 placeholders, the feeder
+                          thread and the Coordinator become
+                          tf.data.Dataset.from_generator(...).prefetch(20)
+                          over the same PoseDatasetFactory.  The batches are
+                          keyed by the *name* of each Batch member: tf.nest
+                          sorts the keys of a dict it flattens and Batch
+                          members do not compare, so a dict keyed by Batch
+                          cannot cross a tf.function boundary.
+  make_optimizer          MomentumOptimizer(lr, 0.9) keeps a <- 0.9a + g,
+                          w <- w - lr a and SGD(lr, momentum=0.9) keeps
+                          v <- 0.9v - lr g, w <- w + v, the same sequence for
+                          a constant lr.  AdamOptimizer defaults to
+                          epsilon=1e-8 and Keras to 1e-7, so it is passed.
+  make_train_step         create_train_op makes GraphKeys.UPDATE_OPS control
+                          dependencies of the loss, differentiates the
+                          trainable variables, applies the gradients,
+                          increments the global step and checks the loss for
+                          inf and nan.  Calling the layers with
+                          is_training=True applies those updates in place, so
+                          the order is preserved and nothing is collected.
+                          It does NOT add the regularization losses, and
+                          neither does this: DLC registers weight decay into
+                          GraphKeys.REGULARIZATION_LOSSES and never sums it
+                          into total_loss.
+  SnapshotSaver           Saver(max_to_keep=n).save(sess, prefix,
+                          global_step=it) becomes save_tf1_checkpoint plus the
+                          same retention policy and the same "checkpoint"
+                          state file.  The snapshot stays name-based, so the
+                          graph-mode code reads it unchanged.
+  LearningRate            copied from core/train.py, which cannot be imported:
+                          its line 34 disables eager execution for the whole
+                          process at import time.
+
+tf.compat.v1.train.Saver(slim.get_variables_to_restore(...)) becomes
+nnets/checkpoint.load_tf1_checkpoint with include_prefixes, which is the same
+filter; remove_head passes the model's own non-pose prefixes.  The redownload
+that auxfun_models.smart_restore performs is kept in restore_weights.
+tf.compat.v1.summary.{scalar,merge_all,FileWriter} become tf.summary; the
+ConfigProto/allow_growth dance becomes tf.config.experimental.
+
+Equivalence, measured on a real multi-animal project (openfield, 4 body
+parts, 6 limbs, PAF prediction on, resnet_50, batch size 8, Adam, lr 1e-4),
+both engines resuming the same snapshot-200 and running 20 iterations of the
+real multi-animal-imgaug pipeline from the same seed:
+
+  loss trajectory        identical at every one of the 20 iterations, to the
+                         4 decimals learning_stats.csv records
+  snapshot               271 tensors in both, the same names; the eager one
+                         adds global_step, which Saver.restore ignores
+  weights after 20 steps |w220 - w200| max 2.026e-03 mean 1.260e-04 in both;
+                         |tf1 - tf2| max 6.886e-04 mean 1.830e-06, i.e. 1.5%
+                         of the movement on average and 4.9e-05 of the mean
+                         weight.  Adam divides by sqrt(v), so a float32
+                         difference in the gradient is amplified wherever the
+                         gradient is near zero; 766 of 24003544 scalars move
+                         in one run and not the other.
+  restore                predict.setup_pose_prediction reads the snapshot the
+                         eager loop wrote and runs; the graph-mode training
+                         graph's own Saver restores all 271 of its variables
+                         with max |restored - checkpoint| = 0.
+
+Batch norm, the thing a naive GradientTape drops.  Same project as
+DLCRNet/MuNet (stride 4, multi_stage, batch size 2) from the ImageNet
+resnet_v1_50 checkpoint, 10 iterations:
+
+  decoder moving_mean      1280/1280 scalars moved, max |x - 0| 0.036 (tf1)
+                           and 0.033 (eager)
+  decoder moving_variance  1280/1280 scalars moved, max |x - 1| 0.0092 (tf1)
+                           and 0.0090 (eager)
+  backbone moving_mean/variance  0 of 53120 scalars moved, in both engines
+
+The last line is the control: multi.py builds the resnet backbone with
+is_training=False even while training, so its 106 moving averages are frozen
+in the graph-mode loop too.  The eager loop reproduces both halves -- the
+decoder's statistics track, the backbone's do not -- which is what shows the
+update mechanism survived rather than that something is simply moving.
+
+nnets/utils.py.  build_learning_rate's exponential_decay is
+keras.optimizers.schedules.ExponentialDecay, which is what
+tf.compat.v1.train.exponential_decay calls in graph mode; the five
+tf.compat.v1.logging.info and the one .fatal are tf.get_logger();
+tf.compat.v1.div is tf.math.divide for the float input drop_connect gives it.
+build_optimizer's three optimizers become their keras.optimizers.legacy
+counterparts, except that tf.compat.v1.train.RMSPropOptimizer initialises its
+mean-square accumulator to one and Keras initialises it to zero, which is a
+different optimiser and not a rounding difference: 50 steps on a quadratic
+diverge by 6.3e-01 without the RMSProp subclass here and are bit-identical
+with it.  TpuBatchNormalization._moments gains the mask argument Keras has
+passed since 2.13; without it the class raises TypeError the moment it
+normalises with batch statistics, so it has been unusable, and the one place
+that would build it is commented out.
+
+Per function, against the pre-port module in the same graph-mode process:
+batch_spec, wrapper, the gaussian kernel, all four learning-rate schedules
+over 3000 steps, both batch-norm classes (variable names, the update_ops they
+publish, outputs and moving averages over 6 batches), drop_connect and
+DepthwiseConv2D are bit-identical; sgd and rmsprop are bit-identical over 50
+steps and momentum differs by 5.96e-08, two float32 ulp at 0.27.
+
+The three tf.compat.v1 references left in nnets/utils.py are the base classes
+of TpuBatchNormalization, BatchNormalization and DepthwiseConv2D, and they
+are load-bearing for EfficientNet's variable names.  backbones/
+efficientnet_model.py builds the rest of that network from
+tf.compat.v1.layers.Conv2D and tf.compat.v1.variable_scope inside a
+tf.keras.Model; a tf.compat.v1 layer takes its name from the variable scope
+and a plain Keras layer takes it from the enclosing Keras model, so swapping
+only these three renames every batch-norm and depthwise variable of the
+backbone, inserting a "model/" component the convolutions around them do not
+get: efficientnet/efficientnet-b0/blocks_0/tpu_batch_normalization/gamma
+becomes efficientnet/efficientnet-b0/model/blocks_0/tpu_batch_normalization/
+gamma, and depthwise_conv2d is uniquified differently.  Measured on the whole
+EfficientNet-B0 pose net: 308 variables, none of the names shared with the
+graph the pretrained checkpoint was written for.  They can only move together
+with the rest of that backbone.  With them left alone that net is unchanged:
+308 variables, 212 trainable, 96 update_ops, identical names, and the three
+heads and the moving averages bit-identical, with and without
+use_batch_norm.
+---
+ .../core/train_eager.py                       | 161 ++++++++++++++++++
+ .../core/train_multianimal.py                 | 144 +++++++++-------
+ .../pose_estimation_tensorflow/nnets/utils.py |  39 +++--
+ 3 files changed, 266 insertions(+), 78 deletions(-)
+ create mode 100644 deeplabcut/pose_estimation_tensorflow/core/train_eager.py
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/train_eager.py b/deeplabcut/pose_estimation_tensorflow/core/train_eager.py
+new file mode 100644
+index 0000000..893a7eb
+--- /dev/null
++++ b/deeplabcut/pose_estimation_tensorflow/core/train_eager.py
+@@ -0,0 +1,161 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""Pieces a TensorFlow 2 training loop needs that no longer come from a Session.
++
++``setup_preloading``/``start_preloading`` (a FIFOQueue fed by a Python thread
++through a Coordinator), ``slim.learning.create_train_op`` and
++``tf.train.Saver`` each have a direct eager counterpart; they are collected
++here so the single- and multi-animal loops share one implementation.
++"""
++
++import os
++from pathlib import Path
++
++import tensorflow as tf
++
++from deeplabcut.pose_estimation_tensorflow.datasets import Batch
++
++#: Depth of the prefetch queue, i.e. the capacity of the FIFOQueue it replaces.
++QUEUE_SIZE = 20
++
++
++class LearningRate:
++    """The piecewise schedule of ``multi_step``, stepped once per iteration.
++
++    Lives here rather than in ``core/train.py`` because importing that module
++    turns eager execution off for the whole process.
++    """
++
++    def __init__(self, cfg):
++        self.steps = cfg["multi_step"]
++        self.current_step = 0
++
++    def get_lr(self, iteration):
++        lr = self.steps[self.current_step][0]
++        if iteration == self.steps[self.current_step][1]:
++            self.current_step += 1
++
++        return lr
++
++
++def configure_gpu_memory_growth(allow_growth=True):
++    """Grow the GPU allocation on demand instead of taking the whole device."""
++    if not allow_growth:
++        return
++    for device in tf.config.list_physical_devices("GPU"):
++        try:
++            tf.config.experimental.set_memory_growth(device, True)
++        except RuntimeError:
++            # The device is already initialised; its policy cannot change now.
++            pass
++
++
++def make_dataset(dataset, batch_spec, queue_size=QUEUE_SIZE):
++    """Prefetch the batches of a ``PoseDataset`` into a ``tf.data`` pipeline.
++
++    ``dataset.next_batch()`` returns a ``{Batch: numpy array}`` dictionary and
++    never runs out.  The result yields the same batches keyed by the *name* of
++    each ``Batch`` member: ``tf.nest`` sorts the keys of a dictionary it flattens
++    and ``Batch`` members do not compare.
++    """
++    keys = sorted(batch_spec, key=lambda k: k.value)
++
++    def generator():
++        while True:
++            batch = dataset.next_batch()
++            yield tuple(batch[key].astype("float32") for key in keys)
++
++    signature = tuple(tf.TensorSpec(batch_spec[key], tf.float32) for key in keys)
++    pipeline = tf.data.Dataset.from_generator(generator, output_signature=signature)
++    pipeline = pipeline.prefetch(queue_size)
++    names = [key.name for key in keys]
++    return pipeline.map(lambda *tensors: dict(zip(names, tensors)))
++
++
++def make_optimizer(cfg, learning_rate):
++    """The optimizer ``core/train.get_optimizer`` builds, without a graph.
++
++    ``MomentumOptimizer(lr, 0.9)`` keeps ``a <- 0.9 a + g``, ``w <- w - lr a``
++    and ``SGD(lr, momentum=0.9)`` keeps ``v <- 0.9 v - lr g``, ``w <- w + v``,
++    the same sequence for a constant learning rate.  ``AdamOptimizer`` defaults
++    to ``epsilon=1e-8`` where Keras defaults to ``1e-7``, so it is passed.
++    """
++    if cfg["optimizer"] == "sgd":
++        return tf.keras.optimizers.legacy.SGD(learning_rate=learning_rate, momentum=0.9)
++    if cfg["optimizer"] == "adam":
++        return tf.keras.optimizers.legacy.Adam(learning_rate=learning_rate, epsilon=1e-8)
++    raise ValueError("unknown optimizer {}".format(cfg["optimizer"]))
++
++
++def make_train_step(net, optimizer, global_step, variables_to_train=None):
++    """One optimisation step, the eager form of ``create_train_op``.
++
++    ``create_train_op`` makes the update operations of every batch
++    normalisation layer control dependencies of the loss, computes the
++    gradients of the trainable variables, applies them and increments the
++    global step, checking the loss for inf and nan on the way.  Calling the
++    layers with ``is_training=True`` applies those updates in place, so the
++    order is the same and nothing has to be collected.
++    """
++
++    @tf.function(reduce_retracing=True)
++    def train_step(batch, learning_rate):
++        optimizer.learning_rate.assign(learning_rate)
++        with tf.GradientTape() as tape:
++            losses = net.train({Batch[name]: tensor for name, tensor in batch.items()})
++            total_loss = tf.debugging.check_numerics(losses["total_loss"], "LossTensor is inf or nan")
++        variables = net.trainable_variables if variables_to_train is None else variables_to_train
++        gradients = tape.gradient(total_loss, variables)
++        optimizer.apply_gradients(zip(gradients, variables))
++        global_step.assign_add(1)
++        return losses
++
++    return train_step
++
++
++class SnapshotSaver:
++    """Write name-based snapshots, keeping the last ``max_to_keep`` of them.
++
++    Reproduces what ``tf.train.Saver(max_to_keep=n).save(sess, prefix,
++    global_step=it)`` leaves on disk: the checkpoint shards, the ``checkpoint``
++    state file naming the newest and listing the ones kept, and the deletion of
++    everything older.
++    """
++
++    def __init__(self, model, prefix, max_to_keep=5):
++        from deeplabcut.pose_estimation_tensorflow.nnets import save_tf1_checkpoint
++
++        self._save = save_tf1_checkpoint
++        self.model = model
++        self.prefix = str(prefix)
++        self.max_to_keep = max_to_keep
++        self.saved = []
++
++    def save(self, global_step):
++        written = self._save(self.model, self.prefix, global_step=global_step, write_state=False)
++        self.saved.append(written)
++        while self.max_to_keep and len(self.saved) > self.max_to_keep:
++            self._remove(self.saved.pop(0))
++        self._write_state()
++        return written
++
++    @staticmethod
++    def _remove(written):
++        path = Path(written)
++        for stale in path.parent.glob(path.name + ".*"):
++            stale.unlink(missing_ok=True)
++
++    def _write_state(self):
++        directory = os.path.dirname(os.path.abspath(self.prefix)) or "."
++        with open(os.path.join(directory, "checkpoint"), "w") as handle:
++            handle.write(f'model_checkpoint_path: "{os.path.basename(self.saved[-1])}"\n')
++            for written in self.saved:
++                handle.write(f'all_model_checkpoint_paths: "{os.path.basename(written)}"\n')
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py b/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py
+index c63c116..c7af77e 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py
+@@ -15,20 +15,57 @@ import os
+ from pathlib import Path
+ 
+ import tensorflow as tf
+-import tf_slim as slim
+ 
+ from deeplabcut.pose_estimation_tensorflow.config import load_config
+-from deeplabcut.pose_estimation_tensorflow.core.train import (
++from deeplabcut.pose_estimation_tensorflow.core.train_eager import (
+     LearningRate,
+-    get_optimizer,
+-    setup_preloading,
+-    start_preloading,
++    SnapshotSaver,
++    configure_gpu_memory_growth,
++    make_dataset,
++    make_optimizer,
++    make_train_step,
+ )
+ from deeplabcut.pose_estimation_tensorflow.datasets import PoseDatasetFactory
+-from deeplabcut.pose_estimation_tensorflow.nnets import PoseNetFactory
++from deeplabcut.pose_estimation_tensorflow.nnets import (
++    KERAS_ENGINE,
++    PoseNetFactory,
++    ensure_eager_execution,
++    load_tf1_checkpoint,
++)
+ from deeplabcut.pose_estimation_tensorflow.nnets.utils import get_batch_spec
+ from deeplabcut.pose_estimation_tensorflow.util.logging import setup_logging
+-from deeplabcut.utils import auxfun_models
++from deeplabcut.utils import auxfun_models, auxiliaryfunctions
++
++BACKBONE_SCOPES = {
++    "resnet": "resnet_v1",
++    "mobilenet": "MobilenetV2",
++    "efficientnet": "efficientnet",
++}
++
++
++def restore_weights(net, checkpoint_path, net_type, include_prefixes=None):
++    """Load ``checkpoint_path`` into ``net``, redownloading it when it is missing.
++
++    Same contract as ``auxfun_models.smart_restore``: a checkpoint that does not
++    load and that sits where DeepLabCut keeps its pretrained weights is fetched
++    again before the load is retried.
++    """
++    try:
++        return load_tf1_checkpoint(net, checkpoint_path, include_prefixes=include_prefixes)
++    except (ValueError, tf.errors.OpError) as err:
++        dlcparent_path = auxiliaryfunctions.get_deeplabcut_path()
++        expected = auxfun_models.MODELTYPE_FILEPATH_MAP.get(net_type)
++        if expected is None or str(checkpoint_path) != str(dlcparent_path / expected):
++            raise
++        auxfun_models.check_for_weights(net_type, dlcparent_path)
++        return load_tf1_checkpoint(net, checkpoint_path, include_prefixes=include_prefixes)
++
++
++def build_net(cfg):
++    """Build the pose net and create its weights."""
++    net = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++    net.build_for([cfg["batch_size"], 200, 200, 3])
++    return net
+ 
+ 
+ def train(
+@@ -48,8 +85,10 @@ def train(
+     superanimal=None,
+     remove_head=False,
+ ):
+-    # in case there was already a graph
+-    tf.compat.v1.reset_default_graph()
++    ensure_eager_execution()
++    # in case there was already a model
++    tf.keras.backend.clear_session()
++    configure_gpu_memory_growth(allow_growth)
+ 
+     start_path = Path.cwd()
+     if modelfolder == "":
+@@ -98,14 +137,9 @@ def train(
+     dataset = PoseDatasetFactory.create(cfg)
+ 
+     batch_spec = get_batch_spec(cfg)
+-    batch, enqueue_op, placeholders = setup_preloading(batch_spec)
++    batches = iter(make_dataset(dataset, batch_spec))
+ 
+-    losses = PoseNetFactory.create(cfg).train(batch)
+-    total_loss = losses["total_loss"]
+-
+-    for k, t in losses.items():
+-        tf.compat.v1.summary.scalar(k, t)
+-    merged_summaries = tf.compat.v1.summary.merge_all()
++    net = build_net(cfg)
+     net_type = cfg["net_type"]
+ 
+     if init_weights != "":
+@@ -116,7 +150,7 @@ def train(
+     stem = Path(cfg["init_weights"]).stem
+     if "snapshot" in stem and keepdeconvweights:
+         print("Loading already trained DLC with backbone:", net_type)
+-        variables_to_restore = slim.get_variables_to_restore()
++        include_prefixes = None
+         if cfg.get("resume_weights_only", False):
+             start_iter = 0
+         else:
+@@ -124,49 +158,34 @@ def train(
+ 
+         if remove_head:
+             # removing the decoding layer from the checkpoint
+-            temp = []
+-            for variable in variables_to_restore:
+-                if "pose" not in variable.name:
+-                    temp.append(variable)
+-            variables_to_restore = temp
++            include_prefixes = sorted(
++                {name.split("/")[0] for name in net.slim_weight_map() if "pose" not in name}
++            )
+ 
+     else:
+         print("Loading ImageNet-pretrained", net_type)
+         # loading backbone from ResNet, MobileNet etc.
+-        if "resnet" in net_type:
+-            variables_to_restore = slim.get_variables_to_restore(include=["resnet_v1"])
+-        elif "mobilenet" in net_type:
+-            variables_to_restore = slim.get_variables_to_restore(include=["MobilenetV2"])
+-        elif "efficientnet" in net_type:
+-            variables_to_restore = slim.get_variables_to_restore(include=["efficientnet"])
+-            variables_to_restore = {
+-                var.op.name.replace("efficientnet/", "") + "/ExponentialMovingAverage": var
+-                for var in variables_to_restore
+-            }
+-        else:
++        scope = next((s for key, s in BACKBONE_SCOPES.items() if key in net_type), None)
++        if scope is None:
+             print("Wait for DLC 2.3.")
++        include_prefixes = [scope] if scope else []
+         start_iter = 0
+ 
+-    restorer = tf.compat.v1.train.Saver(variables_to_restore)
+-    saver = tf.compat.v1.train.Saver(
+-        max_to_keep=max_to_keep
+-    )  # selects how many snapshots are stored, see https://github.com/DeepLabCut/DeepLabCut/issues/8#issuecomment-387404835
++    restore_weights(net, cfg["init_weights"], net_type, include_prefixes)
+ 
+-    if allow_growth:
+-        config = tf.compat.v1.ConfigProto()
+-        config.gpu_options.allow_growth = True
+-        sess = tf.compat.v1.Session(config=config)
++    global_step = tf.Variable(start_iter, dtype=tf.int64, trainable=False, name="global_step")
++    if "efficientnet" in net_type:
++        cfg["optimizer"] = "adam"
++        schedule = tf.keras.optimizers.schedules.CosineDecay(
++            cfg["lr_init"], cfg["decay_steps"], alpha=cfg["alpha_r"]
++        )
+     else:
+-        sess = tf.compat.v1.Session()
++        schedule = None
++    optimizer = make_optimizer(cfg, cfg.get("lr_init", 0.005))
++    train_step = make_train_step(net, optimizer, global_step)
+ 
+-    coord, thread = start_preloading(sess, enqueue_op, dataset, placeholders)
+-    train_writer = tf.compat.v1.summary.FileWriter(cfg["log_dir"], sess.graph)
+-    learning_rate, train_op, tstep = get_optimizer(total_loss, cfg)
+-
+-    sess.run(tf.compat.v1.global_variables_initializer())
+-    sess.run(tf.compat.v1.local_variables_initializer())
+-
+-    auxfun_models.smart_restore(restorer, sess, cfg["init_weights"], net_type)
++    saver = SnapshotSaver(net, cfg["snapshot_prefix"], max_to_keep=max_to_keep)
++    train_writer = tf.summary.create_file_writer(cfg["log_dir"])
+ 
+     if maxiters is None:
+         max_iter = int(cfg["multi_step"][-1][1])
+@@ -200,18 +219,14 @@ def train(
+     print("Starting multi-animal training....")
+     max_iter += start_iter  # max_iter is relative to start_iter
+     for it in range(start_iter, max_iter + 1):
+-        if "efficientnet" in net_type:
+-            lr_dict = {tstep: it - start_iter}
+-            current_lr = sess.run(learning_rate, feed_dict=lr_dict)
++        if schedule is not None:
++            current_lr = float(schedule(it - start_iter))
+         else:
+             current_lr = lr_gen.get_lr(it - start_iter)
+-            lr_dict = {learning_rate: current_lr}
+ 
+-        # [_, loss_val, summary] = sess.run([train_op, total_loss, merged_summaries],feed_dict={learning_rate:
+-        # current_lr})
+-        [_, alllosses, loss_val, summary] = sess.run(
+-            [train_op, losses, total_loss, merged_summaries], feed_dict=lr_dict
+-        )
++        alllosses = train_step(next(batches), tf.constant(current_lr, tf.float32))
++        alllosses = {k: float(v) for k, v in alllosses.items()}
++        loss_val = alllosses["total_loss"]
+ 
+         partloss += alllosses["part_loss"]  # scoremap loss
+         if cfg["location_refinement"]:
+@@ -220,7 +235,9 @@ def train(
+             pwloss += alllosses["pairwise_loss"]
+ 
+         cumloss += loss_val
+-        train_writer.add_summary(summary, it)
++        with train_writer.as_default(step=it):
++            for k, v in alllosses.items():
++                tf.summary.scalar(k, v)
+         if it % display_iters == 0 and it > start_iter:
+             logging.info(
+                 "iteration: {} loss: {} scmap loss: {} locref loss: {} limb loss: {} lr: {}".format(
+@@ -251,14 +268,11 @@ def train(
+ 
+         # Save snapshot
+         if (it % save_iters == 0 and it != start_iter) or it == max_iter:
+-            model_name = cfg["snapshot_prefix"]
+-            saver.save(sess, model_name, global_step=it)
++            saver.save(global_step=it)
+     if lrf:
+         lrf.close()
+ 
+-    sess.close()
+-    coord.request_stop()
+-    coord.join([thread])
++    train_writer.close()
+ 
+     # return to original path.
+     os.chdir(str(start_path))
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/utils.py b/deeplabcut/pose_estimation_tensorflow/nnets/utils.py
+index 5641ffc..01202bc 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/utils.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/utils.py
+@@ -23,6 +23,17 @@ from tensorflow.python.tpu.ops import tpu_ops
+ 
+ from deeplabcut.pose_estimation_tensorflow.datasets import Batch
+ 
++logger = tf.get_logger()
++
++
++class RMSProp(tf.keras.optimizers.legacy.RMSprop):
++    """RMSProp whose mean-square accumulator starts at one rather than zero."""
++
++    def _create_slots(self, var_list):
++        for var in var_list:
++            self.add_slot(var, "rms", "ones")
++        super()._create_slots(var_list)
++
+ 
+ def wrapper(func, *args, **kwargs):
+     partial_func = functools.partial(func, *args, **kwargs)
+@@ -105,7 +116,9 @@ def build_learning_rate(
+     if lr_decay_type == "exponential":
+         assert steps_per_epoch is not None
+         decay_steps = steps_per_epoch * decay_epochs
+-        lr = tf.compat.v1.train.exponential_decay(initial_lr, global_step, decay_steps, decay_factor, staircase=True)
++        lr = tf.keras.optimizers.schedules.ExponentialDecay(
++            initial_lr, decay_steps, decay_factor, staircase=True
++        )(global_step)
+     elif lr_decay_type == "cosine":
+         assert total_steps is not None
+         lr = 0.5 * initial_lr * (1 + tf.cos(np.pi * tf.cast(global_step, tf.float32) / total_steps))
+@@ -115,7 +128,7 @@ def build_learning_rate(
+         raise AssertionError(f"Unknown lr_decay_type : {lr_decay_type}")
+ 
+     if warmup_epochs:
+-        tf.compat.v1.logging.info(f"Learning rate warmup_epochs: {warmup_epochs}")
++        logger.info(f"Learning rate warmup_epochs: {warmup_epochs}")
+         warmup_steps = int(warmup_epochs * steps_per_epoch)
+         warmup_lr = initial_lr * tf.cast(global_step, tf.float32) / tf.cast(warmup_steps, tf.float32)
+         lr = tf.cond(
+@@ -130,16 +143,16 @@ def build_learning_rate(
+ def build_optimizer(learning_rate, optimizer_name="rmsprop", decay=0.9, epsilon=0.001, momentum=0.9):
+     """Build optimizer."""
+     if optimizer_name == "sgd":
+-        tf.compat.v1.logging.info("Using SGD optimizer")
+-        optimizer = tf.compat.v1.train.GradientDescentOptimizer(learning_rate=learning_rate)
++        logger.info("Using SGD optimizer")
++        optimizer = tf.keras.optimizers.legacy.SGD(learning_rate=learning_rate)
+     elif optimizer_name == "momentum":
+-        tf.compat.v1.logging.info("Using Momentum optimizer")
+-        optimizer = tf.compat.v1.train.MomentumOptimizer(learning_rate=learning_rate, momentum=momentum)
++        logger.info("Using Momentum optimizer")
++        optimizer = tf.keras.optimizers.legacy.SGD(learning_rate=learning_rate, momentum=momentum)
+     elif optimizer_name == "rmsprop":
+-        tf.compat.v1.logging.info("Using RMSProp optimizer")
+-        optimizer = tf.compat.v1.train.RMSPropOptimizer(learning_rate, decay, momentum, epsilon)
++        logger.info("Using RMSProp optimizer")
++        optimizer = RMSProp(learning_rate=learning_rate, rho=decay, momentum=momentum, epsilon=epsilon)
+     else:
+-        tf.compat.v1.logging.fatal(f"Unknown optimizer: {optimizer_name}")
++        logger.fatal(f"Unknown optimizer: {optimizer_name}")
+     return optimizer
+ 
+ 
+@@ -165,16 +178,16 @@ class TpuBatchNormalization(tf.compat.v1.layers.BatchNormalization):
+             ]
+         return tpu_ops.cross_replica_sum(t, group_assignment) / tf.cast(num_shards_per_group, t.dtype)
+ 
+-    def _moments(self, inputs, reduction_axes, keep_dims):
++    def _moments(self, inputs, reduction_axes, keep_dims, mask=None):
+         """Compute the mean and variance: it overrides the original _moments."""
+-        shard_mean, shard_variance = super()._moments(inputs, reduction_axes, keep_dims=keep_dims)
++        shard_mean, shard_variance = super()._moments(inputs, reduction_axes, keep_dims=keep_dims, mask=mask)
+ 
+         num_shards = tpu_function.get_tpu_context().number_of_shards or 1
+         if num_shards <= 8:  # Skip cross_replica for 2x2 or smaller slices.
+             num_shards_per_group = 1
+         else:
+             num_shards_per_group = max(8, num_shards // 8)
+-        tf.compat.v1.logging.info(f"TpuBatchNormalization with num_shards_per_group {num_shards_per_group}")
++        logger.info(f"TpuBatchNormalization with num_shards_per_group {num_shards_per_group}")
+         if num_shards_per_group > 1:
+             # Compute variance using: Var[X]= E[X^2] - E[X]^2.
+             shard_square_of_mean = tf.math.square(shard_mean)
+@@ -207,7 +220,7 @@ def drop_connect(inputs, is_training, drop_connect_rate):
+     random_tensor = keep_prob
+     random_tensor += tf.random.uniform([batch_size, 1, 1, 1], dtype=inputs.dtype)
+     binary_tensor = tf.floor(random_tensor)
+-    output = tf.compat.v1.div(inputs, keep_prob) * binary_tensor
++    output = tf.math.divide(inputs, keep_prob) * binary_tensor
+     return output
+ 
+ 
