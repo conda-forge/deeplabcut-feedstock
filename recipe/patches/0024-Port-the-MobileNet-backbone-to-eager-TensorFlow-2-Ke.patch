@@ -1,0 +1,1130 @@
+From f6b1b24fbbcdabb5b47412339ec3c6e6a2aeac60 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 09:53:49 -0400
+Subject: [PATCH] Port the MobileNet backbone to eager TensorFlow 2 / Keras
+
+backbones/mobilenet.py, backbones/mobilenet_v2.py and nnets/conv_blocks.py
+are a vendored copy of the tf_slim model-zoo MobilenetV2 -- 1141 lines
+carrying 57 slim.* and 11 tf.compat.v1 references before 0014.  They use
+slim only for its layer wrappers (conv2d, separable_conv2d, batch_norm,
+arg_scope), all of which have exact Keras equivalents, so the whole
+backbone fits in one eager tf.keras.Model.
+
+backbones/mobilenet_v2_keras.py is that model.  MobilenetV2Keras registers
+with KerasBackboneFactory under "mobilenet"; PoseMobileNetKeras derives
+from BaseKerasPoseNet and registers with PoseNetFactory under
+engine=KERAS_ENGINE, so resolve_engine picks it up from pose_cfg.yaml's
+tf_engine key or DLC_TF_ENGINE.  The tf_slim path is untouched and stays
+the default.  Every layer carries the tf_slim variable scope it replaces
+and implements slim_weights(), so slim_weight_map(), load_tf1_checkpoint
+and save_tf1_checkpoint work with no MobileNet-specific plumbing: 266
+weights mapped, unmapped_weights() empty.  The heads are
+keras_prediction_layer via BaseKerasPoseNet._add_head, at the same
+pose/{part_pred,locref_pred,pairwise_pred,intermediate_supervision}/block4
+scopes.
+
+Since 0020 made core/predict dispatch on the engine, this is the piece
+that makes a net_type=mobilenet_v2_* project actually runnable on the
+eager path: setup_pose_prediction now builds the Keras net, restores a
+snapshot through load_tf1_checkpoint and returns score maps that go
+straight into extract_cnn_output and argmax_pose_predict.
+
+The two things that needed care
+
+Inference-time batch norm, i.e. patch 0014.  PoseMobileNet builds the
+backbone through mobilenet_v2.training_scope(), which defaults to
+is_training=True, so all 52 batch-norm layers normalise with batch
+statistics even at inference.  0014 keeps that -- switching to the stored
+moving averages costs 4.72 -> 12.79 px test error -- and removes only the
+dependence on batch composition, by building the backbone one image at a
+time and concatenating.  SlimBatchNorm expresses the same thing directly:
+it reduces over [height, width] instead of [batch, height, width].  That
+is one pass instead of N, it drops 0014's 3.5 s -> 25.7 s graph
+construction, and it works for a dynamic batch dimension, which the
+replication trick could not: a tf.function traced on [None, H, W, 3] --
+the shape export_model uses -- gives the same prediction for an image at
+batch sizes 1, 2, 4 and 8 and under shuffled companions, to 2.4e-6 in the
+part_pred logits.  Exported MobileNet graphs consumed in batches were the
+one case 0014 left unfixed.
+
+Unlike the resnet backbone, which PoseResnet builds with is_training=False
+unconditionally so its batch norm never updates, this one really does
+train: dumping the tf_slim graph shows 52 FusedBatchNormV3 nodes with
+is_training=True and 104 UPDATE_OPS in the training graph.
+PoseMobileNetKeras.extract_features therefore passes is_training through
+to the backbone, and there is a test that the moving averages move when,
+and only when, is_training is set.
+
+The caller's pose_cfg.  MobilenetV2Keras keeps no reference to cfg at all
+-- only scalars and a fresh copy of mean_pixel -- so tf.keras.Model's
+attribute tracking never touches the caller's dict; PoseMobileNetKeras
+gets cfg through BaseKerasPoseNet, which uses set_untracked.  Verified the
+way 0019 asks: write_plainconfig, build the net, write_plainconfig again,
+byte-identical with no !!python tags.  Reverting either half makes six of
+the new tests fail, and write_plainconfig then raises RepresenterError on
+ListWrapper([123.68, 116.779, 103.939]) rather than corrupting silently.
+
+Equivalence against the patched tf_slim implementation
+
+Over all four stock net_types at batch sizes 1 and 4, 73 tensors each (19
+layer_N endpoints, 50 intermediate endpoints, the feature map and the
+part_pred / locref / part_pred_interm heads), 128x160 input, with the real
+ImageNet weights restored:
+
+  every variable maps 1:1, 266 of 266, no unmapped Keras weight
+  end_point key sets identical, 69 of 69
+  worst relative deviation   8.1e-5, always on layer_19 (relu6-saturated)
+  keypoints through predict.argmax_pose_predict
+                             max 5.9e-4 px, mean 2.8e-4 px
+  peak likelihoods           max 4.4e-6
+
+With TF_ENABLE_ONEDNN_OPTS=0 on both sides, which removes the difference
+between oneDNN's graph-mode fusions and eager execution, those become
+6.8e-5, 4.0e-4 px and 2.1e-4 px.
+
+That residual is the float32 noise floor of this network, not a defect of
+the port.  Re-associating one line of the same Keras code -- (x-m)*s+b
+instead of x*s+(b-m*s), algebraically identical and both matching
+fused_batch_norm to 2 ulp in isolation -- moves the feature map by 2.3e-4,
+and running the very same model in float64 moves it by 2.2e-4, against
+3.7e-4 for the gap to tf_slim; evaluating the port in float64 brings it
+closer to tf_slim's float32 result (2.7e-4), not further away.
+MobileNet's 52 chained batch-norm layers amplify a per-layer rounding
+difference the same way 0014 measured them amplifying a real
+perturbation: 18.7% at layer 1 becoming 72% at layer 52.  Two correct
+float32 implementations of this network cannot agree more closely than
+this, and the port sits inside that floor.
+
+Batch independence holds exactly where batch norm decides it.  Across all
+four multipliers the backbone feature map at batch 4 is bit-identical to
+the batch-1 one, 0.000e+00, however the batch is composed.  The heads are
+not quite: Conv2DTranspose accumulates differently for different batch
+sizes, which moves the keypoints by 1e-5 px and is the same last-bit noise
+the tf_slim graph shows between its own batch-1 and batch-4 builds
+(1.2e-6).  End to end through core/predict.setup_pose_prediction the same
+frame gives the same keypoints at batch size 1 and 4 to 2.0e-5 px.  As a
+control, SlimBatchNorm also offers the reduction the unpatched code
+performs (bn_mode="batch"), which reproduces stock tf_slim to 2.9e-5 -
+5.5e-4 and exhibits the bug 0014 describes: at batch size 4 the keypoints
+of a fixed image move by 51 to 130 px depending on its companions.
+
+The checkpoint bridge works in both directions.  The ImageNet checkpoint
+loads with 266 of 266 tensors bit-identical and nothing left over; five
+tf.GradientTape steps train the net, 1.97901 -> 1.86072, moving 258 of the
+266 tensors (the eight that do not are project/BatchNorm/beta on residual
+blocks, whose gradients underflow float32 at this learning rate -- no
+trainable variable got a None gradient); save_tf1_checkpoint writes it
+back out, and a bare tf.compat.v1.train.Saver().restore reads it into the
+unmodified tf_slim graph and reproduces the feature map to 4.9e-5
+relative.
+
+Landmines checked rather than assumed.  slim.l2_regularizer(s) is
+s*sum(w^2)/2 while keras.regularizers.l2(s) is s*sum(w^2), so the
+convolutions go through layers.slim_l2_regularizer; the 35 backbone
+convolutions and 3 heads produce 38 regularization losses and the
+depthwise kernels produce none, matching training_scope's
+weights_regularizer=None for separable_conv2d.  Nothing sums model.losses
+into the loss, because slim.learning.create_train_op never added them.
+slim's separable_conv2d with num_outputs=None is depthwise only, with no
+pointwise stage, so it maps to DepthwiseConv2D and not SeparableConv2D;
+depth_multiplier=1 gives the same [k, k, in, 1] kernel slim stores as
+depthwise_weights, under that name and not "weights".  Batch norm is
+pinned to slim.batch_norm's epsilon of 1e-3, to training_scope's decay of
+0.997 and to V2_DEF's scale=True rather than left on the Keras defaults or
+on layers.py's SLIM_BN_* constants, which are slim's unmodified ones.
+The 15th op's stride is 1, not the 2 of the upstream architecture, which
+is DeepLabCut's change to get output stride 16.
+
+Tests
+
+tests/test_nnets_keras_mobilenet.py, 39 eager-only tests covering the
+contract, the end_point names, the checkpoint round trip, the three
+batch-norm modes, the dynamic-batch graph, the pose_cfg guarantee and the
+core/predict entry point.  Its eager fixture leaves eager on, like the
+other Keras modules, so the four compose in any collection order; that was
+checked over seven different orders.
+
+Two config tests are also generalised, and this fixes three failures that
+predate this change.  Both asserted that building a Keras net leaves the
+caller's pose_cfg byte-identical, which is not the property anyone wants:
+PoseMultiNet turns cfg["multi_stage"] off for a backbone that is not a
+resnet, and PoseEfficientNet.__init__ has always filled in
+cfg["use_batch_norm"] and cfg["use_drop_out"], both of them in the tf_slim
+engine as much as the Keras one, and callers rely on the write-through --
+0022 removed a config copy that was silently swallowing exactly this.  The
+property that matters is parity between the engines: build the tf_slim net
+on a second copy of the config and compare against what it leaves behind.
+That needs no enumeration of which net writes which key, so a backbone
+added later is covered without editing the test again.  What the tests
+still catch unchanged is the corruption 0019 fixed -- a ListWrapper in the
+caller's dict, or a !!python tag in the YAML -- and they still have teeth:
+making PoseMobileNetKeras write one spurious key and leak one list fails
+seven of them.
+
+  before: 10 failed, 198 passed, 4 skipped
+   after:  7 failed, 244 passed, 0 skipped
+
+The three that go green are
+test_nnets_efficientnet_keras.py::test_pose_net_leaves_the_caller_config_alone
+and test_no_registered_keras_net_touches_the_callers_config[{4,8}-efficientnet-b0].
+The seven that remain are FileNotFoundError on test data the sdist does
+not ship, identical before and after, as are the 91 collection errors.
+All four Keras suites together: 132 passed, nothing skipped.
+
+Reference counts are unchanged in the shipped package: 111 tf.compat.v1
+and 96 slim. occurrences in deeplabcut/ before and after, because the
+tf_slim MobileNet has to stay selectable.  The new backbone contains
+neither.  What retiring the tf_slim MobileNet would remove is 10
+tf.compat.v1 and 42 slim. occurrences -- backbones/mobilenet.py (6 and
+25), backbones/mobilenet_v2.py (0 and 16) and the tf_slim half of
+nnets/mobilenet.py (4 and 1) -- plus nnets/conv_blocks.py's 4 and 7, which
+can only go once PoseMultiNet stops importing expanded_conv from it.
+
+Not covered.  PoseMultiNetKeras will now find a mobilenet backbone, since
+it asks KerasBackboneFactory for one, but it indexes end_points by resnet
+block names and would fail at the first forward pass; that mirrors the
+tf_slim net, whose own mobilenet branch is unreachable because it needs
+stride < 8 and nothing writes such a value.
+---
+ .../backbones/mobilenet_v2_keras.py           | 332 ++++++++++++++
+ .../nnets/__init__.py                         |   3 +-
+ .../nnets/mobilenet.py                        |  48 +-
+ tests/test_nnets_efficientnet_keras.py        |  23 +-
+ tests/test_nnets_keras.py                     |  13 +-
+ tests/test_nnets_keras_mobilenet.py           | 421 ++++++++++++++++++
+ 6 files changed, 829 insertions(+), 11 deletions(-)
+ create mode 100644 deeplabcut/pose_estimation_tensorflow/backbones/mobilenet_v2_keras.py
+ create mode 100644 tests/test_nnets_keras_mobilenet.py
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/backbones/mobilenet_v2_keras.py b/deeplabcut/pose_estimation_tensorflow/backbones/mobilenet_v2_keras.py
+new file mode 100644
+index 0000000..b12871f
+--- /dev/null
++++ b/deeplabcut/pose_estimation_tensorflow/backbones/mobilenet_v2_keras.py
+@@ -0,0 +1,332 @@
++#
++# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++"""MobileNet V2 as an eager ``tf.keras`` backbone.
++
++Replaces, for ``net_type=mobilenet_v2_*``, the vendored tf_slim model-zoo copy
++in ``backbones/mobilenet.py`` + ``backbones/mobilenet_v2.py`` +
++``nnets/conv_blocks.py``, restricted to the configurations DeepLabCut builds:
++``mobilenet_base`` with ``base_only=True``, depth multipliers 1.0/0.75/0.5/0.35
++and ``finegrain_classification_mode`` for the small ones.
++
++Contains no ``tf.compat.v1``, no ``tf_slim``, no ``variable_scope``, no
++``arg_scope``, no placeholder and no Session.  Every layer carries the tf_slim
++variable scope it stands in for and exposes ``slim_weights()``, so
++``BaseKerasPoseNet.slim_weight_map`` and ``nnets/checkpoint.py`` handle
++snapshots in both directions with no further plumbing.
++
++Inference-time batch norm is the part that needs care.  ``PoseMobileNet``
++builds this backbone through ``mobilenet_v2.training_scope()``, which defaults
++to ``is_training=True``, so all 52 batch-norm layers normalise with batch
++statistics even at inference.  Those 52 layers *are* the feature extractor and
++switching them to the stored moving averages destroys accuracy, so the
++behaviour is kept.  What ``BN_PER_IMAGE`` removes is the dependence on which
++images share a batch: it reduces over ``[height, width]`` only, which is what
++the tf_slim code computes when it is handed one image at a time.  Unlike the
++graph replication it replaces it costs one pass instead of N and works for a
++dynamic batch dimension, so exported models get it too.
++"""
++
++import tensorflow as tf
++
++from deeplabcut.pose_estimation_tensorflow.nnets.factory import KerasBackboneFactory
++from deeplabcut.pose_estimation_tensorflow.nnets.layers import SlimConv
++
++# tf_slim defaults, from mobilenet.training_scope() and V2_DEF.  Note these are
++# not slim.batch_norm's own defaults: training_scope() overrides decay, and
++# V2_DEF overrides scale.
++MOBILENET_BN_DECAY = 0.997
++MOBILENET_BN_EPSILON = 1e-3  # slim.batch_norm's default epsilon
++MOBILENET_BN_SCALE = True  # V2_DEF sets center=True, scale=True
++MOBILENET_WEIGHT_DECAY = 0.00004  # mobilenet.training_scope(weight_decay=...)
++MOBILENET_STDDEV = 0.09  # mobilenet.training_scope(stddev=...)
++
++#: normalise every image by its own statistics: patch 0014's behaviour
++BN_PER_IMAGE = "per_image"
++#: normalise by the statistics of the whole batch: stock tf_slim at inference
++BN_BATCH = "batch"
++#: normalise by the stored moving averages, which costs 4.72 -> 12.79 px
++BN_MOVING = "moving"
++
++
++def _make_divisible(v, divisor=8, min_value=None):
++    """Verbatim from nnets/conv_blocks.py."""
++    if min_value is None:
++        min_value = divisor
++    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
++    if new_v < 0.9 * v:
++        new_v += divisor
++    return new_v
++
++
++#: depth multiplier and finegrain flag per net_type, matching nnets/mobilenet.py
++MOBILENET_VARIANTS = {
++    "mobilenet_v2_1.0": (1.0, False),
++    "mobilenet_v2_0.75": (0.75, True),
++    "mobilenet_v2_0.5": (0.5, True),
++    "mobilenet_v2_0.35": (0.35, True),
++}
++
++# Architecture: https://arxiv.org/abs/1801.04381, as spelled out by
++# mobilenet_v2.V2_DEF.  NOTE the stride of the 15th op is 1 and not 2: that is
++# DeepLabCut's change, to get an output stride of 16 instead of 32.
++V2_SPEC = (
++    {"op": "conv", "stride": 2, "num_outputs": 32, "kernel_size": 3},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 16, "expansion": 1, "expansion_divisible_by": 1},
++    {"op": "expanded_conv", "stride": 2, "num_outputs": 24},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 24},
++    {"op": "expanded_conv", "stride": 2, "num_outputs": 32},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 32},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 32},
++    {"op": "expanded_conv", "stride": 2, "num_outputs": 64},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 64},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 64},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 64},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 96},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 96},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 96},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 160},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 160},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 160},
++    {"op": "expanded_conv", "stride": 1, "num_outputs": 320},
++    {"op": "conv", "stride": 1, "num_outputs": 1280, "kernel_size": 1},
++)
++
++
++class SlimBatchNorm(tf.keras.layers.BatchNormalization):
++    """``slim.batch_norm`` with a selectable inference-time reduction.
++
++    ``training=True`` is ordinary Keras batch norm, which is what tf_slim does
++    while training, moving-average update and decay included.  With
++    ``training=False`` the reduction is chosen by ``mode``; see the module
++    docstring for why the default is not the moving averages.
++    """
++
++    def __init__(self, mode=BN_PER_IMAGE, **kwargs):
++        kwargs.setdefault("epsilon", MOBILENET_BN_EPSILON)
++        kwargs.setdefault("momentum", MOBILENET_BN_DECAY)
++        super().__init__(axis=-1, center=True, scale=MOBILENET_BN_SCALE, **kwargs)
++        self.mode = mode
++
++    def call(self, inputs, training=None):
++        if training:
++            return super().call(inputs, training=True)
++        if self.mode == BN_MOVING:
++            return super().call(inputs, training=False)
++        # BN_PER_IMAGE reduces over height and width only, which is what the
++        # tf_slim graph computes when it is given one image at a time.
++        axes = [1, 2] if self.mode == BN_PER_IMAGE else [0, 1, 2]
++        mean = tf.reduce_mean(inputs, axis=axes, keepdims=True)
++        variance = tf.reduce_mean(
++            tf.math.squared_difference(inputs, tf.stop_gradient(mean)),
++            axis=axes,
++            keepdims=True,
++        )
++        # Same association as tf.nn.fused_batch_norm: fold gamma into the scale
++        # and the mean into the offset, then a single multiply-add.
++        scale = tf.math.rsqrt(variance + self.epsilon) * self.gamma
++        return inputs * scale + (self.beta - mean * scale)
++
++
++class MobilenetConv(SlimConv):
++    """``slim.conv2d`` + ``slim.batch_norm`` with MobileNet's normalisation."""
++
++    def __init__(self, slim_scope, filters, kernel_size, strides=1, activation=None,
++                 weight_decay=MOBILENET_WEIGHT_DECAY, stddev=MOBILENET_STDDEV,
++                 bn_mode=BN_PER_IMAGE, **kwargs):
++        super().__init__(
++            slim_scope,
++            filters,
++            kernel_size,
++            strides=strides,
++            padding="same",
++            use_bn=True,
++            bn_scale=MOBILENET_BN_SCALE,
++            bn_decay=MOBILENET_BN_DECAY,
++            bn_epsilon=MOBILENET_BN_EPSILON,
++            activation=activation,
++            weight_decay=weight_decay,
++            kernel_initializer=_slim_initializer(stddev),
++            **kwargs,
++        )
++        # SlimConv builds a plain BatchNormalization; MobileNet needs the
++        # per-image reduction.  The layer being replaced has not been built, so
++        # it owns no weights and slim_weight_map() never sees it.
++        self.bn = SlimBatchNorm(mode=bn_mode)
++
++
++class SlimDepthwiseConv(tf.keras.layers.Layer):
++    """``slim.separable_conv2d(num_outputs=None)`` + ``slim.batch_norm``.
++
++    slim's ``separable_conv2d`` with ``num_outputs=None`` is depthwise ONLY --
++    it has no pointwise stage -- so this is ``DepthwiseConv2D`` and not
++    ``SeparableConv2D``.  ``depth_multiplier=1`` gives the same
++    ``[k, k, in, 1]`` kernel slim stores as ``depthwise_weights``.
++    ``training_scope()`` sets ``weights_regularizer=None`` for
++    ``separable_conv2d``, unlike ``conv2d``, so there is no regularizer here.
++    """
++
++    def __init__(self, slim_scope, kernel_size=3, strides=1, rate=1,
++                 activation=tf.nn.relu6, stddev=MOBILENET_STDDEV,
++                 bn_mode=BN_PER_IMAGE, **kwargs):
++        super().__init__(name=slim_scope.replace("/", "."), **kwargs)
++        self.slim_scope = slim_scope
++        self.activation = activation
++        self.conv = tf.keras.layers.DepthwiseConv2D(
++            kernel_size,
++            strides=strides,
++            dilation_rate=rate,
++            padding="same",
++            depth_multiplier=1,
++            use_bias=False,
++            depthwise_initializer=_slim_initializer(stddev),
++            depthwise_regularizer=None,
++        )
++        self.bn = SlimBatchNorm(mode=bn_mode)
++
++    def call(self, inputs, training=False):
++        x = self.bn(self.conv(inputs), training=training)
++        return self.activation(x) if self.activation is not None else x
++
++    def slim_weights(self):
++        """``{tf_slim variable name: tf.Variable}`` for this layer."""
++        return {
++            f"{self.slim_scope}/depthwise_weights": self.conv.depthwise_kernel,
++            f"{self.slim_scope}/BatchNorm/gamma": self.bn.gamma,
++            f"{self.slim_scope}/BatchNorm/beta": self.bn.beta,
++            f"{self.slim_scope}/BatchNorm/moving_mean": self.bn.moving_mean,
++            f"{self.slim_scope}/BatchNorm/moving_variance": self.bn.moving_variance,
++        }
++
++
++def _slim_initializer(stddev):
++    """``mobilenet.training_scope``'s weights_initializer."""
++    if stddev < 0:
++        return "glorot_uniform"
++    return tf.keras.initializers.TruncatedNormal(stddev=stddev)
++
++
++@KerasBackboneFactory.register("mobilenet")
++class MobilenetV2Keras(tf.keras.Model):
++    """``mobilenet_v2.mobilenet_base`` with tf_slim's exact layer semantics.
++
++    Takes raw images and subtracts ``cfg["mean_pixel"]`` itself, mirroring
++    ``PoseMobileNet.extract_features``.  Returns ``(net, end_points)``, whose
++    keys are the tf_slim ones: ``layer_1`` .. ``layer_19`` plus the
++    ``layer_N/expansion_output``, ``layer_N/depthwise_output`` and
++    ``layer_N/output`` tensors the tf_slim builder harvests from the graph.
++    """
++
++    def __init__(self, cfg, bn_mode=None, **kwargs):
++        super().__init__(**kwargs)
++        # Deliberately no reference to cfg: tf.keras.Model.__setattr__ rewrites
++        # the lists and dicts it is handed into trackable wrappers, in place,
++        # and DeepLabCut writes pose_cfg back out with yaml.dump.  Only scalars
++        # and fresh copies are kept here; see nnets/base.set_untracked.
++        depth_multiplier, finegrain = MOBILENET_VARIANTS[cfg["net_type"]]
++        if depth_multiplier <= 0:
++            raise ValueError("multiplier is not greater than zero.")
++        self.scope = "MobilenetV2"
++        self.mean_pixel = list(cfg["mean_pixel"])
++        self.depth_multiplier = depth_multiplier
++        # A diagnostic knob, not a tuning one: the shipped behaviour is
++        # BN_PER_IMAGE and the alternatives exist to reproduce the tf_slim bug
++        # and the moving-average variant that was measured and rejected.
++        if bn_mode is None:
++            bn_mode = cfg.get("mobilenet_bn_mode") or BN_PER_IMAGE
++        self.bn_mode = bn_mode
++
++        # mobilenet_v2.mobilenet(): finegrain mode keeps the embedding wide.
++        spec = [dict(entry) for entry in V2_SPEC]
++        if finegrain and depth_multiplier < 1:
++            spec[-1]["num_outputs"] = spec[-1]["num_outputs"] / depth_multiplier
++
++        def md(depth):
++            return _make_divisible(depth * depth_multiplier, 8, 8)
++
++        self.plan = []
++        self.layer_lookup = {}
++        prev_depth = 3
++        n_conv = n_expanded = 0
++        for index, opdef in enumerate(spec):
++            end_point = f"layer_{index + 1}"
++            num_outputs = md(opdef["num_outputs"])
++            if opdef["op"] == "conv":
++                slim_scope = f"{self.scope}/Conv" + (f"_{n_conv}" if n_conv else "")
++                n_conv += 1
++                self._add(slim_scope, MobilenetConv(
++                    slim_scope, num_outputs, opdef["kernel_size"],
++                    strides=opdef["stride"], activation=tf.nn.relu6, bn_mode=bn_mode,
++                ))
++                self.plan.append(("conv", end_point, slim_scope))
++            else:
++                slim_scope = f"{self.scope}/expanded_conv" + (f"_{n_expanded}" if n_expanded else "")
++                n_expanded += 1
++                inner = _make_divisible(
++                    prev_depth * opdef.get("expansion", 6),
++                    opdef.get("expansion_divisible_by", 8),
++                )
++                expand = inner > prev_depth
++                if expand:
++                    self._add(f"{slim_scope}/expand", MobilenetConv(
++                        f"{slim_scope}/expand", inner, 1,
++                        activation=tf.nn.relu6, bn_mode=bn_mode,
++                    ))
++                self._add(f"{slim_scope}/depthwise", SlimDepthwiseConv(
++                    f"{slim_scope}/depthwise", 3, strides=opdef["stride"], bn_mode=bn_mode,
++                ))
++                # the linear bottleneck: project_activation_fn is tf.identity
++                self._add(f"{slim_scope}/project", MobilenetConv(
++                    f"{slim_scope}/project", num_outputs, 1, activation=None, bn_mode=bn_mode,
++                ))
++                residual = opdef["stride"] == 1 and num_outputs == prev_depth
++                self.plan.append(("expanded_conv", end_point, slim_scope, expand, residual))
++            prev_depth = num_outputs
++        self.output_depth = prev_depth
++
++    def _add(self, slim_scope, layer):
++        self.layer_lookup[slim_scope] = layer
++        setattr(self, "_l_" + slim_scope.replace("/", "_").replace(".", "_"), layer)
++        return layer
++
++    def set_bn_mode(self, mode):
++        """Switch every batch norm's inference-time reduction (diagnostics)."""
++        for layer in self.layer_lookup.values():
++            layer.bn.mode = mode
++        self.bn_mode = mode
++
++    def call(self, inputs, training=False):
++        net = tf.cast(inputs, tf.float32) - tf.constant(
++            self.mean_pixel, dtype=tf.float32, shape=[1, 1, 1, 3]
++        )
++        end_points = {}
++        for entry in self.plan:
++            if entry[0] == "conv":
++                _, end_point, slim_scope = entry
++                net = self.layer_lookup[slim_scope](net, training=training)
++            else:
++                _, end_point, slim_scope, expand, residual = entry
++                shortcut = net
++                if expand:
++                    net = self.layer_lookup[f"{slim_scope}/expand"](net, training=training)
++                    end_points[f"{end_point}/expansion_output"] = net
++                net = self.layer_lookup[f"{slim_scope}/depthwise"](net, training=training)
++                end_points[f"{end_point}/depthwise_output"] = net
++                net = self.layer_lookup[f"{slim_scope}/project"](net, training=training)
++                if residual:
++                    net = net + shortcut
++                end_points[f"{end_point}/output"] = net
++            end_points[end_point] = net
++        return net, end_points
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py b/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py
+index 6d0331c..cb99b28 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py
+@@ -19,7 +19,7 @@ from .factory import (
+     PoseNetFactory,
+     resolve_engine,
+ )
+-from .mobilenet import PoseMobileNet
++from .mobilenet import PoseMobileNet, PoseMobileNetKeras
+ from .multi import PoseMultiNet, PoseMultiNetKeras
+ from .resnet import PoseResnet, PoseResnetKeras, SlimResNetV1
+ 
+@@ -31,6 +31,7 @@ __all__ = [
+     "PoseEfficientNet",
+     "PoseEfficientNetKeras",
+     "PoseMobileNet",
++    "PoseMobileNetKeras",
+     "PoseMultiNet",
+     "PoseMultiNetKeras",
+     "PoseNetFactory",
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py b/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py
+index 707342c..16c927f 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py
+@@ -22,10 +22,10 @@ https://github.com/tensorflow/models/blob/master/research/slim/nets/mobilenet/mo
+ import tensorflow as tf
+ import tf_slim as slim
+ 
+-from deeplabcut.pose_estimation_tensorflow.backbones import mobilenet_v2
++from deeplabcut.pose_estimation_tensorflow.backbones import mobilenet_v2, mobilenet_v2_keras  # noqa: F401
+ 
+-from .base import BasePoseNet
+-from .factory import PoseNetFactory
++from .base import BaseKerasPoseNet, BasePoseNet
++from .factory import KERAS_ENGINE, KerasBackboneFactory, PoseNetFactory
+ from .layers import prediction_layer
+ from .utils import wrapper
+ 
+@@ -109,3 +109,45 @@ class PoseMobileNet(BasePoseNet):
+     def get_net(self, inputs, is_training=False):
+         net, end_points = self.extract_features(inputs, is_training=is_training)
+         return self.prediction_layers(net, end_points)
++
++
++@PoseNetFactory.register("mobilenet", engine=KERAS_ENGINE)
++class PoseMobileNetKeras(BaseKerasPoseNet):
++    """Keras twin of :class:`PoseMobileNet`.
++
++    Batch norm reproduces patch 0014: every image is normalised by its own
++    statistics, independently of the batch it is in.  See
++    ``backbones/mobilenet_v2_keras.py`` for why that, and not the moving
++    averages, is the right inference behaviour for this backbone.
++    """
++
++    def __init__(self, cfg):
++        super().__init__(cfg)  # stores cfg with set_untracked
++        self.backbone = KerasBackboneFactory.create(cfg)
++        n_joints = cfg["num_joints"]
++        n_parts = n_joints + cfg.get("num_idchannel", 0)
++        self._add_head("part_pred", "pose/part_pred/block4", n_parts)
++        if cfg["location_refinement"]:
++            self._add_head("locref", "pose/locref_pred/block4", n_joints * 2)
++        if cfg["pairwise_predict"] and "multi-animal" not in cfg["dataset_type"]:
++            self._add_head("pairwise_pred", "pose/pairwise_pred/block4", n_joints * (n_joints - 1) * 2)
++        if cfg["partaffinityfield_predict"] and "multi-animal" in cfg["dataset_type"]:
++            self._add_head("pairwise_pred", "pose/pairwise_pred/block4", cfg["num_limbs"] * 2)
++        self.interm_end_point = None
++        if cfg["intermediate_supervision"]:
++            self.interm_end_point = f"layer_{cfg['intermediate_supervision_layer']}"
++            self._add_head("part_pred_interm", "pose/intermediate_supervision/block4", n_parts)
++
++    def extract_features(self, inputs, is_training=False):
++        # Unlike PoseResnet, which passes is_training=False to resnet_v1
++        # unconditionally, mobilenet_v2.training_scope() propagates is_training
++        # into the backbone: the tf_slim training graph really does run all 52
++        # batch norms in training mode and update their moving averages.
++        return self.backbone(inputs, training=is_training)
++
++    def prediction_layers(self, features, end_points, is_training=False):
++        out = {"features": features}
++        for key, layer in self._heads.items():
++            source = end_points[self.interm_end_point] if key == "part_pred_interm" else features
++            out[key] = layer(source, training=is_training)
++        return out
+diff --git a/tests/test_nnets_efficientnet_keras.py b/tests/test_nnets_efficientnet_keras.py
+index 5464cd0..4858b2b 100644
+--- a/tests/test_nnets_efficientnet_keras.py
++++ b/tests/test_nnets_efficientnet_keras.py
+@@ -22,6 +22,7 @@ tf = pytest.importorskip("tensorflow")
+ from deeplabcut.pose_estimation_tensorflow.datasets import Batch  # noqa: E402
+ from deeplabcut.pose_estimation_tensorflow.nnets import (  # noqa: E402
+     KERAS_ENGINE,
++    TF1_ENGINE,
+     KerasBackboneFactory,
+     PoseEfficientNetKeras,
+     PoseNetFactory,
+@@ -327,16 +328,24 @@ CONFIG_LISTS = {
+ }
+ 
+ 
+-def assert_config_survives(tmp_path, build_it):
+-    """Build a net and check the caller's config is byte-identical after.
++def assert_config_survives(tmp_path, build_it, reference_build=None):
++    """Build a net and check the caller's config comes back as tf_slim leaves it.
+ 
+     Assigning a structure to a ``tf.keras.Model`` attribute makes Keras replace
+     it with a ``ListWrapper`` in place, and DeepLabCut writes pose_cfg.yaml back
+-    out with ``write_plainconfig``.
++    out with ``write_plainconfig``.  That is what must never happen.  Writing a
++    plain value back is a different matter and is sometimes deliberate:
++    ``PoseEfficientNet.__init__`` has always filled in ``use_batch_norm`` and
++    ``use_drop_out``.  ``reference_build`` therefore names the tf_slim net to
++    compare against, so the assertion is parity between the engines rather than
++    immutability; without it the config must be untouched.
+     """
+     cfg = pose_cfg(**CONFIG_LISTS)
++    reference = pose_cfg(**CONFIG_LISTS)
++    if reference_build is not None:
++        reference_build(reference)
+     before, after = tmp_path / "before.yaml", tmp_path / "after.yaml"
+-    write_plainconfig(str(before), cfg)
++    write_plainconfig(str(before), reference)
+     build_it(cfg)
+     write_plainconfig(str(after), cfg)
+     assert before.read_text() == after.read_text()
+@@ -354,7 +363,11 @@ def test_backbone_leaves_the_caller_config_alone(tmp_path):
+     reason="BaseKerasPoseNet still assigns cfg through Keras attribute tracking",
+ )
+ def test_pose_net_leaves_the_caller_config_alone(tmp_path):
+-    assert_config_survives(tmp_path, lambda cfg: PoseNetFactory.create(cfg, engine=KERAS_ENGINE))
++    assert_config_survives(
++        tmp_path,
++        lambda cfg: PoseNetFactory.create(cfg, engine=KERAS_ENGINE),
++        reference_build=lambda cfg: PoseNetFactory.create(cfg, engine=TF1_ENGINE),
++    )
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/tests/test_nnets_keras.py b/tests/test_nnets_keras.py
+index 35b213d..335bd5f 100644
+--- a/tests/test_nnets_keras.py
++++ b/tests/test_nnets_keras.py
+@@ -422,12 +422,21 @@ def test_no_registered_keras_net_touches_the_callers_config(net_type, stride):
+     """
+     yaml = pytest.importorskip("yaml")
+     cfg = multi_animal_cfg(stride=stride, multi_stage=stride < 8, net_type=net_type)
+-    before = yaml.dump(cfg, default_flow_style=False)
++    # The property is parity with the tf_slim net, not immutability.  Some nets
++    # legitimately write to the config they are handed -- PoseMultiNet turns
++    # multi_stage off for a backbone that is not a resnet, PoseEfficientNet
++    # fills in use_batch_norm and use_drop_out -- and callers rely on it.  So
++    # the reference is what the tf_slim net leaves behind, not the untouched
++    # dict; enumerating which keys each net writes would need editing every
++    # time a backbone is added.  Building the tf_slim net here is safe because
++    # its __init__ builds no graph.
++    reference = multi_animal_cfg(stride=stride, multi_stage=stride < 8, net_type=net_type)
++    PoseNetFactory.create(reference, engine=TF1_ENGINE)
++    before = yaml.dump(reference, default_flow_style=False)
+     try:
+         model = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
+     except ValueError as err:
+         pytest.skip(f"no Keras implementation yet: {err}")
+-    cfg["multi_stage"] = "resnet" in net_type and stride < 8  # the one edit that is by design
+     assert _trackable_values(cfg) == {}
+     after = yaml.dump(cfg, default_flow_style=False)
+     assert "!!python" not in after
+diff --git a/tests/test_nnets_keras_mobilenet.py b/tests/test_nnets_keras_mobilenet.py
+new file mode 100644
+index 0000000..e766c86
+--- /dev/null
++++ b/tests/test_nnets_keras_mobilenet.py
+@@ -0,0 +1,421 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""Tests for the eager TensorFlow 2 MobileNet backbone and pose net.
++
++Never builds a TF1 graph.  The comparison against the ``tf_slim``
++implementation needs the two engines in separate processes and lives in
++``test_nnets_keras_equivalence.py``'s sibling harness; what is checked here is
++the contract, the checkpoint bridge and the batch-norm behaviour patch 0014
++established.
++"""
++import numpy as np
++import pytest
++
++tf = pytest.importorskip("tensorflow")
++
++from deeplabcut.pose_estimation_tensorflow.backbones import (  # noqa: E402
++    mobilenet_v2_keras as mnk,
++)
++from deeplabcut.pose_estimation_tensorflow.nnets import (  # noqa: E402
++    KERAS_ENGINE,
++    TF1_ENGINE,
++    KerasBackboneFactory,
++    PoseMobileNetKeras,
++    PoseNetFactory,
++    ensure_eager_execution,
++    load_tf1_checkpoint,
++    save_tf1_checkpoint,
++)
++from deeplabcut.pose_estimation_tensorflow.nnets.checkpoint import (  # noqa: E402
++    compare_to_tf1_checkpoint,
++)
++
++SIZE = (128, 160)
++ALPHAS = ["mobilenet_v2_1.0", "mobilenet_v2_0.75", "mobilenet_v2_0.5", "mobilenet_v2_0.35"]
++#: tf_slim variable counts: 260 backbone plus two per prediction head
++N_BACKBONE = 260
++
++
++@pytest.fixture(scope="module", autouse=True)
++def eager():
++    """Turn eager on for this module, and leave it on.
++
++    Eager cannot be re-enabled once the eager context has been touched, so a
++    module that turns it off again on the way out makes every later Keras test
++    skip.  All the Keras test modules therefore leave it on, which is what lets
++    them run in any collection order.
++    """
++    try:
++        ensure_eager_execution()
++    except RuntimeError as err:  # a TF1 graph was built earlier in this process
++        pytest.skip(str(err))
++    yield
++
++
++def pose_cfg(**kwargs):
++    cfg = {
++        "stride": 8.0,
++        "weigh_part_predictions": False,
++        "mean_pixel": [123.68, 116.779, 103.939],
++        "location_refinement": True,
++        "locref_stdev": 7.2801,
++        "locref_loss_weight": 1.0,
++        "locref_huber_loss": True,
++        "intermediate_supervision": False,
++        "intermediate_supervision_layer": 12,
++        "weight_decay": 0.0001,
++        "batch_size": 1,
++        "dataset_type": "imgaug",
++        "pairwise_huber_loss": True,
++        "pairwise_predict": False,
++        "partaffinityfield_predict": False,
++        "num_joints": 4,
++        "num_limbs": 0,
++        "net_type": "mobilenet_v2_1.0",
++        "multi_stage": False,
++        "pairwise_loss_weight": 1.0,
++    }
++    cfg.update(kwargs)
++    return cfg
++
++
++def images(batch_size, seed=0):
++    return tf.constant(
++        np.random.RandomState(seed).uniform(0, 255, (batch_size, *SIZE, 3)),
++        dtype=tf.float32,
++    )
++
++
++def build(cfg, batch_size=None):
++    if batch_size is not None:
++        cfg = dict(cfg, batch_size=batch_size)
++    model = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++    model.build_for([cfg["batch_size"], *SIZE, 3])
++    return model
++
++
++# ---------------------------------------------------------------------------
++# engine and factory wiring
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("net_type", ALPHAS)
++def test_the_keras_engine_selects_the_keras_mobilenet(net_type):
++    cfg = pose_cfg(net_type=net_type)
++    assert isinstance(PoseNetFactory.create(cfg, engine=KERAS_ENGINE), PoseMobileNetKeras)
++    assert type(PoseNetFactory.create(cfg, engine=TF1_ENGINE)).__name__ == "PoseMobileNet"
++
++
++def test_tf1_stays_the_default():
++    assert type(PoseNetFactory.create(pose_cfg())).__name__ == "PoseMobileNet"
++
++
++@pytest.mark.parametrize("net_type", ALPHAS)
++def test_the_backbone_is_registered(net_type):
++    assert KerasBackboneFactory.supports(net_type)
++    backbone = KerasBackboneFactory.create(pose_cfg(net_type=net_type))
++    assert isinstance(backbone, mnk.MobilenetV2Keras)
++
++
++# ---------------------------------------------------------------------------
++# the contract
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("net_type", ALPHAS)
++def test_every_weight_carries_a_tf_slim_name(net_type):
++    model = build(pose_cfg(net_type=net_type))
++    weights = model.slim_weight_map()
++    assert len(weights) == N_BACKBONE + 4  # part_pred and locref, weights + biases
++    assert model.unmapped_weights() == []
++    assert all(name.startswith(("MobilenetV2/", "pose/")) for name in weights)
++
++
++def test_intermediate_supervision_adds_one_head():
++    model = build(pose_cfg(intermediate_supervision=True))
++    assert len(model.slim_weight_map()) == N_BACKBONE + 6
++    assert "pose/intermediate_supervision/block4/weights" in model.slim_weight_map()
++    assert model.unmapped_weights() == []
++
++
++def test_heads_are_the_documented_contract():
++    model = build(pose_cfg(intermediate_supervision=True))
++    out = model.get_net(images(1))
++    assert set(out) == {"features", "part_pred", "locref", "part_pred_interm"}
++    assert out["part_pred"].shape == (1, SIZE[0] // 8, SIZE[1] // 8, 4)
++    assert out["locref"].shape == (1, SIZE[0] // 8, SIZE[1] // 8, 8)
++    assert out["features"].shape[-1] == 1280
++
++
++def test_extract_features_returns_the_tf_slim_end_point_names():
++    model = build(pose_cfg())
++    net, end_points = model.extract_features(images(1))
++    assert net.shape == (1, SIZE[0] // 16, SIZE[1] // 16, 1280)
++    for i in range(1, 20):
++        assert f"layer_{i}" in end_points
++    # the expanded_conv tensors the tf_slim builder harvests from the graph
++    assert "layer_3/expansion_output" in end_points
++    assert "layer_3/depthwise_output" in end_points
++    assert "layer_3/output" in end_points
++    # the first expanded_conv has no expansion stage, as in the checkpoint
++    assert "layer_2/expansion_output" not in end_points
++    assert len(end_points) == 69
++
++
++def test_no_variable_is_claimed_twice():
++    model = build(pose_cfg(intermediate_supervision=True))
++    by_id = {}
++    for name, variable in model.slim_weight_map().items():
++        by_id.setdefault(id(variable), []).append(name)
++    assert all(len(names) == 1 for names in by_id.values())
++
++
++def test_depthwise_layers_use_slims_weight_name():
++    model = build(pose_cfg())
++    names = model.slim_weight_map()
++    assert "MobilenetV2/expanded_conv/depthwise/depthwise_weights" in names
++    assert names["MobilenetV2/expanded_conv/depthwise/depthwise_weights"].shape == (3, 3, 32, 1)
++    # slim.separable_conv2d(num_outputs=None) has no pointwise stage
++    assert "MobilenetV2/expanded_conv/depthwise/pointwise_weights" not in names
++
++
++# ---------------------------------------------------------------------------
++# batch norm: what patch 0014 established
++# ---------------------------------------------------------------------------
++def test_inference_is_independent_of_batch_composition():
++    """Patch 0014's property, without its graph replication.
++
++    The feature map is bit-identical whatever else is in the batch.  The heads
++    are not quite: ``Conv2DTranspose`` accumulates differently for different
++    batch sizes, which is the same last-bit noise the tf_slim graph shows
++    (1.2e-06 between its own batch-1 and batch-4 builds) and has nothing to do
++    with batch norm.
++    """
++    model = build(pose_cfg(), batch_size=4)
++    batch = images(4, seed=1)
++    alone, _ = model.extract_features(batch[:1])
++    together, _ = model.extract_features(batch)
++    shuffled, _ = model.extract_features(tf.gather(batch, [3, 0, 2, 1]))
++    assert np.array_equal(alone.numpy(), together.numpy()[:1])
++    assert np.array_equal(alone.numpy(), shuffled.numpy()[1:2])
++
++    head_alone = model.get_net(batch[:1])["part_pred"].numpy()
++    head_together = model.get_net(batch)["part_pred"].numpy()[:1]
++    assert np.abs(head_alone - head_together).max() < 1e-5
++
++
++def test_batch_mode_reproduces_the_bug_it_replaces():
++    """The stock tf_slim reduction really does depend on the other images."""
++    model = build(pose_cfg(), batch_size=4)
++    model.backbone.set_bn_mode(mnk.BN_BATCH)
++    batch = images(4, seed=1)
++    alone = model.get_net(batch[:1])["part_pred"].numpy()
++    together = model.get_net(batch)["part_pred"].numpy()[:1]
++    assert np.abs(alone - together).max() > 1e-3
++
++
++def test_a_dynamic_batch_dimension_is_batch_independent_too():
++    """What export_model builds, and the one case patch 0014 could not fix."""
++    model = build(pose_cfg(), batch_size=4)
++
++    @tf.function(input_signature=[tf.TensorSpec([None, *SIZE, 3], tf.float32)])
++    def graph(x):
++        return model.get_net(x)["part_pred"]
++
++    batch = images(4, seed=1)
++    alone = graph(batch[:1]).numpy()
++    for size in (2, 3, 4):
++        assert np.abs(alone - graph(batch[:size]).numpy()[:1]).max() < 1e-4
++
++
++def test_the_backbone_updates_its_moving_averages_only_in_training_mode():
++    """Unlike resnet: training_scope() propagates is_training to the backbone.
++
++    The tf_slim training graph really does carry 52 ``is_training=True``
++    batch-norm nodes and 104 UPDATE_OPS, so the Keras net must move its moving
++    statistics when, and only when, ``is_training`` is set.
++    """
++    model = build(pose_cfg())
++    bn = model.backbone.layer_lookup["MobilenetV2/Conv"].bn
++    before = bn.moving_mean.numpy().copy()
++    model.get_net(images(1), is_training=False)
++    assert np.array_equal(before, bn.moving_mean.numpy())
++    model.get_net(images(1), is_training=True)
++    assert not np.array_equal(before, bn.moving_mean.numpy())
++
++
++def test_moving_average_mode_differs_from_the_shipped_default():
++    """The variant that was measured at 12.79 px and rejected is still reachable."""
++    model = build(pose_cfg())
++    default = model.get_net(images(1))["part_pred"].numpy()
++    model.backbone.set_bn_mode(mnk.BN_MOVING)
++    moving = model.get_net(images(1))["part_pred"].numpy()
++    assert np.abs(default - moving).max() > 1e-3
++
++
++# ---------------------------------------------------------------------------
++# checkpoints and training
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("net_type", ALPHAS)
++def test_checkpoint_round_trip(tmp_path, net_type):
++    model = build(pose_cfg(net_type=net_type, intermediate_supervision=True))
++    written = save_tf1_checkpoint(model, str(tmp_path / "snapshot"), global_step=3)
++    assert written.endswith("snapshot-3")
++    for variable in model.slim_weight_map().values():
++        variable.assign(tf.zeros_like(variable))
++    report = load_tf1_checkpoint(model, written)
++    assert report.ok and report.missing == [] and report.unused == []
++    assert len(report.loaded) == N_BACKBONE + 6
++    assert max(compare_to_tf1_checkpoint(model, written).values()) == 0.0
++
++
++def test_load_rejects_a_checkpoint_for_a_different_multiplier(tmp_path):
++    big = build(pose_cfg(net_type="mobilenet_v2_1.0"))
++    written = save_tf1_checkpoint(big, str(tmp_path / "big"))
++    small = build(pose_cfg(net_type="mobilenet_v2_0.35"))
++    with pytest.raises(ValueError):
++        load_tf1_checkpoint(small, written)
++
++
++def test_gradients_reach_every_trainable_weight():
++    from deeplabcut.pose_estimation_tensorflow.datasets import Batch
++
++    model = build(pose_cfg())
++    height, width = SIZE[0] // 8, SIZE[1] // 8
++    batch = {
++        Batch.inputs: images(1),
++        Batch.part_score_targets: tf.zeros([1, height, width, 4]),
++        Batch.part_score_weights: tf.ones([1, height, width, 4]),
++        Batch.locref_targets: tf.zeros([1, height, width, 8]),
++        Batch.locref_mask: tf.ones([1, height, width, 8]),
++    }
++    with tf.GradientTape() as tape:
++        losses = model.train(batch)
++    grads = tape.gradient(losses["total_loss"], model.trainable_variables)
++    # 156 backbone (52 convolutions and their gamma/beta) plus two heads
++    assert len(grads) == 160
++    assert all(g is not None for g in grads)
++
++
++def test_test_and_inference_run_eagerly():
++    model = build(pose_cfg())
++    outputs = model.test(images(1))
++    assert set(outputs) >= {"part_prob", "peak_inds", "locref", "features"}
++    single = build(pose_cfg(), batch_size=1)
++    assert single.inference(images(1))["pose"].shape == (4, 3)
++
++
++# ---------------------------------------------------------------------------
++# the caller's pose_cfg must come back exactly as it went in
++# ---------------------------------------------------------------------------
++def _trackable_values(cfg):
++    return {
++        key: type(value).__name__
++        for key, value in cfg.items()
++        if "Wrapper" in type(value).__name__
++    }
++
++
++@pytest.mark.parametrize("net_type", ALPHAS)
++def test_building_the_net_leaves_the_callers_config_alone(net_type):
++    yaml = pytest.importorskip("yaml")
++    cfg = pose_cfg(net_type=net_type, intermediate_supervision=True)
++    cfg["all_joints"] = [[i] for i in range(cfg["num_joints"])]
++    cfg["multi_step"] = [[0.005, 10000], [0.02, 430000]]
++    before = yaml.dump(cfg, default_flow_style=False)
++
++    model = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++
++    after = yaml.dump(cfg, default_flow_style=False)
++    assert _trackable_values(cfg) == {}
++    assert "!!python" not in after
++    assert after == before
++    assert model.cfg is cfg
++    # the backbone keeps no reference of its own, only scalars and fresh lists
++    assert getattr(model.backbone, "cfg", None) is None
++    assert model.backbone.mean_pixel is not cfg["mean_pixel"]
++
++
++def test_the_backbone_on_its_own_leaves_the_callers_config_alone():
++    yaml = pytest.importorskip("yaml")
++    cfg = pose_cfg()
++    cfg["all_joints"] = [[i] for i in range(cfg["num_joints"])]
++    before = yaml.dump(cfg, default_flow_style=False)
++    KerasBackboneFactory.create(cfg)
++    assert _trackable_values(cfg) == {}
++    assert yaml.dump(cfg, default_flow_style=False) == before
++
++
++def test_config_survives_deeplabcuts_own_yaml_writers(tmp_path):
++    """The real corruption path: build a net, then let DeepLabCut save the config."""
++    from deeplabcut.utils.auxiliaryfunctions import read_plainconfig, write_plainconfig
++
++    cfg = pose_cfg(intermediate_supervision=True)
++    cfg["all_joints"] = [[i] for i in range(cfg["num_joints"])]
++    cfg["all_joints_names"] = ["a", "b", "c", "d"]
++    cfg["multi_step"] = [[0.005, 10000], [0.02, 430000]]
++
++    reference = tmp_path / "pose_cfg_before.yaml"
++    write_plainconfig(str(reference), cfg)
++
++    PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++
++    written = tmp_path / "pose_cfg_after.yaml"
++    write_plainconfig(str(written), cfg)
++
++    assert "!!python" not in written.read_text()
++    assert written.read_text() == reference.read_text()
++    assert read_plainconfig(str(written)) == read_plainconfig(str(reference))
++
++
++# ---------------------------------------------------------------------------
++# the production entry point
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("batch_size", [1, 4])
++def test_setup_pose_prediction_runs_the_keras_mobilenet(tmp_path, batch_size):
++    """core/predict dispatches on the engine, so a mobilenet project reaches this."""
++    from deeplabcut.pose_estimation_tensorflow.core import predict
++
++    cfg = pose_cfg(tf_engine="keras", batch_size=batch_size)
++    model = build(dict(cfg))
++    cfg["init_weights"] = save_tf1_checkpoint(model, str(tmp_path / "snapshot"), global_step=1)
++
++    session, inputs, outputs = predict.setup_pose_prediction(cfg)
++    values = session.run(outputs, feed_dict={inputs: images(batch_size).numpy()})
++    scmap, locref = predict.extract_cnn_output(values, cfg)
++    assert scmap.shape[-3:] == (SIZE[0] // 8, SIZE[1] // 8, 4)
++    if batch_size == 1:
++        pose = predict.argmax_pose_predict(scmap, locref, cfg["stride"])
++        assert pose.shape == (4, 3)
++    if hasattr(session, "close"):
++        session.close()
++
++
++def test_the_production_path_is_batch_independent(tmp_path):
++    """Patch 0014's guarantee, all the way through core/predict."""
++    from deeplabcut.pose_estimation_tensorflow.core import predict
++
++    model = build(pose_cfg())
++    weights = save_tf1_checkpoint(model, str(tmp_path / "snapshot"), global_step=1)
++    batch = images(4, seed=1).numpy()
++
++    poses = {}
++    for batch_size in (1, 4):
++        cfg = pose_cfg(tf_engine="keras", batch_size=batch_size)
++        cfg["init_weights"] = weights
++        session, inputs, outputs = predict.setup_pose_prediction(cfg)
++        values = session.run(outputs, feed_dict={inputs: batch[:batch_size]})
++        scmap, locref = predict.extract_cnn_output(values, cfg)
++        if batch_size > 1:
++            scmap = scmap[0]
++            locref = locref.reshape(batch_size, *scmap.shape[:2], -1, 2)[0]
++        poses[batch_size] = predict.argmax_pose_predict(scmap, locref, cfg["stride"])
++        if hasattr(session, "close"):
++            session.close()
++
++    moved = np.linalg.norm(poses[1][:, :2] - poses[4][:, :2], axis=-1)
++    assert moved.max() < 1e-3, moved

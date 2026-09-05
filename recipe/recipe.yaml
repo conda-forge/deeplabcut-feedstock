@@ -38,6 +38,7 @@ source:
     - patches/0021-Port-the-EfficientNet-backbone-to-eager-TensorFlow-2.patch
     - patches/0022-Drop-the-eager-engine-s-config-copy-workaround.patch
     - patches/0023-Replace-nnets-base.py-s-tf.compat.v1-losses-and-stop.patch
+    - patches/0024-Port-the-MobileNet-backbone-to-eager-TensorFlow-2-Ke.patch
 
 build:
   number: 0
