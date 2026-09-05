@@ -37,6 +37,7 @@ source:
     - patches/0020-Remove-tf.compat.v1-from-the-pose-engine.patch
     - patches/0021-Port-the-EfficientNet-backbone-to-eager-TensorFlow-2.patch
     - patches/0022-Drop-the-eager-engine-s-config-copy-workaround.patch
+    - patches/0023-Replace-nnets-base.py-s-tf.compat.v1-losses-and-stop.patch
 
 build:
   number: 0
