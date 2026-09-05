@@ -1,0 +1,61 @@
+From f27b19fc13e11a593930e205197f05ff5b542ce0 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Fri, 4 Sep 2026 20:22:20 -0400
+Subject: [PATCH] Release the TensorFlow session when video analysis finishes
+
+analyze_videos() and analyze_time_lapse_frames() build a pose-prediction
+session and never close it, so every call leaks one tf.compat.v1.Session and
+the graph it was built in, holding onto GPU memory for the lifetime of the
+process. Analysing several videos in one session -- which the GUI and any
+batch script do -- accumulates them.
+
+The rest of the codebase already treats this as the contract: evaluate.py and
+create_tracking_dataset() both close their sessions and reset the default
+graph when they are done. Do the same on both exit paths of analyze_videos()
+and at the end of analyze_time_lapse_frames().
+
+OpenVINO is exempt: OpenVINOSession has no close().
+
+Predictions are unaffected -- the analysed output of a run before and after
+this change compares equal, and three consecutive analyze_videos() calls in
+one process still succeed, confirming that resetting the graph does not break
+reuse.
+---
+ .../pose_estimation_tensorflow/predict_videos.py      | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/predict_videos.py b/deeplabcut/pose_estimation_tensorflow/predict_videos.py
+index a083b99..c56fa59 100644
+--- a/deeplabcut/pose_estimation_tensorflow/predict_videos.py
++++ b/deeplabcut/pose_estimation_tensorflow/predict_videos.py
+@@ -625,12 +625,22 @@ def analyze_videos(
+                 "If the tracking is not satisfactory for some videos, consider expanding the training set. "
+                 "You can use the function 'extract_outlier_frames' to extract a few representative outlier frames."
+             )
++        _release_inference_session(sess, use_openvino)
+         return DLCscorer  # note: this is either DLCscorer or DLCscorerlegacy depending on what was used!
+     else:
+         print("No video(s) were found. Please check your paths and/or video_extensions filter.")
++        _release_inference_session(sess, use_openvino)
+         return DLCscorer
+ 
+ 
++def _release_inference_session(sess, use_openvino=None):
++    """Close a pose-prediction session and drop the graph it was built in."""
++    if use_openvino:
++        return
++    sess.close()
++    tf.compat.v1.reset_default_graph()
++
++
+ def checkcropping(cfg, cap):
+     print(
+         "Cropping based on the "
+@@ -1305,6 +1315,7 @@ def analyze_time_lapse_frames(
+             else:
+                 print("No frames were found. Consider changing the path or the frametype.")
+ 
++    _release_inference_session(sess)
+     os.chdir(str(start_path))
+ 
+ 

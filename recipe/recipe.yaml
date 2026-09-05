@@ -25,6 +25,8 @@ source:
     - patches/0008-Add-outputs-required-for-multi-animal-model-export.patch
     - patches/0009-Loosen-dependency-bounds.patch
     - patches/0010-Replace-albumentations-with-a-vendored-augmentation-.patch
+    - patches/0011-Fix-Path-str-confusion-left-over-from-the-pathlib-mi.patch
+    - patches/0012-Release-the-TensorFlow-session-when-video-analysis-f.patch
 
 build:
   number: 0
