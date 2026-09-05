@@ -35,6 +35,7 @@ source:
     - patches/0018-Port-the-multi-animal-training-loop-to-eager-Tensor.patch
     - patches/0019-Keep-the-caller-s-pose_cfg-out-of-Keras-attribute-tr.patch
     - patches/0020-Remove-tf.compat.v1-from-the-pose-engine.patch
+    - patches/0021-Port-the-EfficientNet-backbone-to-eager-TensorFlow-2.patch
 
 build:
   number: 0
