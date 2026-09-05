@@ -1,0 +1,1452 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Fri, 5 Sep 2026 14:00:00 -0400
+Subject: [PATCH] Remove tf.compat.v1 from the pose engine's inference,
+ training and export
+
+core/predict.py, core/train.py, predict_videos.py and export.py were the last
+large block of TensorFlow 1 in the engine: 44 tf.compat.v1 references, 8
+Sessions, 6 placeholders, and the tf.compat.v1.disable_eager_execution() call
+at core/train.py line 34 that ran at *import* and so turned eager execution off
+for the whole process, for everyone.  That one line is why the ported Keras
+networks could not be reached at runtime: setup_pose_prediction wrapped them in
+a Session with a name-based Saver.
+
+Those four files now contain no tf.compat.v1, no Session and no placeholder.
+Everything that was TF1 in them has been moved, unchanged, into one new module,
+core/legacy_tf1.py, which is entered only when the tf1 engine is selected and
+is meant to be deleted whole once the Keras nets are the only implementation.
+The disable_eager_execution() call goes with it, and now runs from
+ensure_graph_mode() at the top of the TF1 entry points instead of at import, so
+importing deeplabcut leaves eager execution on.
+
+  core/eager_session.py  EagerSession, the (sess, inputs, outputs) contract
+                         backed by a tf.function.  That contract is a duck
+                         type, not a Session -- DeepLabCut already ships a
+                         second implementation of it in
+                         core/openvino/session.py -- so predict_videos.py,
+                         core/evaluate.py, core/evaluate_multianimal.py,
+                         visualizemaps.py and core/test.py need no changes.
+  core/legacy_tf1.py     the TF1 engine, in one file, for deletion.
+
+The engine is chosen with nnets/factory.resolve_engine, i.e. tf_engine in
+pose_cfg.yaml or DLC_TF_ENGINE, and tf1 is still the default, so a stock
+project is unaffected.
+
+The checkpoint plumbing is nnets/checkpoint's; the eager training helpers are
+core/train_eager's.  core/train.py re-exports LearningRate from train_eager,
+which had to keep its own copy only because importing core/train.py used to
+disable eager execution, and re-exports the TF1 input queue and optimiser from
+legacy_tf1 for anything still importing them from here.
+
+Inference.  setup_pose_prediction and setup_GPUpose_prediction build the Keras
+net, restore the snapshot by name and hand back an EagerSession.  The inference
+heads needed no migration: BasePoseNet.test and BasePoseNet.inference are
+already plain TensorFlow 2 and are inherited unchanged by the Keras nets, so
+they are called rather than rewritten.  Against the tf_slim Session, on 16 real
+480x640 frames:
+
+    resnet_50, batch 1        part_prob 2.7e-07  locref 8.3e-06
+    resnet_50, batch 8        part_prob 3.3e-07  locref 7.6e-06
+    resnet_50 +PAF, batch 1   part_prob 2.9e-07  locref 3.2e-06  paf 3.9e-06
+    resnet_50 +PAF, batch 8   part_prob 3.0e-07  locref 3.0e-06  paf 3.9e-06
+    MuNet, stride 4           part_prob 3.7e-07  locref 4.4e-06  paf 6.0e-06
+
+The peak-index tensor is bit-identical in every case (343, 248 and 497-552
+peaks per frame), the keypoints predict.getpose / getposeNP decode agree to
+1.0e-05 px, and the "pose" tensor of setup_GPUpose_prediction to 3.1e-05 px.
+Over a whole 2330-frame video, analyze_videos moves keypoints by at most
+6.1e-05 px, mean 2.0e-06 px, and evaluate_network reports the same errors to
+the two decimals it prints: 26.9 px train / 32.23 px test, 7.02 / 7.43 with the
+p-cutoff.  Running the same video through the tf1 engine after this patch
+reproduces the unpatched package bit for bit.
+
+Training.  slim.learning.create_train_op becomes train_eager.make_train_step,
+the FIFOQueue with its thread and Coordinator becomes train_eager.make_dataset,
+and the Saver becomes train_eager.SnapshotSaver, so the single-animal loop and
+core/train_multianimal.py replace create_train_op the same way.
+
+create_train_op made every op in GraphKeys.UPDATE_OPS a control dependency of
+the loss, which is what kept the batch-norm moving averages trained.  Measured
+on the real DeepLabCut training graphs:
+
+    resnet_50           53 batch-norm nodes, all is_training=False,   0 update ops
+    resnet_50 +PAF      53 batch-norm nodes, all is_training=False,   0 update ops
+    mobilenet_v2_1.0    52 batch-norm nodes, all is_training=True,  104 update ops
+    MuNet, stride 4     58 batch-norm nodes, 5 is_training=True,     10 update ops
+
+with every update op reachable from the train op.  Keras batch-norm applies
+that update inside the layer call when it is called with is_training=True, so
+12 steps of the ported loop on the Keras MuNet move all 10 of the decoder's
+moving_mean/moving_variance tensors and leave all 106 of the backbone's frozen
+-- which is the other half of the check, because multi.py builds the resnet
+backbone is_training=False even while training and the port has to reproduce
+that too.
+
+Checked step for step against create_train_op from the same snapshot over the
+same real batches, 8 steps at lr 1e-4, over all 269 (resnet) / 271 (+PAF)
+variables:
+
+    momentum   loss 3.7e-09   weights max 1.5e-08, mean 1.8e-13, none over 1e-5
+    adam       loss 6.1e-07   weights max 2.1e-04, mean 1.1e-07
+
+The momentum figures are roundoff.  Adam amplifies it, because its first steps
+divide by sqrt(v)+epsilon where both are near zero; for scale, running the
+unmodified TF1 code twice with oneDNN on and off diverges by 5.8e-04 max and
+3.4e-06 mean over the same eight steps, so the port sits nearer the reference
+run than two legitimate TF1 runs sit to each other.  Two differences that are
+not roundoff were found: the TF1 AdamOptimizer defaults to epsilon 1e-8 where
+keras.optimizers.legacy.Adam defaults to 1e-7, worth 9.3e-04 in eight steps
+(train_eager.make_optimizer passes it), and DeepLabCut never sums the
+regularization-losses collection into the loss -- 37 to 70 dead weight-decay
+terms depending on net_type -- so model.losses must stay out of the tape.
+
+Snapshots are written by train_eager.SnapshotSaver under the tf_slim variable
+names, so they are ordinary DeepLabCut snapshots: one written by the eager
+trainer and restored into the unmodified tf_slim graph reproduces the eager
+engine's own predictions to 2.2e-07 on part_prob and 1.6e-05 on locref.
+
+Export.  Freezing an eager model names its nodes after Keras layers, so none of
+the names DLC-Live loads by survive -- of 3796 TF1 op names exactly one does.
+Wrapping each output in tf.identity with its old name inside the traced
+function restores all of them.  Exporting the same model through
+deeplabcut.export_model with each engine and loading the .pb by node name, the
+way DLC-Live does:
+
+    multi-animal   Sigmoid, pose/locref_pred/block4/BiasAdd,
+                   pose/pairwise_pred/block4/BiasAdd  all bit-identical,
+                   Cast_2 identical
+    single animal  Sigmoid 2.4e-07, pose/locref_pred/block4/BiasAdd 5.7e-06
+    TFGPUinference concat_1 bit-identical
+
+that is, the three multi-animal outputs the earlier patch added included.  The
+input node is still called Placeholder, which is what export.py reads.
+
+predict_videos.py loses its four reset_default_graph() calls to
+tf.keras.backend.clear_session(), which the file already used at line 223 and
+which resets the TF1 default graph as well as the eager Keras state, and
+GetPoseF_GTF now flips and reshapes the pose array in numpy instead of
+appending tf.gather and tf.reshape to the inference graph, so the pose network
+is the only thing in the file that builds TensorFlow ops.
+
+Not fixed here, because the files belong elsewhere: nnets/base.py's train()
+still calls tf.compat.v1.losses (5 references) and prediction_layers still
+opens a variable_scope, and the efficientnet and mobilenet backbones are
+unported.  Excluding legacy_tf1.py, which exists to be deleted, this leaves 72
+tf.compat.v1 references in the tree, none of them in the engine's entry points.
+
+Prerequisites: this applies on top of the ResNet/MuNet Keras port (it uses
+nnets/factory's engine selection and nnets/checkpoint) and the multi-animal
+training port (it uses core/train_eager).  It touches no file any other patch
+in the series touches.
+---
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/eager_session.py b/deeplabcut/pose_estimation_tensorflow/core/eager_session.py
+new file mode 100644
+index 0000000..1e6fa5c
+--- /dev/null
++++ b/deeplabcut/pose_estimation_tensorflow/core/eager_session.py
+@@ -0,0 +1,104 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""The (sess, inputs, outputs) contract, without a Session.
++
++Everything downstream of ``core/predict.py`` -- predict_videos.py,
++core/evaluate.py, core/evaluate_multianimal.py, visualizemaps.py, export.py --
++uses exactly one interface::
++
++    sess, inputs, outputs = predict.setup_pose_prediction(cfg)
++    arrays = sess.run(outputs, feed_dict={inputs: batch})
++    sess.close()
++
++That is a duck type, not a Session: DeepLabCut already ships a second,
++non-TensorFlow implementation of it in ``core/openvino/session.py``.
++:class:`EagerSession` is the eager one.  It owns a ``tf.function``, traced once
++per input shape, and turns ``run(fetches, feed_dict)`` into a call, so none of
++those callers has to change.
++"""
++
++import numpy as np
++import tensorflow as tf
++
++
++def plain(value):
++    """Strip Keras's attribute-tracking wrappers out of a config.
++
++    ``BaseKerasPoseNet.__init__`` assigns ``cfg`` to an attribute of a
++    ``tf.keras.Model``, which replaces its lists and dicts with ``ListWrapper``
++    and ``_DictWrapper``.  Those are not YAML serialisable, so writing the
++    exported pose_cfg.yaml fails.  Networks are handed a plain copy and
++    anything on its way back out to YAML is converted back.
++    """
++    if isinstance(value, dict):
++        return {k: plain(v) for k, v in value.items()}
++    if isinstance(value, (list, tuple)):
++        converted = [plain(v) for v in value]
++        return tuple(converted) if isinstance(value, tuple) else converted
++    return value
++
++
++class Fetch:
++    """Stands in for a graph tensor in the (sess, inputs, outputs) contract."""
++
++    __slots__ = ("name",)
++
++    def __init__(self, name):
++        self.name = name
++
++    def __repr__(self):
++        return f"<Fetch {self.name}>"
++
++    def __hash__(self):
++        return hash(self.name)
++
++    def __eq__(self, other):
++        return isinstance(other, Fetch) and other.name == self.name
++
++
++class EagerSession:
++    """Session-shaped facade over an eager ``tf.function``.
++
++    Only what the code base actually uses is provided: ``run``, ``close`` and
++    the context-manager protocol.  ``net`` and ``cfg`` are there for the
++    exporter, which needs to re-trace the network under the TF1 node names.
++    """
++
++    def __init__(self, fn, feed, outputs, net, cfg):
++        self._fn = fn
++        self.inputs = feed
++        self.outputs = outputs
++        self.net = net
++        self.cfg = cfg
++        self._closed = False
++
++    def run(self, fetches, feed_dict=None):
++        if self._closed:
++            raise RuntimeError("this pose-prediction session has been closed")
++        if not feed_dict:
++            raise ValueError("an eager pose-prediction session needs a feed_dict")
++        (value,) = feed_dict.values()
++        out = self._fn(tf.convert_to_tensor(np.asarray(value, dtype=np.float32)))
++        single = isinstance(fetches, Fetch)
++        wanted = [fetches] if single else list(fetches)
++        result = [out[f.name].numpy() for f in wanted]
++        return result[0] if single else result
++
++    def close(self):
++        self._closed = True
++        self._fn = None
++        self.net = None
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        self.close()
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/legacy_tf1.py b/deeplabcut/pose_estimation_tensorflow/core/legacy_tf1.py
+new file mode 100644
+index 0000000..53d91f2
+--- /dev/null
++++ b/deeplabcut/pose_estimation_tensorflow/core/legacy_tf1.py
+@@ -0,0 +1,397 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Adapted from DeeperCut by Eldar Insafutdinov
++# https://github.com/eldar/pose-tensorflow
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""The TF1 graph-mode pose engine, kept until every network is ported.
++
++This module exists so that the rest of the TensorFlow engine can be written in
++plain TensorFlow 2.  Every remaining ``tf.compat.v1`` construct in
++core/predict.py, core/train.py, predict_videos.py and export.py has been moved
++here unchanged; those four files now contain none.  The file is reached only
++when the tf1 engine is selected (see ``nnets.factory.resolve_engine``),
++and it is meant to be deleted, whole, once they are the only implementation.
++
++Nothing in here is new code -- it is the DeepLabCut 3.0.1 implementation,
++moved.
++"""
++
++import logging
++import os
++import threading
++import warnings
++from pathlib import Path
++
++import tensorflow as tf
++import tf_slim as slim
++
++from deeplabcut.pose_estimation_tensorflow.config import load_config
++from deeplabcut.pose_estimation_tensorflow.datasets import PoseDatasetFactory
++from deeplabcut.pose_estimation_tensorflow.nnets.factory import TF1_ENGINE, PoseNetFactory
++from deeplabcut.pose_estimation_tensorflow.util.logging import setup_logging
++from deeplabcut.utils import auxfun_models
++
++_GRAPH_MODE = False
++
++
++def ensure_graph_mode():
++    """Switch TensorFlow to graph mode, once.
++
++    In DeepLabCut 3.0.1 this ran at import of core/train.py, so merely
++    importing ``deeplabcut`` disabled eager execution process-wide and made it
++    impossible for TF1 and TF2 code to share a process.  It now runs only when
++    a TF1 graph is about to be built.
++    """
++    global _GRAPH_MODE
++    if not _GRAPH_MODE:
++        tf.compat.v1.disable_eager_execution()
++        _GRAPH_MODE = True
++
++
++def reset_default_graph():
++    """``tf.compat.v1.reset_default_graph()``; a no-op outside graph mode."""
++    if _GRAPH_MODE:
++        tf.compat.v1.reset_default_graph()
++
++
++def graph_input_name(sess):
++    """The name of the input node of a frozen TF1 pose graph."""
++    return sess.graph.get_operations()[0].name
++
++
++def freeze_graph(sess, output, pbtxt_file, pb_file):
++    """Write the pbtxt and the frozen protobuf of a TF1 session's graph."""
++    tf.io.write_graph(sess.graph.as_graph_def(), "", pbtxt_file, as_text=True)
++    frozen = tf.compat.v1.graph_util.convert_variables_to_constants(
++        sess,
++        sess.graph_def,
++        output,
++    )
++    with Path(pb_file).open("wb") as file:
++        file.write(frozen.SerializeToString())
++
++
++class LearningRate:
++    def __init__(self, cfg):
++        self.steps = cfg["multi_step"]
++        self.current_step = 0
++
++    def get_lr(self, iteration):
++        lr = self.steps[self.current_step][0]
++        if iteration == self.steps[self.current_step][1]:
++            self.current_step += 1
++
++        return lr
++
++
++def get_batch_spec(cfg):
++    from deeplabcut.pose_estimation_tensorflow.datasets import Batch
++
++    num_joints = cfg["num_joints"]
++    batch_size = cfg["batch_size"]
++    return {
++        Batch.inputs: [batch_size, None, None, 3],
++        Batch.part_score_targets: [batch_size, None, None, num_joints],
++        Batch.part_score_weights: [batch_size, None, None, num_joints],
++        Batch.locref_targets: [batch_size, None, None, num_joints * 2],
++        Batch.locref_mask: [batch_size, None, None, num_joints * 2],
++    }
++
++
++def setup_pose_prediction(cfg, allow_growth=False, collect_extra=False):
++    ensure_graph_mode()
++    tf.compat.v1.reset_default_graph()
++    inputs = tf.compat.v1.placeholder(tf.float32, shape=[cfg["batch_size"], None, None, 3])
++    net_heads = PoseNetFactory.create(cfg, engine=TF1_ENGINE).test(inputs)
++    extra_dict = {}
++    outputs = [net_heads["part_prob"]]
++    if cfg["location_refinement"]:
++        outputs.append(net_heads["locref"])
++
++    if ("multi-animal" in cfg["dataset_type"]) and cfg["partaffinityfield_predict"]:
++        print("Activating extracting of PAFs")
++        outputs.append(net_heads["pairwise_pred"])
++
++    outputs.append(net_heads["peak_inds"])
++
++    if collect_extra:
++        extra_dict["features"] = net_heads["features"]
++
++    restorer = tf.compat.v1.train.Saver()
++
++    if allow_growth:
++        config = tf.compat.v1.ConfigProto()
++        config.gpu_options.allow_growth = True
++        sess = tf.compat.v1.Session(config=config)
++    else:
++        sess = tf.compat.v1.Session()
++    sess.run(tf.compat.v1.global_variables_initializer())
++    sess.run(tf.compat.v1.local_variables_initializer())
++
++    # Restore variables from disk.
++    restorer.restore(sess, cfg["init_weights"])
++
++    if collect_extra:
++        return sess, inputs, outputs, extra_dict
++    else:
++        return sess, inputs, outputs
++
++def setup_GPUpose_prediction(cfg, allow_growth=False):
++    ensure_graph_mode()
++    tf.compat.v1.reset_default_graph()
++    inputs = tf.compat.v1.placeholder(tf.float32, shape=[cfg["batch_size"], None, None, 3])
++    net_heads = PoseNetFactory.create(cfg, engine=TF1_ENGINE).inference(inputs)
++    outputs = [net_heads["pose"]]
++
++    restorer = tf.compat.v1.train.Saver()
++
++    if allow_growth:
++        config = tf.compat.v1.ConfigProto()
++        config.gpu_options.allow_growth = True
++        sess = tf.compat.v1.Session(config=config)
++    else:
++        sess = tf.compat.v1.Session()
++
++    sess.run(tf.compat.v1.global_variables_initializer())
++    sess.run(tf.compat.v1.local_variables_initializer())
++
++    # Restore variables from disk.
++    restorer.restore(sess, cfg["init_weights"])
++
++    return sess, inputs, outputs
++
++def setup_preloading(batch_spec):
++    placeholders = {name: tf.compat.v1.placeholder(tf.float32, shape=spec) for (name, spec) in batch_spec.items()}
++    names = placeholders.keys()
++    placeholders_list = list(placeholders.values())
++
++    QUEUE_SIZE = 20
++    q = tf.queue.FIFOQueue(QUEUE_SIZE, [tf.float32] * len(batch_spec))
++    enqueue_op = q.enqueue(placeholders_list)
++    batch_list = q.dequeue()
++
++    batch = {}
++    for idx, name in enumerate(names):
++        batch[name] = batch_list[idx]
++        batch[name].set_shape(batch_spec[name])
++    return batch, enqueue_op, placeholders
++
++
++def load_and_enqueue(sess, enqueue_op, coord, dataset, placeholders):
++    while not coord.should_stop():
++        batch_np = dataset.next_batch()
++        food = {pl: batch_np[name] for (name, pl) in placeholders.items()}
++        sess.run(enqueue_op, feed_dict=food)
++
++
++def start_preloading(sess, enqueue_op, dataset, placeholders):
++    coord = tf.compat.v1.train.Coordinator()
++    t = threading.Thread(
++        target=load_and_enqueue,
++        args=(sess, enqueue_op, coord, dataset, placeholders),
++    )
++    t.start()
++    return coord, t
++
++def get_optimizer(loss_op, cfg):
++    tstep = tf.compat.v1.placeholder(tf.int32, shape=[], name="tstep")
++    if "efficientnet" in cfg["net_type"]:
++        print("Switching to cosine decay schedule with adam!")
++        cfg["optimizer"] = "adam"
++        learning_rate = tf.compat.v1.train.cosine_decay(cfg["lr_init"], tstep, cfg["decay_steps"], alpha=cfg["alpha_r"])
++    else:
++        learning_rate = tf.compat.v1.placeholder(tf.float32, shape=[])
++
++    if cfg["optimizer"] == "sgd":
++        optimizer = tf.compat.v1.train.MomentumOptimizer(learning_rate=learning_rate, momentum=0.9)
++    elif cfg["optimizer"] == "adam":
++        optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate)
++    else:
++        raise ValueError("unknown optimizer {}".format(cfg["optimizer"]))
++    train_op = slim.learning.create_train_op(loss_op, optimizer)
++
++    return learning_rate, train_op, tstep
++
++
++def get_optimizer_with_freeze(loss_op, cfg):
++    learning_rate = tf.compat.v1.placeholder(tf.float32, shape=[])
++
++    if cfg["optimizer"] == "sgd":
++        optimizer = tf.compat.v1.train.MomentumOptimizer(learning_rate=learning_rate, momentum=0.9)
++    elif cfg["optimizer"] == "adam":
++        optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate)
++    else:
++        raise ValueError("unknown optimizer {}".format(cfg["optimizer"]))
++
++    train_unfrozen_op = slim.learning.create_train_op(loss_op, optimizer)
++    variables_unfrozen = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, "pose")
++
++    train_frozen_op = slim.learning.create_train_op(loss_op, optimizer, variables_to_train=variables_unfrozen)
++
++    return learning_rate, train_unfrozen_op, train_frozen_op
++
++def train(
++    config_yaml,
++    displayiters,
++    saveiters,
++    maxiters,
++    max_to_keep=5,
++    keepdeconvweights=True,
++    allow_growth=True,
++):
++    ensure_graph_mode()
++    start_path = Path.cwd()
++    os.chdir(str(Path(config_yaml).parents[0]))  # switch to folder of config_yaml (for logging)
++    setup_logging()
++
++    cfg = load_config(config_yaml)
++    net_type = cfg["net_type"]
++    if cfg["dataset_type"] in ("scalecrop", "tensorpack", "deterministic"):
++        print(
++            "Switching batchsize to 1, as tensorpack/scalecrop/deterministic loaders "
++            "do not support batches >1. Use imgaug/default loader."
++        )
++        cfg["batch_size"] = 1  # in case this was edited for analysis.-
++
++    dataset = PoseDatasetFactory.create(cfg)
++    batch_spec = get_batch_spec(cfg)
++    batch, enqueue_op, placeholders = setup_preloading(batch_spec)
++
++    losses = PoseNetFactory.create(cfg, engine=TF1_ENGINE).train(batch)
++    total_loss = losses["total_loss"]
++
++    for k, t in losses.items():
++        tf.compat.v1.summary.scalar(k, t)
++    merged_summaries = tf.compat.v1.summary.merge_all()
++
++    stem = Path(cfg["init_weights"]).stem
++    if "snapshot" in stem and keepdeconvweights:
++        print("Loading already trained DLC with backbone:", net_type)
++        variables_to_restore = slim.get_variables_to_restore()
++        start_iter = int(stem.split("-")[1])
++    else:
++        print("Loading ImageNet-pretrained", net_type)
++        # loading backbone from ResNet, MobileNet etc.
++        if "resnet" in net_type:
++            variables_to_restore = slim.get_variables_to_restore(include=["resnet_v1"])
++        elif "mobilenet" in net_type:
++            variables_to_restore = slim.get_variables_to_restore(include=["MobilenetV2"])
++        elif "efficientnet" in net_type:
++            variables_to_restore = slim.get_variables_to_restore(include=["efficientnet"])
++            variables_to_restore = {
++                var.op.name.replace("efficientnet/", "") + "/ExponentialMovingAverage": var
++                for var in variables_to_restore
++            }
++        else:
++            print("Wait for DLC 2.3.")
++        start_iter = 0
++
++    restorer = tf.compat.v1.train.Saver(variables_to_restore)
++    saver = tf.compat.v1.train.Saver(
++        max_to_keep=max_to_keep
++    )  # selects how many snapshots are stored, see https://github.com/DeepLabCut/DeepLabCut/issues/8#issuecomment-387404835
++
++    if allow_growth:
++        config = tf.compat.v1.ConfigProto()
++        config.gpu_options.allow_growth = True
++        sess = tf.compat.v1.Session(config=config)
++    else:
++        sess = tf.compat.v1.Session()
++
++    coord, thread = start_preloading(sess, enqueue_op, dataset, placeholders)
++    train_writer = tf.compat.v1.summary.FileWriter(cfg["log_dir"], sess.graph)
++
++    # Auto-switch to Adam on M1/M2 chips, as the momentum optimizer crashes
++    from tensorflow.python.platform import build_info
++
++    info = build_info.build_info
++    if not info["is_cuda_build"]:  # Apple Silicon is not built with CUDA
++        warnings.warn("Switching to Adam, as SGD crashes on Apple Silicon.", stacklevel=2)
++        cfg["optimizer"] = "adam"
++        cfg["lr_init"] = 5e-4
++        cfg["multi_step"] = [[1e-4, 7500], [5e-5, 12000], [1e-5, 200000]]
++
++    if cfg.get("freezeencoder", False):
++        if "efficientnet" in net_type:
++            print("Freezing ONLY supported MobileNet/ResNet currently!!")
++            learning_rate, train_op, tstep = get_optimizer(total_loss, cfg)
++
++        print("Freezing encoder...")
++        learning_rate, _, train_op = get_optimizer_with_freeze(total_loss, cfg)
++    else:
++        learning_rate, train_op, tstep = get_optimizer(total_loss, cfg)
++
++    sess.run(tf.compat.v1.global_variables_initializer())
++    sess.run(tf.compat.v1.local_variables_initializer())
++
++    # Restore variables from disk.
++    auxfun_models.smart_restore(restorer, sess, cfg["init_weights"], net_type)
++
++    if maxiters is None:
++        max_iter = int(cfg["multi_step"][-1][1])
++    else:
++        max_iter = min(int(cfg["multi_step"][-1][1]), int(maxiters))
++        # display_iters = max(1,int(displayiters))
++        print("Max_iters overwritten as", max_iter)
++
++    if displayiters is None:
++        display_iters = max(1, int(cfg["display_iters"]))
++    else:
++        display_iters = max(1, int(displayiters))
++        print("Display_iters overwritten as", display_iters)
++
++    if saveiters is None:
++        save_iters = max(1, int(cfg["save_iters"]))
++
++    else:
++        save_iters = max(1, int(saveiters))
++        print("Save_iters overwritten as", save_iters)
++
++    cum_loss = 0.0
++    lr_gen = LearningRate(cfg)
++
++    stats_path = Path(config_yaml).with_name("learning_stats.csv")
++    lrf = stats_path.open("w")
++
++    print("Training parameter:")
++    print(cfg)
++    print("Starting training....")
++    max_iter += start_iter  # max_iter is relative to start_iter
++    for it in range(start_iter, max_iter + 1):
++        if "efficientnet" in net_type:
++            lr_dict = {tstep: it - start_iter}
++            current_lr = sess.run(learning_rate, feed_dict=lr_dict)
++        else:
++            current_lr = lr_gen.get_lr(it - start_iter)
++            lr_dict = {learning_rate: current_lr}
++
++        [_, loss_val, summary] = sess.run([train_op, total_loss, merged_summaries], feed_dict=lr_dict)
++        cum_loss += loss_val
++        train_writer.add_summary(summary, it)
++
++        if it % display_iters == 0 and it > start_iter:
++            average_loss = cum_loss / display_iters
++            cum_loss = 0.0
++            logging.info("iteration: {} loss: {} lr: {}".format(it, f"{average_loss:.4f}", current_lr))
++            lrf.write(f"{it}, {average_loss:.5f}, {current_lr}\n")
++            lrf.flush()
++
++        # Save snapshot
++        if (it % save_iters == 0 and it != start_iter) or it == max_iter:
++            model_name = cfg["snapshot_prefix"]
++            saver.save(sess, model_name, global_step=it)
++
++    lrf.close()
++    sess.close()
++    coord.request_stop()
++    coord.join([thread])
++    # return to original path.
++    os.chdir(str(start_path))
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/predict.py b/deeplabcut/pose_estimation_tensorflow/core/predict.py
+index ffed2b1..99dac18 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/predict.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/predict.py
+@@ -15,47 +15,77 @@
+ import numpy as np
+ import tensorflow as tf
+ 
+-from deeplabcut.pose_estimation_tensorflow.nnets.factory import PoseNetFactory
+-
++from deeplabcut.pose_estimation_tensorflow.nnets import checkpoint
++from deeplabcut.pose_estimation_tensorflow.nnets.factory import (
++    KERAS_ENGINE,
++    PoseNetFactory,
++    resolve_engine,
++)
++
++from . import legacy_tf1
++from .eager_session import EagerSession, Fetch, plain
++from .train_eager import configure_gpu_memory_growth
+ from .openvino.session import OpenVINOSession
+ 
+ 
++def build_eager_net(cfg, trace_batch=1):
++    """Build the Keras pose net and restore ``cfg["init_weights"]`` into it.
++
++    The network is handed a plain copy of the config because
++    ``BaseKerasPoseNet`` stores it on a ``tf.keras.Model``, which would replace
++    its lists and dicts with Keras tracking wrappers.
++    """
++    net = PoseNetFactory.create(plain(cfg), engine=KERAS_ENGINE)
++    net.build_for([trace_batch, 64, 64, 3])
++    checkpoint.load_tf1_checkpoint(net, cfg["init_weights"])
++    return net
++
++
++def _build_eager_session(cfg, head_fn, output_names, allow_growth=False):
++    # the TF1 engine spelled this ConfigProto(gpu_options.allow_growth=True)
++    configure_gpu_memory_growth(allow_growth)
++    net = build_eager_net(cfg, cfg.get("batch_size") or 1)
++
++    @tf.function(reduce_retracing=True)
++    def fn(x):
++        return head_fn(net, x)
++
++    feed = Fetch("Placeholder")
++    outputs = [Fetch(name) for name in output_names]
++    return EagerSession(fn, feed, outputs, net, cfg), feed, outputs
++
++
+ def setup_pose_prediction(cfg, allow_growth=False, collect_extra=False):
+-    tf.compat.v1.reset_default_graph()
+-    inputs = tf.compat.v1.placeholder(tf.float32, shape=[cfg["batch_size"], None, None, 3])
+-    net_heads = PoseNetFactory.create(cfg).test(inputs)
+-    extra_dict = {}
+-    outputs = [net_heads["part_prob"]]
+-    if cfg["location_refinement"]:
+-        outputs.append(net_heads["locref"])
++    if resolve_engine(cfg) != KERAS_ENGINE:
++        return legacy_tf1.setup_pose_prediction(cfg, allow_growth, collect_extra)
+ 
++    names = ["part_prob"]
++    if cfg["location_refinement"]:
++        names.append("locref")
+     if ("multi-animal" in cfg["dataset_type"]) and cfg["partaffinityfield_predict"]:
+         print("Activating extracting of PAFs")
+-        outputs.append(net_heads["pairwise_pred"])
++        names.append("pairwise_pred")
++    names.append("peak_inds")
++    if collect_extra:
++        names.append("features")
+ 
+-    outputs.append(net_heads["peak_inds"])
++    def head_fn(net, x):
++        # BasePoseNet.test() -- get_net() plus the inference heads -- is already
++        # plain TensorFlow 2 and is inherited unchanged by the Keras nets.
++        out = net.test(x)
++        return {k: out[k] for k in names}
+ 
++    sess, feed, outputs = _build_eager_session(cfg, head_fn, names, allow_growth)
+     if collect_extra:
+-        extra_dict["features"] = net_heads["features"]
+-
+-    restorer = tf.compat.v1.train.Saver()
++        return sess, feed, outputs[:-1], {"features": outputs[-1]}
++    return sess, feed, outputs
+ 
+-    if allow_growth:
+-        config = tf.compat.v1.ConfigProto()
+-        config.gpu_options.allow_growth = True
+-        sess = tf.compat.v1.Session(config=config)
+-    else:
+-        sess = tf.compat.v1.Session()
+-    sess.run(tf.compat.v1.global_variables_initializer())
+-    sess.run(tf.compat.v1.local_variables_initializer())
+ 
+-    # Restore variables from disk.
+-    restorer.restore(sess, cfg["init_weights"])
++def setup_GPUpose_prediction(cfg, allow_growth=False):
++    if resolve_engine(cfg) != KERAS_ENGINE:
++        return legacy_tf1.setup_GPUpose_prediction(cfg, allow_growth)
+ 
+-    if collect_extra:
+-        return sess, inputs, outputs, extra_dict
+-    else:
+-        return sess, inputs, outputs
++    return _build_eager_session(cfg, lambda net, x: net.inference(x), ["pose"], allow_growth)
+ 
+ 
+ def extract_cnn_output(outputs_np, cfg):
+@@ -201,31 +231,6 @@ def getposeNP(image, cfg, sess, inputs, outputs, outall=False):
+         return pose
+ 
+ 
+-### Code for TF inference on GPU
+-def setup_GPUpose_prediction(cfg, allow_growth=False):
+-    tf.compat.v1.reset_default_graph()
+-    inputs = tf.compat.v1.placeholder(tf.float32, shape=[cfg["batch_size"], None, None, 3])
+-    net_heads = PoseNetFactory.create(cfg).inference(inputs)
+-    outputs = [net_heads["pose"]]
+-
+-    restorer = tf.compat.v1.train.Saver()
+-
+-    if allow_growth:
+-        config = tf.compat.v1.ConfigProto()
+-        config.gpu_options.allow_growth = True
+-        sess = tf.compat.v1.Session(config=config)
+-    else:
+-        sess = tf.compat.v1.Session()
+-
+-    sess.run(tf.compat.v1.global_variables_initializer())
+-    sess.run(tf.compat.v1.local_variables_initializer())
+-
+-    # Restore variables from disk.
+-    restorer.restore(sess, cfg["init_weights"])
+-
+-    return sess, inputs, outputs
+-
+-
+ def extract_GPUprediction(outputs, cfg):
+     return outputs[0]
+ 
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/train.py b/deeplabcut/pose_estimation_tensorflow/core/train.py
+index 94844a9..9565508 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/train.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/train.py
+@@ -15,36 +15,47 @@
+ import argparse
+ import logging
+ import os
+-import threading
+ import warnings
+ from pathlib import Path
+ 
+ import tensorflow as tf
+-import tf_slim as slim
+ 
+ from deeplabcut.pose_estimation_tensorflow.config import load_config
+-from deeplabcut.pose_estimation_tensorflow.datasets import (
+-    Batch,
+-    PoseDatasetFactory,
++from deeplabcut.pose_estimation_tensorflow.datasets import Batch, PoseDatasetFactory
++from deeplabcut.pose_estimation_tensorflow.nnets import load_tf1_checkpoint
++from deeplabcut.pose_estimation_tensorflow.nnets.factory import (
++    KERAS_ENGINE,
++    PoseNetFactory,
++    resolve_engine,
+ )
+-from deeplabcut.pose_estimation_tensorflow.nnets import PoseNetFactory
+ from deeplabcut.pose_estimation_tensorflow.util.logging import setup_logging
+-from deeplabcut.utils import auxfun_models
+-
+-tf.compat.v1.disable_eager_execution()
+-
+-
+-class LearningRate:
+-    def __init__(self, cfg):
+-        self.steps = cfg["multi_step"]
+-        self.current_step = 0
+-
+-    def get_lr(self, iteration):
+-        lr = self.steps[self.current_step][0]
+-        if iteration == self.steps[self.current_step][1]:
+-            self.current_step += 1
++from deeplabcut.utils import auxiliaryfunctions, auxfun_models
++
++from . import legacy_tf1
++from .eager_session import plain
++
++# The eager training helpers are shared with core/train_multianimal.py; this
++# module used to own LearningRate, but importing it turned eager execution off
++# process-wide, so it moved.  It is re-exported here for anything that still
++# reaches for deeplabcut...core.train.LearningRate.
++from .train_eager import (  # noqa: F401
++    LearningRate,
++    SnapshotSaver,
++    configure_gpu_memory_growth,
++    make_dataset,
++    make_optimizer,
++    make_train_step,
++)
+ 
+-        return lr
++# core/train_multianimal.py used to import the TF1 input queue and optimiser
++# from here.  They live in legacy_tf1 now, and are re-exported so that anything
++# else reaching for them keeps working until that module is deleted.
++from .legacy_tf1 import (  # noqa: F401
++    get_optimizer,
++    get_optimizer_with_freeze,
++    setup_preloading,
++    start_preloading,
++)
+ 
+ 
+ def get_batch_spec(cfg):
+@@ -59,179 +70,49 @@ def get_batch_spec(cfg):
+     }
+ 
+ 
+-def setup_preloading(batch_spec):
+-    placeholders = {name: tf.compat.v1.placeholder(tf.float32, shape=spec) for (name, spec) in batch_spec.items()}
+-    names = placeholders.keys()
+-    placeholders_list = list(placeholders.values())
+-
+-    QUEUE_SIZE = 20
+-    q = tf.queue.FIFOQueue(QUEUE_SIZE, [tf.float32] * len(batch_spec))
+-    enqueue_op = q.enqueue(placeholders_list)
+-    batch_list = q.dequeue()
+-
+-    batch = {}
+-    for idx, name in enumerate(names):
+-        batch[name] = batch_list[idx]
+-        batch[name].set_shape(batch_spec[name])
+-    return batch, enqueue_op, placeholders
+-
+-
+-def load_and_enqueue(sess, enqueue_op, coord, dataset, placeholders):
+-    while not coord.should_stop():
+-        batch_np = dataset.next_batch()
+-        food = {pl: batch_np[name] for (name, pl) in placeholders.items()}
+-        sess.run(enqueue_op, feed_dict=food)
+-
+-
+-def start_preloading(sess, enqueue_op, dataset, placeholders):
+-    coord = tf.compat.v1.train.Coordinator()
+-    t = threading.Thread(
+-        target=load_and_enqueue,
+-        args=(sess, enqueue_op, coord, dataset, placeholders),
+-    )
+-    t.start()
+-    return coord, t
+-
+-
+-def get_optimizer(loss_op, cfg):
+-    tstep = tf.compat.v1.placeholder(tf.int32, shape=[], name="tstep")
+-    if "efficientnet" in cfg["net_type"]:
+-        print("Switching to cosine decay schedule with adam!")
+-        cfg["optimizer"] = "adam"
+-        learning_rate = tf.compat.v1.train.cosine_decay(cfg["lr_init"], tstep, cfg["decay_steps"], alpha=cfg["alpha_r"])
+-    else:
+-        learning_rate = tf.compat.v1.placeholder(tf.float32, shape=[])
+-
+-    if cfg["optimizer"] == "sgd":
+-        optimizer = tf.compat.v1.train.MomentumOptimizer(learning_rate=learning_rate, momentum=0.9)
+-    elif cfg["optimizer"] == "adam":
+-        optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate)
+-    else:
+-        raise ValueError("unknown optimizer {}".format(cfg["optimizer"]))
+-    train_op = slim.learning.create_train_op(loss_op, optimizer)
+-
+-    return learning_rate, train_op, tstep
+-
+-
+-def get_optimizer_with_freeze(loss_op, cfg):
+-    learning_rate = tf.compat.v1.placeholder(tf.float32, shape=[])
+-
+-    if cfg["optimizer"] == "sgd":
+-        optimizer = tf.compat.v1.train.MomentumOptimizer(learning_rate=learning_rate, momentum=0.9)
+-    elif cfg["optimizer"] == "adam":
+-        optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate)
+-    else:
+-        raise ValueError("unknown optimizer {}".format(cfg["optimizer"]))
++def _restore_plan(cfg, keepdeconvweights):
++    """Which snapshot weights to load, and which iteration to resume from.
+ 
+-    train_unfrozen_op = slim.learning.create_train_op(loss_op, optimizer)
+-    variables_unfrozen = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, "pose")
+-
+-    train_frozen_op = slim.learning.create_train_op(loss_op, optimizer, variables_to_train=variables_unfrozen)
+-
+-    return learning_rate, train_unfrozen_op, train_frozen_op
+-
+-
+-def train(
+-    config_yaml,
+-    displayiters,
+-    saveiters,
+-    maxiters,
+-    max_to_keep=5,
+-    keepdeconvweights=True,
+-    allow_growth=True,
+-):
+-    start_path = Path.cwd()
+-    os.chdir(str(Path(config_yaml).parents[0]))  # switch to folder of config_yaml (for logging)
+-    setup_logging()
+-
+-    cfg = load_config(config_yaml)
++    The tf_slim trainer chose between ``get_variables_to_restore()`` for a
++    DeepLabCut snapshot and ``get_variables_to_restore(include=[<backbone>])``
++    for an ImageNet checkpoint; ``include_prefixes`` is the same restriction
++    expressed against the tf_slim names the Keras nets publish.
++    """
+     net_type = cfg["net_type"]
+-    if cfg["dataset_type"] in ("scalecrop", "tensorpack", "deterministic"):
+-        print(
+-            "Switching batchsize to 1, as tensorpack/scalecrop/deterministic loaders "
+-            "do not support batches >1. Use imgaug/default loader."
+-        )
+-        cfg["batch_size"] = 1  # in case this was edited for analysis.-
+-
+-    dataset = PoseDatasetFactory.create(cfg)
+-    batch_spec = get_batch_spec(cfg)
+-    batch, enqueue_op, placeholders = setup_preloading(batch_spec)
+-
+-    losses = PoseNetFactory.create(cfg).train(batch)
+-    total_loss = losses["total_loss"]
+-
+-    for k, t in losses.items():
+-        tf.compat.v1.summary.scalar(k, t)
+-    merged_summaries = tf.compat.v1.summary.merge_all()
+-
+     stem = Path(cfg["init_weights"]).stem
+     if "snapshot" in stem and keepdeconvweights:
+         print("Loading already trained DLC with backbone:", net_type)
+-        variables_to_restore = slim.get_variables_to_restore()
+-        start_iter = int(stem.split("-")[1])
+-    else:
+-        print("Loading ImageNet-pretrained", net_type)
+-        # loading backbone from ResNet, MobileNet etc.
+-        if "resnet" in net_type:
+-            variables_to_restore = slim.get_variables_to_restore(include=["resnet_v1"])
+-        elif "mobilenet" in net_type:
+-            variables_to_restore = slim.get_variables_to_restore(include=["MobilenetV2"])
+-        elif "efficientnet" in net_type:
+-            variables_to_restore = slim.get_variables_to_restore(include=["efficientnet"])
+-            variables_to_restore = {
+-                var.op.name.replace("efficientnet/", "") + "/ExponentialMovingAverage": var
+-                for var in variables_to_restore
+-            }
+-        else:
+-            print("Wait for DLC 2.3.")
+-        start_iter = 0
+-
+-    restorer = tf.compat.v1.train.Saver(variables_to_restore)
+-    saver = tf.compat.v1.train.Saver(
+-        max_to_keep=max_to_keep
+-    )  # selects how many snapshots are stored, see https://github.com/DeepLabCut/DeepLabCut/issues/8#issuecomment-387404835
+-
+-    if allow_growth:
+-        config = tf.compat.v1.ConfigProto()
+-        config.gpu_options.allow_growth = True
+-        sess = tf.compat.v1.Session(config=config)
+-    else:
+-        sess = tf.compat.v1.Session()
+-
+-    coord, thread = start_preloading(sess, enqueue_op, dataset, placeholders)
+-    train_writer = tf.compat.v1.summary.FileWriter(cfg["log_dir"], sess.graph)
++        return None, int(stem.split("-")[1])
+ 
+-    # Auto-switch to Adam on M1/M2 chips, as the momentum optimizer crashes
+-    from tensorflow.python.platform import build_info
++    print("Loading ImageNet-pretrained", net_type)
++    for key, prefix in (
++        ("resnet", "resnet_v1"),
++        ("mobilenet", "MobilenetV2"),
++        ("efficientnet", "efficientnet"),
++    ):
++        if key in net_type:
++            return [prefix], 0
++    print("Wait for DLC 2.3.")
++    return None, 0
+ 
+-    info = build_info.build_info
+-    if not info["is_cuda_build"]:  # Apple Silicon is not built with CUDA
+-        warnings.warn("Switching to Adam, as SGD crashes on Apple Silicon.", stacklevel=2)
+-        cfg["optimizer"] = "adam"
+-        cfg["lr_init"] = 5e-4
+-        cfg["multi_step"] = [[1e-4, 7500], [5e-5, 12000], [1e-5, 200000]]
+-
+-    if cfg.get("freezeencoder", False):
+-        if "efficientnet" in net_type:
+-            print("Freezing ONLY supported MobileNet/ResNet currently!!")
+-            learning_rate, train_op, tstep = get_optimizer(total_loss, cfg)
+ 
+-        print("Freezing encoder...")
+-        learning_rate, _, train_op = get_optimizer_with_freeze(total_loss, cfg)
+-    else:
+-        learning_rate, train_op, tstep = get_optimizer(total_loss, cfg)
++def _restore(net, cfg, include):
++    """Restore ``cfg["init_weights"]``, redownloading it if it has gone missing.
+ 
+-    sess.run(tf.compat.v1.global_variables_initializer())
+-    sess.run(tf.compat.v1.local_variables_initializer())
++    ``auxfun_models.smart_restore`` does the same for the tf_slim trainer.
++    """
++    try:
++        return load_tf1_checkpoint(net, cfg["init_weights"], include_prefixes=include)
++    except (ValueError, tf.errors.NotFoundError):
++        auxfun_models.check_for_weights(cfg["net_type"], auxiliaryfunctions.get_deeplabcut_path())
++        return load_tf1_checkpoint(net, cfg["init_weights"], include_prefixes=include)
+ 
+-    # Restore variables from disk.
+-    auxfun_models.smart_restore(restorer, sess, cfg["init_weights"], net_type)
+ 
++def _iteration_counts(cfg, maxiters, displayiters, saveiters):
+     if maxiters is None:
+         max_iter = int(cfg["multi_step"][-1][1])
+     else:
+         max_iter = min(int(cfg["multi_step"][-1][1]), int(maxiters))
+-        # display_iters = max(1,int(displayiters))
+         print("Max_iters overwritten as", max_iter)
+ 
+     if displayiters is None:
+@@ -242,32 +123,80 @@ def train(
+ 
+     if saveiters is None:
+         save_iters = max(1, int(cfg["save_iters"]))
+-
+     else:
+         save_iters = max(1, int(saveiters))
+         print("Save_iters overwritten as", save_iters)
++    return max_iter, display_iters, save_iters
+ 
+-    cum_loss = 0.0
+-    lr_gen = LearningRate(cfg)
+ 
+-    stats_path = Path(config_yaml).with_name("learning_stats.csv")
+-    lrf = stats_path.open("w")
++def _train_eager(
++    config_yaml,
++    cfg,
++    dataset,
++    displayiters,
++    saveiters,
++    maxiters,
++    max_to_keep,
++    keepdeconvweights,
++    allow_growth,
++):
++    """The single-animal training loop, in eager mode.
++
++    ``slim.learning.create_train_op`` becomes ``train_eager.make_train_step``,
++    the ``FIFOQueue`` plus its thread and ``Coordinator`` become
++    ``train_eager.make_dataset``, and the TF1 ``Saver`` becomes
++    ``train_eager.SnapshotSaver``.  Those helpers are shared with
++    ``core/train_multianimal.py`` so both loops replace create_train_op the
++    same way.
++    """
++    configure_gpu_memory_growth(allow_growth)
++
++    net = PoseNetFactory.create(plain(cfg), engine=KERAS_ENGINE)
++    include, start_iter = _restore_plan(cfg, keepdeconvweights)
++
++    batches = iter(make_dataset(dataset, get_batch_spec(cfg)))
++    batch = next(batches)
++    # one forward pass, because Keras creates the weights lazily
++    net.get_net(batch["inputs"], is_training=True)
++    _restore(net, cfg, include)
++
++    if cfg.get("freezeencoder", False):
++        if "efficientnet" in cfg["net_type"]:
++            print("Freezing ONLY supported MobileNet/ResNet currently!!")
++        print("Freezing encoder...")
++        heads = {id(v) for layer in net._heads.values() for v in layer.trainable_variables}
++        variables_to_train = [v for v in net.trainable_variables if id(v) in heads]
++    else:
++        variables_to_train = None
+ 
++    lr_gen = LearningRate(cfg)
++    global_step = tf.Variable(start_iter, dtype=tf.int64, trainable=False, name="global_step")
++    optimizer = make_optimizer(cfg, lr_gen.get_lr(0))
++    step = make_train_step(net, optimizer, global_step, variables_to_train)
++    saver = SnapshotSaver(net, cfg["snapshot_prefix"], max_to_keep=max_to_keep)
++
++    max_iter, display_iters, save_iters = _iteration_counts(cfg, maxiters, displayiters, saveiters)
++    writer = tf.summary.create_file_writer(cfg["log_dir"])
++    cosine = None
++    if "efficientnet" in cfg["net_type"]:
++        print("Switching to cosine decay schedule with adam!")
++        cosine = tf.keras.optimizers.schedules.CosineDecay(
++            cfg["lr_init"], cfg["decay_steps"], alpha=cfg["alpha_r"]
++        )
++
++    cum_loss = 0.0
++    lrf = Path(config_yaml).with_name("learning_stats.csv").open("w")
+     print("Training parameter:")
+     print(cfg)
+     print("Starting training....")
+     max_iter += start_iter  # max_iter is relative to start_iter
+     for it in range(start_iter, max_iter + 1):
+-        if "efficientnet" in net_type:
+-            lr_dict = {tstep: it - start_iter}
+-            current_lr = sess.run(learning_rate, feed_dict=lr_dict)
+-        else:
+-            current_lr = lr_gen.get_lr(it - start_iter)
+-            lr_dict = {learning_rate: current_lr}
+-
+-        [_, loss_val, summary] = sess.run([train_op, total_loss, merged_summaries], feed_dict=lr_dict)
+-        cum_loss += loss_val
+-        train_writer.add_summary(summary, it)
++        current_lr = float(cosine(it - start_iter)) if cosine is not None else lr_gen.get_lr(it - start_iter)
++        losses = step(batch, tf.constant(current_lr, tf.float32))
++        cum_loss += float(losses["total_loss"])
++        with writer.as_default(step=it):
++            for name, value in losses.items():
++                tf.summary.scalar(name, value)
+ 
+         if it % display_iters == 0 and it > start_iter:
+             average_loss = cum_loss / display_iters
+@@ -276,17 +205,74 @@ def train(
+             lrf.write(f"{it}, {average_loss:.5f}, {current_lr}\n")
+             lrf.flush()
+ 
+-        # Save snapshot
+         if (it % save_iters == 0 and it != start_iter) or it == max_iter:
+-            model_name = cfg["snapshot_prefix"]
+-            saver.save(sess, model_name, global_step=it)
++            saver.save(global_step=it)
++
++        if it != max_iter:
++            batch = next(batches)
+ 
+     lrf.close()
+-    sess.close()
+-    coord.request_stop()
+-    coord.join([thread])
+-    # return to original path.
+-    os.chdir(str(start_path))
++    writer.close()
++
++
++def train(
++    config_yaml,
++    displayiters,
++    saveiters,
++    maxiters,
++    max_to_keep=5,
++    keepdeconvweights=True,
++    allow_growth=True,
++):
++    cfg = load_config(config_yaml)
++    if resolve_engine(cfg) != KERAS_ENGINE:
++        return legacy_tf1.train(
++            config_yaml,
++            displayiters,
++            saveiters,
++            maxiters,
++            max_to_keep=max_to_keep,
++            keepdeconvweights=keepdeconvweights,
++            allow_growth=allow_growth,
++        )
++
++    start_path = Path.cwd()
++    os.chdir(str(Path(config_yaml).parents[0]))  # switch to folder of config_yaml (for logging)
++    setup_logging()
++    try:
++        if cfg["dataset_type"] in ("scalecrop", "tensorpack", "deterministic"):
++            print(
++                "Switching batchsize to 1, as tensorpack/scalecrop/deterministic loaders "
++                "do not support batches >1. Use imgaug/default loader."
++            )
++            cfg["batch_size"] = 1  # in case this was edited for analysis.-
++
++        if "efficientnet" in cfg["net_type"]:
++            cfg["optimizer"] = "adam"
++
++        # Auto-switch to Adam on M1/M2 chips, as the momentum optimizer crashes
++        from tensorflow.python.platform import build_info
++
++        if not build_info.build_info["is_cuda_build"]:  # Apple Silicon is not built with CUDA
++            warnings.warn("Switching to Adam, as SGD crashes on Apple Silicon.", stacklevel=2)
++            cfg["optimizer"] = "adam"
++            cfg["lr_init"] = 5e-4
++            cfg["multi_step"] = [[1e-4, 7500], [5e-5, 12000], [1e-5, 200000]]
++
++        dataset = PoseDatasetFactory.create(cfg)
++        _train_eager(
++            config_yaml,
++            cfg,
++            dataset,
++            displayiters,
++            saveiters,
++            maxiters,
++            max_to_keep,
++            keepdeconvweights,
++            allow_growth,
++        )
++    finally:
++        os.chdir(str(start_path))
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/deeplabcut/pose_estimation_tensorflow/export.py b/deeplabcut/pose_estimation_tensorflow/export.py
+index ed539a0..1ccabd4 100644
+--- a/deeplabcut/pose_estimation_tensorflow/export.py
++++ b/deeplabcut/pose_estimation_tensorflow/export.py
+@@ -14,12 +14,28 @@ import tarfile
+ from pathlib import Path
+ 
+ import tensorflow as tf
++from tensorflow.python.framework.convert_to_constants import (
++    convert_variables_to_constants_v2,
++)
+ 
+ from deeplabcut.core.config import get_yaml_dumper, get_yaml_loader
+ from deeplabcut.pose_estimation_tensorflow.config import load_config
+-from deeplabcut.pose_estimation_tensorflow.core import predict
++from deeplabcut.pose_estimation_tensorflow.core import legacy_tf1, predict
++from deeplabcut.pose_estimation_tensorflow.core.eager_session import plain
++from deeplabcut.pose_estimation_tensorflow.nnets.factory import KERAS_ENGINE, resolve_engine
+ from deeplabcut.utils import auxiliaryfunctions
+ 
++#: The node names a frozen DeepLabCut graph is consumed by -- DLC-Live reads
++#: them out of the .pb by name -- and the head each one carries.
++EXPORT_NODES = {
++    "Sigmoid": "part_prob",
++    "pose/part_pred/block4/BiasAdd": "part_pred",
++    "pose/locref_pred/block4/BiasAdd": "locref",
++    "pose/pairwise_pred/block4/BiasAdd": "pairwise_pred",
++    "Cast_2": "peak_inds",
++    "concat_1": "pose",
++}
++
+ 
+ def create_deploy_config_template():
+     """
+@@ -146,11 +162,43 @@ def load_model(cfg, shuffle=1, trainingsetindex=0, TFGPUinference=True, modelpre
+         else:
+             output = ["Sigmoid", "pose/part_pred/block4/BiasAdd"]
+ 
+-    input = tf.compat.v1.get_default_graph().get_operations()[0].name
++    if resolve_engine(dlc_cfg) == KERAS_ENGINE:
++        # the eager serving function declares its input as "Placeholder", the
++        # name the TF1 graph gave it and the one DLC-Live looks for
++        input = "Placeholder"
++    else:
++        input = legacy_tf1.graph_input_name(sess)
+ 
+     return sess, input, output, dlc_cfg
+ 
+ 
++def build_serving_function(net, cfg, output):
++    """A ``tf.function`` whose frozen graph carries the TF1 node names.
++
++    Freezing an eager model names its nodes after Keras layers, so none of the
++    names DLC-Live loads by survive -- of 3796 TF1 op names exactly one does.
++    Wrapping each output in ``tf.identity`` with its old name inside the traced
++    function restores all of them; the input node is already "Placeholder".
++    """
++    wanted = list(output)
++    unknown = [name for name in wanted if name not in EXPORT_NODES]
++    if unknown:
++        raise ValueError(f"cannot export unknown output node(s) {unknown}")
++    shape = [cfg.get("batch_size") or None, None, None, 3]
++
++    @tf.function(input_signature=[tf.TensorSpec(shape, tf.float32, name="Placeholder")])
++    def serve(x):
++        heads = net.get_net(x, is_training=False)
++        available = dict(heads)
++        if any(EXPORT_NODES[n] in ("part_prob", "peak_inds") for n in wanted):
++            available.update(net.add_inference_layers(heads))
++        if "concat_1" in wanted:
++            available.update(net.inference(x))
++        return tuple(tf.identity(available[EXPORT_NODES[n]], name=n) for n in wanted)
++
++    return serve
++
++
+ def tf_to_pb(sess, checkpoint, output, output_dir=None):
+     """Saves a frozen tensorflow graph (a protobuf file).
+ 
+@@ -168,20 +216,19 @@ def tf_to_pb(sess, checkpoint, output, output_dir=None):
+ 
+     output_dir = Path(output_dir).expanduser() if output_dir else Path(checkpoint).parent
+     ckpt_base = Path(checkpoint).name
+-
+-    # save graph to pbtxt file
+     pbtxt_file = str(Path(output_dir) / (ckpt_base + ".pbtxt"))
+-    tf.io.write_graph(sess.graph.as_graph_def(), "", pbtxt_file, as_text=True)
+-
+-    # create frozen graph from pbtxt file
+     pb_file = Path(output_dir) / (ckpt_base + ".pb")
+-    frozen_graph_def = tf.compat.v1.graph_util.convert_variables_to_constants(
+-        sess,
+-        sess.graph_def,
+-        output,
+-    )
++
++    if getattr(sess, "net", None) is None:
++        legacy_tf1.freeze_graph(sess, output, pbtxt_file, pb_file)
++        return
++
++    serve = build_serving_function(sess.net, sess.cfg, output)
++    frozen = convert_variables_to_constants_v2(serve.get_concrete_function())
++    graph_def = frozen.graph.as_graph_def()
++    tf.io.write_graph(graph_def, "", pbtxt_file, as_text=True)
+     with Path(pb_file).open("wb") as file:
+-        file.write(frozen_graph_def.SerializeToString())
++        file.write(graph_def.SerializeToString())
+ 
+ 
+ def export_model(
+@@ -262,7 +309,7 @@ def export_model(
+     ### write pose config file
+ 
+     # sort dlc_cfg keys alphabetically, then save to pose_cfg.yaml in export directory
+-    dlc_cfg = dict(dlc_cfg)
++    dlc_cfg = plain(dict(dlc_cfg))
+     sorted_cfg = {}
+     for key, value in sorted(dlc_cfg.items()):
+         if wipepaths:
+diff --git a/deeplabcut/pose_estimation_tensorflow/predict_videos.py b/deeplabcut/pose_estimation_tensorflow/predict_videos.py
+index c56fa59..a90c6de 100644
+--- a/deeplabcut/pose_estimation_tensorflow/predict_videos.py
++++ b/deeplabcut/pose_estimation_tensorflow/predict_videos.py
+@@ -89,7 +89,7 @@ def create_tracking_dataset(
+     if gputouse is not None:  # gpu selection
+         auxfun_models.set_visible_devices(gputouse)
+ 
+-    tf.compat.v1.reset_default_graph()
++    tf.keras.backend.clear_session()
+     start_path = Path.cwd()  # record cwd to return to this directory in the end
+ 
+     cfg = auxiliaryfunctions.read_config(config)
+@@ -429,7 +429,7 @@ def analyze_videos(
+     if gputouse is not None:  # gpu selection
+         auxfun_models.set_visible_devices(gputouse)
+ 
+-    tf.compat.v1.reset_default_graph()
++    tf.keras.backend.clear_session()
+     start_path = Path.cwd()  # record cwd to return to this directory in the end
+ 
+     cfg = auxiliaryfunctions.read_config(config)
+@@ -638,7 +638,7 @@ def _release_inference_session(sess, use_openvino=None):
+     if use_openvino:
+         return
+     sess.close()
+-    tf.compat.v1.reset_default_graph()
++    tf.keras.backend.clear_session()
+ 
+ 
+ def checkcropping(cfg, cap):
+@@ -792,10 +792,14 @@ def GetPoseF_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, batchsize):
+     if cfg["cropping"]:
+         ny, nx = checkcropping(cfg, cap)
+ 
+-    # Flip x, y, confidence and reshape
++    # Flip x, y, confidence and reshape.  This used to append tf.gather and
++    # tf.reshape to the inference graph; doing it in numpy on the way out gives
++    # the same numbers and leaves the pose net as the only thing in this file
++    # that builds TensorFlow ops.
+     pose_tensor = predict.extract_GPUprediction(outputs, dlc_cfg)
+-    pose_tensor = tf.gather(pose_tensor, [1, 0, 2], axis=1)
+-    pose_tensor = tf.reshape(pose_tensor, (batchsize, -1))
++
++    def _flip_and_reshape(pose):
++        return pose[:, [1, 0, 2]].reshape(batchsize, -1)
+ 
+     frames = np.empty((batchsize, ny, nx, 3), dtype="ubyte")
+     pbar = tqdm(total=nframes)
+@@ -815,7 +819,7 @@ def GetPoseF_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, batchsize):
+         frames[batch_ind] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+         inds.append(counter)
+         if batch_ind == batchsize - 1:
+-            pose = sess.run(pose_tensor, feed_dict={inputs: frames})
++            pose = _flip_and_reshape(sess.run(pose_tensor, feed_dict={inputs: frames}))
+             PredictedData[inds] = pose
+             batch_ind = 0
+             batch_num += 1
+@@ -825,7 +829,7 @@ def GetPoseF_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, batchsize):
+             batch_ind += 1
+ 
+     if batch_ind > 0:
+-        pose = sess.run(pose_tensor, feed_dict={inputs: frames})
++        pose = _flip_and_reshape(sess.run(pose_tensor, feed_dict={inputs: frames}))
+         PredictedData[inds[:batch_ind]] = pose[:batch_ind]
+         pbar.update(batch_ind)
+ 
+@@ -1179,7 +1183,7 @@ def analyze_time_lapse_frames(
+     if gputouse is not None:  # gpu selection
+         auxfun_models.set_visible_devices(gputouse)
+ 
+-    tf.compat.v1.reset_default_graph()
++    tf.keras.backend.clear_session()
+     start_path = Path.cwd()  # record cwd to return to this directory in the end
+ 
+     cfg = auxiliaryfunctions.read_config(config)
