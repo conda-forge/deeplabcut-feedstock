@@ -15,7 +15,7 @@ source:
     - patches/0002-Replace-NumPy-2.0-removed-array-APIs-with-supported-.patch
     # https://github.com/DeepLabCut/DeepLabCut/commit/252183c22d35fbf5577bc5e9aa4ebf81ab06e340
     - patches/0003-Estimate-tracklet-rank-with-a-dense-SVD-instead-of-i.patch
-    # https://github.com/DeepLabCut/DeepLabCut/commit/aafaa2e77a1f6f1a4c0d6ad3d4d9ba0e5e1a0a2d
+    # https://github.com/DeepLabCut/DeepLabCut/commit/aafaa2e7df392234f53d18422b21b8a2f7e2c13f
     - patches/0004-Guard-CoW-read-only-.to_numpy-.values-mutations-3362.patch
     # https://github.com/DeepLabCut/DeepLabCut/commit/18bc897c
     - patches/0005-Guard-remaining-CoW-read-only-.to_numpy-.values-mutat.patch
@@ -39,6 +39,9 @@ source:
     - patches/0022-Drop-the-eager-engine-s-config-copy-workaround.patch
     - patches/0023-Replace-nnets-base.py-s-tf.compat.v1-losses-and-stop.patch
     - patches/0024-Port-the-MobileNet-backbone-to-eager-TensorFlow-2-Ke.patch
+    - patches/0025-Dispatch-multi-animal-TensorFlow-training-on-the-pos.patch
+    - patches/0026-Set-training-logging-up-before-the-config-is-read.patch
+    - patches/0027-Restore-EfficientNet-ImageNet-weights-in-the-eager-t.patch
 
 build:
   number: 0

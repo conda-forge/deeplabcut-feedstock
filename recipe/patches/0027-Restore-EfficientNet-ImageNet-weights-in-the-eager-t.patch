@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Fri, 5 Sep 2026 14:00:00 -0400
+Subject: [PATCH] Restore EfficientNet ImageNet weights in the eager trainer
+
+The published cloud-tpu-checkpoints EfficientNet weights carry neither the
+efficientnet/ scope nor the raw variables, only their
+/ExponentialMovingAverage shadow copies.  core/legacy_tf1.py builds that
+mapping by hand and core/train_multianimal.py passes
+nnets.efficientnet.imagenet_ckpt_name as `rename`, but core/train.py's
+_restore() passed no rename at all, and load_tf1_checkpoint defaults to
+allow_missing=False.  So the eager single-animal trainer could not start from
+ImageNet weights on any efficientnet-b* backbone:
+
+    ValueError: .../models/pretrained/efficientnet-b0/model.ckpt does not
+    match this model: 304 weights missing (e.g.
+    ['efficientnet/efficientnet-b0/blocks_0/conv2d/kernel', ...]),
+    0 shape mismatches
+
+nnets.efficientnet.load_imagenet_checkpoint, the wrapper written for exactly
+this, was dead code.  _restore_plan() now names the loader to use alongside
+the prefixes to include, and picks that wrapper for an ImageNet EfficientNet.
+Every other backbone, and every resume from a DeepLabCut snapshot, keeps
+load_tf1_checkpoint, so nothing else changes.
+
+Verified with 40 iterations of efficientnet-b0 on the bundled openfield
+project under DLC_TF_ENGINE=keras: the restore succeeds and the run reaches
+snapshot-40.
+---
+ .../pose_estimation_tensorflow/core/train.py  | 26 ++++++++++++-------
+ 1 file changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/train.py b/deeplabcut/pose_estimation_tensorflow/core/train.py
+index cd869bd..c36b171 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/train.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/train.py
+@@ -23,6 +23,7 @@ import tensorflow as tf
+ from deeplabcut.pose_estimation_tensorflow.config import load_config
+ from deeplabcut.pose_estimation_tensorflow.datasets import Batch, PoseDatasetFactory
+ from deeplabcut.pose_estimation_tensorflow.nnets import load_tf1_checkpoint
++from deeplabcut.pose_estimation_tensorflow.nnets.efficientnet import load_imagenet_checkpoint
+ from deeplabcut.pose_estimation_tensorflow.nnets.factory import (
+     KERAS_ENGINE,
+     PoseNetFactory,
+@@ -70,18 +71,24 @@ def get_batch_spec(cfg):
+ 
+ 
+ def _restore_plan(cfg, keepdeconvweights):
+-    """Which snapshot weights to load, and which iteration to resume from.
++    """Which snapshot weights to load, how, and which iteration to resume from.
+ 
+     The tf_slim trainer chose between ``get_variables_to_restore()`` for a
+     DeepLabCut snapshot and ``get_variables_to_restore(include=[<backbone>])``
+     for an ImageNet checkpoint; ``include_prefixes`` is the same restriction
+     expressed against the tf_slim names the Keras nets publish.
++
++    The published EfficientNet weights carry neither the ``efficientnet/``
++    scope nor the raw variables, only their ``/ExponentialMovingAverage``
++    shadows, so they need the rename ``load_imagenet_checkpoint`` applies --
++    the tf_slim trainer built the same mapping by hand, and
++    ``core/train_multianimal.py`` passes the same ``rename``.
+     """
+     net_type = cfg["net_type"]
+     stem = Path(cfg["init_weights"]).stem
+     if "snapshot" in stem and keepdeconvweights:
+         print("Loading already trained DLC with backbone:", net_type)
+-        return None, int(stem.split("-")[1])
++        return None, load_tf1_checkpoint, int(stem.split("-")[1])
+ 
+     print("Loading ImageNet-pretrained", net_type)
+     for key, prefix in (
+@@ -90,21 +97,22 @@ def _restore_plan(cfg, keepdeconvweights):
+         ("efficientnet", "efficientnet"),
+     ):
+         if key in net_type:
+-            return [prefix], 0
++            load = load_imagenet_checkpoint if key == "efficientnet" else load_tf1_checkpoint
++            return [prefix], load, 0
+     print("Wait for DLC 2.3.")
+-    return None, 0
++    return None, load_tf1_checkpoint, 0
+ 
+ 
+-def _restore(net, cfg, include):
++def _restore(net, cfg, include, load=load_tf1_checkpoint):
+     """Restore ``cfg["init_weights"]``, redownloading it if it has gone missing.
+ 
+     ``auxfun_models.smart_restore`` does the same for the tf_slim trainer.
+     """
+     try:
+-        return load_tf1_checkpoint(net, cfg["init_weights"], include_prefixes=include)
++        return load(net, cfg["init_weights"], include_prefixes=include)
+     except (ValueError, tf.errors.NotFoundError):
+         auxfun_models.check_for_weights(cfg["net_type"], auxiliaryfunctions.get_deeplabcut_path())
+-        return load_tf1_checkpoint(net, cfg["init_weights"], include_prefixes=include)
++        return load(net, cfg["init_weights"], include_prefixes=include)
+ 
+ 
+ def _iteration_counts(cfg, maxiters, displayiters, saveiters):
+@@ -151,13 +159,13 @@ def _train_eager(
+     configure_gpu_memory_growth(allow_growth)
+ 
+     net = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
+-    include, start_iter = _restore_plan(cfg, keepdeconvweights)
++    include, load, start_iter = _restore_plan(cfg, keepdeconvweights)
+ 
+     batches = iter(make_dataset(dataset, get_batch_spec(cfg)))
+     batch = next(batches)
+     # one forward pass, because Keras creates the weights lazily
+     net.get_net(batch["inputs"], is_training=True)
+-    _restore(net, cfg, include)
++    _restore(net, cfg, include, load)
+ 
+     if cfg.get("freezeencoder", False):
+         if "efficientnet" in cfg["net_type"]:

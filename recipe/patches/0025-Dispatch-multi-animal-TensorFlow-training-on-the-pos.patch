@@ -1,0 +1,451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Fri, 5 Sep 2026 14:00:00 -0400
+Subject: [PATCH] Dispatch multi-animal TensorFlow training on the pose engine
+
+core/train_multianimal.py was the only TensorFlow entry point that never
+consulted nnets.factory.resolve_engine.  It built the Keras net
+unconditionally, with PoseNetFactory.create(cfg, engine=KERAS_ENGINE), and
+called ensure_eager_execution(), so neither `tf_engine: tf1` in pose_cfg.yaml
+nor DLC_TF_ENGINE=tf1 could reach the graph-mode loop -- and
+0018-Port-the-multi-animal-training-loop-to-eager-Tensor.patch had deleted
+that loop, leaving core/legacy_tf1.py with only the single-animal train().
+tf1 being the default engine therefore protected nobody with a multi-animal
+project.
+
+Any process that evaluated or analysed before it (re)trained died at the next
+train_network with
+
+    RuntimeError: The Keras pose nets need eager execution, but this process
+    has already built a TF1 graph.
+
+because prediction had entered graph mode first and TF1 ops already existed.
+That is the order the GUI works in and the order SpatiotemporalAdaptation's
+own docstring prescribes; examples/testscript_tensorflow_multi_animal.py does
+it too and stopped at its second train_network call.
+
+The DeepLabCut 3.0.1 multi-animal loop moves into core/legacy_tf1.py, beside
+the single-animal one already there, unchanged apart from its prologue.
+train() becomes the dispatcher core/train.py already is: it chdirs, sets
+logging up, reads and adjusts the config once, and hands the result to
+whichever loop resolve_engine picks.  The eager loop keeps every line it had
+and is still reached with `tf_engine: keras` or DLC_TF_ENGINE=keras.
+
+Reading the config in the caller also keeps setup_logging() ahead of the
+first logging call for both loops -- config.cfg_from_file() logs -- and the
+return to the original directory now happens in a finally.
+
+examples/testscript_tensorflow_multi_animal.py, NET pinned to dlcrnet_ms5,
+reaches "ALL DONE!!! - default multianimal cases are functional." again, both
+with the default engine and with DLC_TF_ENGINE=keras.
+---
+ .../core/legacy_tf1.py                        | 192 ++++++++++++++++++
+ .../core/train_multianimal.py                 | 140 +++++++++----
+ 2 files changed, 290 insertions(+), 42 deletions(-)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/legacy_tf1.py b/deeplabcut/pose_estimation_tensorflow/core/legacy_tf1.py
+index 53d91f2..ac2a84b 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/legacy_tf1.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/legacy_tf1.py
+@@ -20,6 +20,12 @@ here unchanged; those four files now contain none.  The file is reached only
+ when the tf1 engine is selected (see ``nnets.factory.resolve_engine``),
+ and it is meant to be deleted, whole, once they are the only implementation.
+ 
++Both training loops live here: ``train`` for single-animal projects and
++``train_multianimal`` for multi-animal ones.  Their callers,
++``core/train.py`` and ``core/train_multianimal.py``, own the prologue (the
++chdir, ``setup_logging`` and the config) and hand the loaded ``cfg`` down, so
++neither loop reads the configuration a second time.
++
+ Nothing in here is new code -- it is the DeepLabCut 3.0.1 implementation,
+ moved.
+ """
+@@ -36,6 +42,9 @@ import tf_slim as slim
+ from deeplabcut.pose_estimation_tensorflow.config import load_config
+ from deeplabcut.pose_estimation_tensorflow.datasets import PoseDatasetFactory
+ from deeplabcut.pose_estimation_tensorflow.nnets.factory import TF1_ENGINE, PoseNetFactory
++from deeplabcut.pose_estimation_tensorflow.nnets.utils import (
++    get_batch_spec as get_multianimal_batch_spec,
++)
+ from deeplabcut.pose_estimation_tensorflow.util.logging import setup_logging
+ from deeplabcut.utils import auxfun_models
+ 
+@@ -395,3 +404,186 @@ def train(
+     coord.join([thread])
+     # return to original path.
+     os.chdir(str(start_path))
++
++
++def train_multianimal(
++    config_yaml,
++    cfg,
++    displayiters,
++    saveiters,
++    maxiters,
++    max_to_keep=5,
++    keepdeconvweights=True,
++    allow_growth=True,
++    remove_head=False,
++):
++    """The multi-animal training loop, in graph mode.
++
++    ``cfg`` is the configuration ``core/train_multianimal.train`` has already
++    loaded and adjusted; ``config_yaml`` is only used to place
++    ``learning_stats.csv`` next to it, and is a dictionary when the caller
++    trains without a project.
++    """
++    ensure_graph_mode()
++    # in case there was already a graph
++    tf.compat.v1.reset_default_graph()
++
++    net_type = cfg["net_type"]
++    dataset = PoseDatasetFactory.create(cfg)
++
++    batch_spec = get_multianimal_batch_spec(cfg)
++    batch, enqueue_op, placeholders = setup_preloading(batch_spec)
++
++    losses = PoseNetFactory.create(cfg, engine=TF1_ENGINE).train(batch)
++    total_loss = losses["total_loss"]
++
++    for k, t in losses.items():
++        tf.compat.v1.summary.scalar(k, t)
++    merged_summaries = tf.compat.v1.summary.merge_all()
++
++    stem = Path(cfg["init_weights"]).stem
++    if "snapshot" in stem and keepdeconvweights:
++        print("Loading already trained DLC with backbone:", net_type)
++        variables_to_restore = slim.get_variables_to_restore()
++        if cfg.get("resume_weights_only", False):
++            start_iter = 0
++        else:
++            start_iter = int(stem.split("-")[1])
++
++        if remove_head:
++            # removing the decoding layer from the checkpoint
++            temp = []
++            for variable in variables_to_restore:
++                if "pose" not in variable.name:
++                    temp.append(variable)
++            variables_to_restore = temp
++
++    else:
++        print("Loading ImageNet-pretrained", net_type)
++        # loading backbone from ResNet, MobileNet etc.
++        if "resnet" in net_type:
++            variables_to_restore = slim.get_variables_to_restore(include=["resnet_v1"])
++        elif "mobilenet" in net_type:
++            variables_to_restore = slim.get_variables_to_restore(include=["MobilenetV2"])
++        elif "efficientnet" in net_type:
++            variables_to_restore = slim.get_variables_to_restore(include=["efficientnet"])
++            variables_to_restore = {
++                var.op.name.replace("efficientnet/", "") + "/ExponentialMovingAverage": var
++                for var in variables_to_restore
++            }
++        else:
++            print("Wait for DLC 2.3.")
++        start_iter = 0
++
++    restorer = tf.compat.v1.train.Saver(variables_to_restore)
++    saver = tf.compat.v1.train.Saver(
++        max_to_keep=max_to_keep
++    )  # selects how many snapshots are stored, see https://github.com/DeepLabCut/DeepLabCut/issues/8#issuecomment-387404835
++
++    if allow_growth:
++        config = tf.compat.v1.ConfigProto()
++        config.gpu_options.allow_growth = True
++        sess = tf.compat.v1.Session(config=config)
++    else:
++        sess = tf.compat.v1.Session()
++
++    coord, thread = start_preloading(sess, enqueue_op, dataset, placeholders)
++    train_writer = tf.compat.v1.summary.FileWriter(cfg["log_dir"], sess.graph)
++    learning_rate, train_op, tstep = get_optimizer(total_loss, cfg)
++
++    sess.run(tf.compat.v1.global_variables_initializer())
++    sess.run(tf.compat.v1.local_variables_initializer())
++
++    auxfun_models.smart_restore(restorer, sess, cfg["init_weights"], net_type)
++
++    if maxiters is None:
++        max_iter = int(cfg["multi_step"][-1][1])
++    else:
++        max_iter = min(int(cfg["multi_step"][-1][1]), int(maxiters))
++        # display_iters = max(1,int(displayiters))
++        print("Max_iters overwritten as", max_iter)
++
++    if displayiters is None:
++        display_iters = max(1, int(cfg["display_iters"]))
++    else:
++        display_iters = max(1, int(displayiters))
++        print("Display_iters overwritten as", display_iters)
++
++    if saveiters is None:
++        save_iters = max(1, int(cfg["save_iters"]))
++
++    else:
++        save_iters = max(1, int(saveiters))
++        print("Save_iters overwritten as", save_iters)
++
++    cumloss, partloss, locrefloss, pwloss = 0.0, 0.0, 0.0, 0.0
++    lr_gen = LearningRate(cfg)
++    lrf = None
++    if not isinstance(config_yaml, dict):
++        stats_path = Path(config_yaml).with_name("learning_stats.csv")
++        lrf = stats_path.open("w")
++
++    print("Training parameters:")
++    print(cfg)
++    print("Starting multi-animal training....")
++    max_iter += start_iter  # max_iter is relative to start_iter
++    for it in range(start_iter, max_iter + 1):
++        if "efficientnet" in net_type:
++            lr_dict = {tstep: it - start_iter}
++            current_lr = sess.run(learning_rate, feed_dict=lr_dict)
++        else:
++            current_lr = lr_gen.get_lr(it - start_iter)
++            lr_dict = {learning_rate: current_lr}
++
++        # [_, loss_val, summary] = sess.run([train_op, total_loss, merged_summaries],feed_dict={learning_rate:
++        # current_lr})
++        [_, alllosses, loss_val, summary] = sess.run(
++            [train_op, losses, total_loss, merged_summaries], feed_dict=lr_dict
++        )
++
++        partloss += alllosses["part_loss"]  # scoremap loss
++        if cfg["location_refinement"]:
++            locrefloss += alllosses["locref_loss"]
++        if cfg["pairwise_predict"]:  # paf loss
++            pwloss += alllosses["pairwise_loss"]
++
++        cumloss += loss_val
++        train_writer.add_summary(summary, it)
++        if it % display_iters == 0 and it > start_iter:
++            logging.info(
++                "iteration: {} loss: {} scmap loss: {} locref loss: {} limb loss: {} lr: {}".format(
++                    it,
++                    f"{cumloss / display_iters:.4f}",
++                    f"{partloss / display_iters:.4f}",
++                    f"{locrefloss / display_iters:.4f}",
++                    f"{pwloss / display_iters:.4f}",
++                    current_lr,
++                )
++            )
++
++            if lrf:
++                lrf.write(
++                    "iteration: {}, loss: {}, scmap loss: {}, locref loss: {}, limb loss: {}, lr: {}\n".format(
++                        it,
++                        f"{cumloss / display_iters:.4f}",
++                        f"{partloss / display_iters:.4f}",
++                        f"{locrefloss / display_iters:.4f}",
++                        f"{pwloss / display_iters:.4f}",
++                        current_lr,
++                    )
++                )
++
++            cumloss, partloss, locrefloss, pwloss = 0.0, 0.0, 0.0, 0.0
++            if lrf:
++                lrf.flush()
++
++        # Save snapshot
++        if (it % save_iters == 0 and it != start_iter) or it == max_iter:
++            model_name = cfg["snapshot_prefix"]
++            saver.save(sess, model_name, global_step=it)
++    if lrf:
++        lrf.close()
++
++    sess.close()
++    coord.request_stop()
++    coord.join([thread])
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py b/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py
+index 44981b1..0c13b44 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py
+@@ -31,12 +31,15 @@ from deeplabcut.pose_estimation_tensorflow.nnets import (
+     PoseNetFactory,
+     ensure_eager_execution,
+     load_tf1_checkpoint,
++    resolve_engine,
+ )
+ from deeplabcut.pose_estimation_tensorflow.nnets.efficientnet import imagenet_ckpt_name
+ from deeplabcut.pose_estimation_tensorflow.nnets.utils import get_batch_spec
+ from deeplabcut.pose_estimation_tensorflow.util.logging import setup_logging
+ from deeplabcut.utils import auxfun_models, auxiliaryfunctions
+ 
++from . import legacy_tf1
++
+ BACKBONE_SCOPES = {
+     "resnet": "resnet_v1",
+     "mobilenet": "MobilenetV2",
+@@ -91,54 +94,115 @@ def train(
+     superanimal=None,
+     remove_head=False,
+ ):
+-    ensure_eager_execution()
+-    # in case there was already a model
+-    tf.keras.backend.clear_session()
+-    configure_gpu_memory_growth(allow_growth)
+-
++    """Train a multi-animal network with the engine ``cfg`` asks for.
++
++    ``core/train.py`` dispatches the single-animal loops the same way: the
++    graph-mode ``tf_slim`` implementation is the default and lives in
++    ``core/legacy_tf1.py``, the eager one is reached with ``tf_engine: keras``
++    in ``pose_cfg.yaml`` or ``DLC_TF_ENGINE=keras``.  Everything both loops
++    need from the configuration is read here, once, so that neither of them
++    loads it before ``setup_logging`` has run.
++    """
+     start_path = Path.cwd()
+     if modelfolder == "":
+         os.chdir(str(Path(config_yaml).parents[0]))  # switch to folder of config_yaml (for logging)
+     else:
+         os.chdir(modelfolder)
+ 
+-    setup_logging()
++    try:
++        setup_logging()
++
++        if isinstance(config_yaml, dict):
++            cfg = config_yaml
++        else:
++            cfg = load_config(config_yaml)
++
++        cfg["pseudo_threshold"] = pseudo_threshold
++        cfg["video_path"] = video_path
++        cfg["traintime_resize"] = traintime_resize
+ 
+-    if isinstance(config_yaml, dict):
+-        cfg = config_yaml
+-    else:
+-        cfg = load_config(config_yaml)
++        if superanimal is not None:
++            cfg["superanimal"] = superanimal
+ 
+-    cfg["pseudo_threshold"] = pseudo_threshold
+-    cfg["video_path"] = video_path
+-    cfg["traintime_resize"] = traintime_resize
++        if pseudo_labels != "":
++            cfg["pseudo_label"] = pseudo_labels
+ 
+-    if superanimal is not None:
+-        cfg["superanimal"] = superanimal
++        if modelfolder != "":
++            cfg["log_dir"] = modelfolder
++            cfg["project_path"] = modelfolder
++            # have to overwrite this
++            cfg["snapshot_prefix"] = "snapshot"
+ 
+-    if pseudo_labels != "":
+-        cfg["pseudo_label"] = pseudo_labels
++        if init_weights != "":
++            cfg["init_weights"] = init_weights
++            cfg["resume_weights_only"] = True
++            print("replacing default init weights with: ", init_weights)
+ 
+-    if modelfolder != "":
+-        cfg["log_dir"] = modelfolder
+-        cfg["project_path"] = modelfolder
+-        # have to overwrite this
+-        cfg["snapshot_prefix"] = "snapshot"
++        if cfg["optimizer"] != "adam":
++            print(
++                "Setting batchsize to 1! Larger batchsize not supported for this loader:",
++                cfg["dataset_type"],
++            )
++            cfg["batch_size"] = 1
++
++        if (
++            cfg["partaffinityfield_predict"] and "multi-animal" in cfg["dataset_type"]
++            # the PAF code currently just hijacks the pairwise net stuff (for the batch feeding via
++            # Batch.pairwise_targets: 5)
++        ):
++            print("Activating limb prediction...")
++            cfg["pairwise_predict"] = True
++
++        if resolve_engine(cfg) != KERAS_ENGINE:
++            return legacy_tf1.train_multianimal(
++                config_yaml,
++                cfg,
++                displayiters,
++                saveiters,
++                maxiters,
++                max_to_keep=max_to_keep,
++                keepdeconvweights=keepdeconvweights,
++                allow_growth=allow_growth,
++                remove_head=remove_head,
++            )
+ 
+-    if cfg["optimizer"] != "adam":
+-        print(
+-            "Setting batchsize to 1! Larger batchsize not supported for this loader:",
+-            cfg["dataset_type"],
++        return _train_eager(
++            config_yaml,
++            cfg,
++            displayiters,
++            saveiters,
++            maxiters,
++            max_to_keep=max_to_keep,
++            keepdeconvweights=keepdeconvweights,
++            allow_growth=allow_growth,
++            remove_head=remove_head,
+         )
+-        cfg["batch_size"] = 1
++    finally:
++        # return to original path.
++        os.chdir(str(start_path))
++
++
++def _train_eager(
++    config_yaml,
++    cfg,
++    displayiters,
++    saveiters,
++    maxiters,
++    max_to_keep=5,
++    keepdeconvweights=True,
++    allow_growth=True,
++    remove_head=False,
++):
++    """The multi-animal training loop, in eager mode.
+ 
+-    if (
+-        cfg["partaffinityfield_predict"] and "multi-animal" in cfg["dataset_type"]
+-        # the PAF code currently just hijacks the pairwise net stuff (for the batch feeding via Batch.pairwise_targets:
+-        # 5)
+-    ):
+-        print("Activating limb prediction...")
+-        cfg["pairwise_predict"] = True
++    ``cfg`` is the configuration :func:`train` has already loaded and
++    adjusted; ``config_yaml`` is only used to place ``learning_stats.csv``
++    next to it, and is a dictionary when the caller trains without a project.
++    """
++    ensure_eager_execution()
++    # in case there was already a model
++    tf.keras.backend.clear_session()
++    configure_gpu_memory_growth(allow_growth)
+ 
+     dataset = PoseDatasetFactory.create(cfg)
+ 
+@@ -148,11 +212,6 @@ def train(
+     net = build_net(cfg)
+     net_type = cfg["net_type"]
+ 
+-    if init_weights != "":
+-        cfg["init_weights"] = init_weights
+-        cfg["resume_weights_only"] = True
+-        print("replacing default init weights with: ", init_weights)
+-
+     rename = None
+     stem = Path(cfg["init_weights"]).stem
+     if "snapshot" in stem and keepdeconvweights:
+@@ -285,9 +344,6 @@ def train(
+ 
+     train_writer.close()
+ 
+-    # return to original path.
+-    os.chdir(str(start_path))
+-
+ 
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()

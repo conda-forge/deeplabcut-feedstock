@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Fri, 5 Sep 2026 14:00:00 -0400
+Subject: [PATCH] Set training logging up before the config is read
+
+0020-Remove-tf.compat.v1-from-the-pose-engine.patch put load_config() ahead of
+setup_logging() in core/train.py's train(), and a single-animal TensorFlow
+training has printed no progress and written no log.txt since:
+config.cfg_from_file() calls logging.info(), which runs logging.basicConfig()
+implicitly and installs a stderr handler on the root logger at level WARNING.
+The setup_logging() that follows calls basicConfig(filename="log.txt",
+level=INFO), and basicConfig does nothing at all once the root logger has a
+handler, so the file handler is never installed and the root level stays at
+WARNING.
+
+On the bundled openfield project, 40 iterations, resnet_50:
+
+                          stdout "iteration:" lines   log.txt
+    DeepLabCut 3.0.1                              8   2668 bytes
+    patches 0001-0024                             0   absent
+    with this patch                               8   2668 bytes
+
+learning_stats.csv was still written, so the loss was recoverable, but
+someone watching a multi-day run saw nothing and lost the training log.
+Multi-animal training was unaffected: it still called setup_logging() first.
+
+train() now chdirs and sets logging up before it reads the config, which is
+the order DeepLabCut 3.0.1 used, and passes the config it loaded on to
+legacy_tf1.train() instead of having it read the same file a second time.
+---
+ .../core/legacy_tf1.py                        | 16 ++++------
+ .../pose_estimation_tensorflow/core/train.py  | 30 +++++++++++--------
+ 2 files changed, 23 insertions(+), 23 deletions(-)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/legacy_tf1.py b/deeplabcut/pose_estimation_tensorflow/core/legacy_tf1.py
+index ac2a84b..b42dc4c 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/legacy_tf1.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/legacy_tf1.py
+@@ -31,7 +31,6 @@ moved.
+ """
+ 
+ import logging
+-import os
+ import threading
+ import warnings
+ from pathlib import Path
+@@ -39,13 +38,11 @@ from pathlib import Path
+ import tensorflow as tf
+ import tf_slim as slim
+ 
+-from deeplabcut.pose_estimation_tensorflow.config import load_config
+ from deeplabcut.pose_estimation_tensorflow.datasets import PoseDatasetFactory
+ from deeplabcut.pose_estimation_tensorflow.nnets.factory import TF1_ENGINE, PoseNetFactory
+ from deeplabcut.pose_estimation_tensorflow.nnets.utils import (
+     get_batch_spec as get_multianimal_batch_spec,
+ )
+-from deeplabcut.pose_estimation_tensorflow.util.logging import setup_logging
+ from deeplabcut.utils import auxfun_models
+ 
+ _GRAPH_MODE = False
+@@ -249,6 +246,7 @@ def get_optimizer_with_freeze(loss_op, cfg):
+ 
+ def train(
+     config_yaml,
++    cfg,
+     displayiters,
+     saveiters,
+     maxiters,
+@@ -256,12 +254,12 @@ def train(
+     keepdeconvweights=True,
+     allow_growth=True,
+ ):
+-    ensure_graph_mode()
+-    start_path = Path.cwd()
+-    os.chdir(str(Path(config_yaml).parents[0]))  # switch to folder of config_yaml (for logging)
+-    setup_logging()
++    """The single-animal training loop, in graph mode.
+ 
+-    cfg = load_config(config_yaml)
++    ``cfg`` is the configuration ``core/train.train`` has already loaded;
++    ``config_yaml`` is only used to place ``learning_stats.csv`` next to it.
++    """
++    ensure_graph_mode()
+     net_type = cfg["net_type"]
+     if cfg["dataset_type"] in ("scalecrop", "tensorpack", "deterministic"):
+         print(
+@@ -402,8 +400,6 @@ def train(
+     sess.close()
+     coord.request_stop()
+     coord.join([thread])
+-    # return to original path.
+-    os.chdir(str(start_path))
+ 
+ 
+ def train_multianimal(
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/train.py b/deeplabcut/pose_estimation_tensorflow/core/train.py
+index 7ad8dd5..cd869bd 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/train.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/train.py
+@@ -223,22 +223,26 @@ def train(
+     keepdeconvweights=True,
+     allow_growth=True,
+ ):
+-    cfg = load_config(config_yaml)
+-    if resolve_engine(cfg) != KERAS_ENGINE:
+-        return legacy_tf1.train(
+-            config_yaml,
+-            displayiters,
+-            saveiters,
+-            maxiters,
+-            max_to_keep=max_to_keep,
+-            keepdeconvweights=keepdeconvweights,
+-            allow_growth=allow_growth,
+-        )
+-
+     start_path = Path.cwd()
+     os.chdir(str(Path(config_yaml).parents[0]))  # switch to folder of config_yaml (for logging)
+-    setup_logging()
+     try:
++        # setup_logging() configures the root logger with logging.basicConfig,
++        # which does nothing at all once a handler exists, and load_config()
++        # logs the config it read: logging has to be set up first.
++        setup_logging()
++        cfg = load_config(config_yaml)
++        if resolve_engine(cfg) != KERAS_ENGINE:
++            return legacy_tf1.train(
++                config_yaml,
++                cfg,
++                displayiters,
++                saveiters,
++                maxiters,
++                max_to_keep=max_to_keep,
++                keepdeconvweights=keepdeconvweights,
++                allow_growth=allow_growth,
++            )
++
+         if cfg["dataset_type"] in ("scalecrop", "tensorpack", "deterministic"):
+             print(
+                 "Switching batchsize to 1, as tensorpack/scalecrop/deterministic loaders "
