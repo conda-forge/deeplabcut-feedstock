@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 08:15:05 -0400
+Subject: [PATCH] Derive the score map size the way the networks actually
+ upsample
+
+calc_target_and_scoremap_sizes computes the size of the training targets as
+
+    sm_size = ceil(target_size / (stride * smfactor)) * smfactor      smfactor = 2
+
+and then special-cases stride 2 to ceil(target_size / 16) * 8.  Every network
+in nnets/ downsamples to stride 16 and then upsamples back by 16 // stride --
+the multi_fusion decoder concatenates at s16 and the transposed convolutions
+double from there -- so what it emits is
+
+    ceil(target_size / 16) * (16 // stride)
+
+The two agree at stride 8 (both give 2 * ceil(t / 16)) and, thanks to the
+special case, at stride 2.  At stride 4 they do not.  Writing target_size as
+16q + r, the dataset produces 4q + 2 * ceil(r / 8) and the network produces
+4q + 4 * (r > 0), so they differ for every r in 1..8, which is half of all
+sizes.  Checked against the real network output for every even size from 160
+to 258:
+
+    stride 8   0 of 50 sizes disagree
+    stride 4  25 of 50 sizes disagree      e.g. 200 -> targets 50x50,
+                                           network 52x52
+    stride 2   0 of 50 sizes disagree
+
+and the formula above matched the network for 150 of 150 (size, stride) pairs.
+
+Consequence: a stride-4 model cannot train under the stock augmentation, which
+draws target_size from default_size * a jittered scale and so hits a bad size
+about half the time; the part_pred loss then gets a [b, 50, 50, J] target
+against a [b, 52, 52, J] prediction.  It only ever worked because the sizes
+that were tried happened to be multiples of 16 -- which is exactly what the
+existing test_calc_target_and_scoremap_sizes uses, 400 * 0.6, 0.8, 1.0 and
+1.2, all divisible by 16, so that test passes either way and keeps passing
+here.
+
+Replacing the whole thing with the single expression also folds in the stride-2
+special case, which was the same formula written out for one stride, and drops
+smfactor.  Nothing in DeepLabCut, and no pose_cfg.yaml it writes, ever sets
+smfactor; at stride 8 the default of 2 is the only value that agrees with the
+network anyway.
+
+Found while porting nnets/ to TensorFlow 2, by comparing the score map the
+ported nets emit against what the dataset asks for.
+---
+ .../datasets/pose_multianimal_imgaug.py       | 12 ++++++------
+ tests/test_pose_multianimal_imgaug.py         | 19 +++++++++++++++++++
+ 2 files changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/datasets/pose_multianimal_imgaug.py b/deeplabcut/pose_estimation_tensorflow/datasets/pose_multianimal_imgaug.py
+index 312188b1..dd18587e 100644
+--- a/deeplabcut/pose_estimation_tensorflow/datasets/pose_multianimal_imgaug.py
++++ b/deeplabcut/pose_estimation_tensorflow/datasets/pose_multianimal_imgaug.py
+@@ -435,12 +435,12 @@ class MAImgaugPoseDataset(BasePoseDataset):
+         if not self.is_valid_size(target_size):
+             target_size = self.default_size
+         stride = self.cfg["stride"]
+-        sm_size = np.ceil(target_size / (stride * self.cfg.get("smfactor", 2))).astype(int) * self.cfg.get(
+-            "smfactor", 2
+-        )
+-        if stride == 2:
+-            sm_size = np.ceil(target_size / 16).astype(int)
+-            sm_size *= 8
++        # Every net in nnets/ downsamples to 16 and then upsamples back by
++        # 16 // stride, so the score map it emits is
++        # ceil(target_size / 16) * (16 // stride).  Deriving the target size the
++        # same way keeps the targets and the prediction the same shape for
++        # every input size, not just the multiples of 16.
++        sm_size = np.ceil(target_size / 16).astype(int) * (16 // int(stride))
+         return target_size, sm_size
+ 
+     def next_batch(self, plotting=False):
+diff --git a/tests/test_pose_multianimal_imgaug.py b/tests/test_pose_multianimal_imgaug.py
+index bc4c4f88..324c0ade 100644
+--- a/tests/test_pose_multianimal_imgaug.py
++++ b/tests/test_pose_multianimal_imgaug.py
+@@ -78,6 +78,25 @@ def test_calc_target_and_scoremap_sizes(
+     np.testing.assert_equal(target_size / stride, sm_size)
+ 
+ 
++@pytest.mark.parametrize("stride", [2, 4, 8])
++@pytest.mark.parametrize("size", [160, 170, 194, 200, 208, 226, 240])
++def test_scoremap_size_is_what_the_network_emits(ma_dataset, stride, size):
++    """Every net in ``nnets/`` downsamples to 16 and upsamples by ``16 // stride``.
++
++    The score map size therefore has to be ``ceil(size / 16) * (16 // stride)``,
++    which only equals ``size / stride`` when ``size`` is a multiple of 16.  At
++    stride 4 that used to disagree with the network for half of all sizes.
++    """
++    ma_dataset.cfg["stride"] = stride
++    ma_dataset.cfg["global_scale"] = 1
++    ma_dataset.cfg["scale_jitter_lo"] = 1
++    ma_dataset.cfg["scale_jitter_up"] = 1
++    ma_dataset.default_size = np.array([size, size])
++    _, sm_size = ma_dataset.calc_target_and_scoremap_sizes()
++    expected = np.ceil(np.array([size, size]) / 16).astype(int) * (16 // stride)
++    np.testing.assert_equal(sm_size, expected)
++
++
+ def test_get_batch(ma_dataset):
+     for batch_size in 1, 4, 8, 16:
+         ma_dataset.batch_size = batch_size

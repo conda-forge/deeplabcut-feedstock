@@ -29,6 +29,9 @@ source:
     - patches/0012-Release-the-TensorFlow-session-when-video-analysis-f.patch
     - patches/0013-Use-batch-norm-moving-averages-at-inference-in-the-M.patch
     - patches/0014-Make-MobileNet-inference-independent-of-batch-compos.patch
+    - patches/0015-Port-the-ResNet-and-MuNet-pose-nets-to-eager-TensorF.patch
+    - patches/0016-Derive-the-score-map-size-the-way-the-networks-actua.patch
+    - patches/0017-Remove-tf.compat.v1-from-the-TensorFlow-entry-points.patch
 
 build:
   number: 0
