@@ -28,6 +28,7 @@ source:
     - patches/0011-Fix-Path-str-confusion-left-over-from-the-pathlib-mi.patch
     - patches/0012-Release-the-TensorFlow-session-when-video-analysis-f.patch
     - patches/0013-Use-batch-norm-moving-averages-at-inference-in-the-M.patch
+    - patches/0014-Make-MobileNet-inference-independent-of-batch-compos.patch
 
 build:
   number: 0

@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Fri, 4 Sep 2026 22:35:00 -0400
+Subject: [PATCH] Make MobileNet inference independent of batch composition
+
+PoseMobileNet.extract_features calls mobilenet_v2.training_scope() with no
+arguments.  That helper defaults to is_training=True, so every graph
+DeepLabCut builds -- including the inference graphs built by
+BasePoseNet.test() and BasePoseNet.inference() -- normalises with the
+statistics of whatever images happen to share the batch.  Dumping the
+graph confirms it: for all four stock net_types (mobilenet_v2_1.0, 0.75,
+0.5 and 0.35) and for all three entry points (train / test / inference)
+all 52 MobilenetV2 FusedBatchNormV3 nodes carry is_training=True, and the
+inference graphs register 104 dangling moving-average update ops in
+tf.GraphKeys.UPDATE_OPS that nothing ever runs.  The other two backbones
+do not have this defect: resnet_50 builds 53 nodes and efficientnet-b0
+builds 48, all with is_training=False, in all three graphs.
+
+Unlike the MuNet decoder of the previous patch, this path is reached by a
+stock project: net_type=mobilenet_v2_* is a documented option and needs no
+hand-edited pose_cfg.yaml.
+
+Measured on a mobilenet_v2_1.0 model trained for 10000 iterations on the
+bundled openfield example (real ImageNet weights, DLC defaults, so
+batch_size 1 and the imgaug augmenter), the prediction for a frame depends
+on the rest of its batch:
+
+    16-frame clip, deeplabcut.analyze_videos, snapshot-10000
+      batchsize 1 vs batchsize 8   mean 0.576 px, p95 1.371 px, max 3.432 px
+      batchsize 1 vs batchsize 4   mean 0.567 px, p95 1.481 px, max 5.054 px
+
+    same probe frame, batch size 4, only the three companions change
+      three other frames of the same video      up to 1.13 px
+      three copies of the probe frame itself    up to 1.53 px
+      three black frames                        up to 6.55 px
+      three white frames                        up to 6.77 px
+
+Because evaluate_network forces batch_size = 1 while analyze_videos uses
+the project's batch_size (8 by default), the reported evaluation error and
+the keypoints written out for a video were not produced by the same
+normalisation.  On this model the whole-dataset error is 3.48 px train /
+4.72 px test at batch size 1 and 3.64 px / 4.62 px at batch size 8.
+
+Fix: build the backbone one image at a time whenever the inference graph
+has a static batch size larger than one, and concatenate the results.
+Each image is then normalised by its own statistics, exactly as it would
+be at batch size 1.
+
+This deliberately does NOT switch inference to the moving averages, which
+is what the equivalent MuNet fix does and what the arg_scope was
+presumably meant to do.  That was tried first and it is badly wrong here:
+the same snapshot evaluated with the stored moving averages gives 11.85 px
+train / 12.79 px test, a 2.7x regression, because DeepLabCut trains this
+backbone at batch_size 1 -- batch-norm in training mode is then instance
+normalisation, and the accumulated averages describe the heavily augmented
+training stream (global_scale 0.8, scale jitter 0.5-1.25, crops, CLAHE,
+motion blur, covering, elastic transform) rather than the images inference
+actually sees.  Freezing the backbone at the ImageNet statistics instead,
+the way resnet.py and efficientnet.py do, is no better: retraining for
+10000 iterations that way gives 9.68 px / 12.68 px.  For the record the
+population statistics can be made usable, but only by recomputing them:
+re-accumulating the 52 moving_mean/moving_variance pairs over the 110
+unaugmented training images at inference resolution and then normalising
+with them gives 3.75 px / 4.71 px and is likewise batch-independent.  That
+is a change for upstream to make at the end of train(), not something a
+packaging patch can do to snapshots users already have.
+
+This does NOT change results for existing trained models.  At batch size 1
+the graph is untouched and the predictions are bit-identical (0.00000 px
+over every frame of every comparison).  At batch size 4 and 8 the
+predictions now equal the batch-size-1 predictions exactly, so accuracy
+moves to the batch-size-1 figure: over snapshots 9000, 9500 and 10000 the
+RMSE against the labelled frames is 3.994 / 3.753 / 4.122 px both before
+(at batch size 1) and after, against 4.179 / 4.034 / 4.316 px for the
+unpatched batch-size-8 path.  Every batch-composition comparison above
+becomes 0.00000 px; end to end through deeplabcut.analyze_videos the
+batchsize-1 and batchsize-8 outputs agree to 2e-5 px, which is float
+scheduling noise rather than batch dependence, and evaluate_network still
+reports 3.48 px / 4.72 px.  The variable set of the inference graph is unchanged
+(264 variables, identical names and shapes), so existing snapshots restore
+as before, and the training graph is untouched -- still 52 is_training=True
+nodes and 104 UPDATE_OPS, which slim.learning.create_train_op does wire in
+as control dependencies of the loss (all 104 are reachable from the train
+op, and the statistics really do move: mean |moving_mean| 0.493 -> 0.555
+and mean moving_variance 3.180 -> 9.464 between the ImageNet checkpoint
+and iteration 10000).
+
+Cost: none at run time on CPU (721 ms vs 730 ms per batch of 8 for a
+480x640 frame), because the per-image branches are independent and TF
+schedules them in parallel; the backbone subgraph is built once per image
+in the batch, so building the inference graph goes from 3.5 s to 25.7 s at
+batch size 8.  Graph construction happens once per analyze_videos call.
+
+Not covered: export_model sets batch_size to None, so an exported graph
+keeps a dynamic batch dimension and takes the unmodified path.  Used one
+frame at a time -- which is how DeepLabCut-Live drives it -- that is
+already per-image normalisation; a consumer that batches an exported
+MobileNet graph still sees the old behaviour.  PoseMultiNet.extract_features
+carries the same training_scope() call for its mobilenet branch, but that
+class is only reached when pose_cfg.yaml sets stride < 8 and no code path
+writes such a value.
+
+Not reported upstream: mobilenet.py carries this arg_scope unchanged on
+all 111 remote branches of the DeepLabCut repository, including
+origin/dev, origin/main and origin/backup/tf-deprecation, and no matching
+issue exists.
+
+Separately, and independently of this bug, net_type=mobilenet_v2_* cannot
+be used at all out of the box: every URL in
+pose_estimation_tensorflow/models/pretrained/pretrained_model_urls.yaml
+for MobileNet returns HTTP 403, so create_training_dataset dies with
+urllib.error.HTTPError.  See tensorflow/models#13561 (open since April
+2025) and DeepLabCut#2937 / #3243.  The resnet and efficientnet URLs in
+the same file are still live.
+---
+ deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py b/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py
+index ffd34aa..707342c 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/mobilenet.py
+@@ -63,11 +63,24 @@ class PoseMobileNet(BasePoseNet):
+     def __init__(self, cfg):
+         super().__init__(cfg)
+ 
+-    def extract_features(self, inputs):
++    def extract_features(self, inputs, is_training=False):
+         net_fun, net_arg_scope = networks[self.cfg["net_type"]]
+         im_centered = self.center_inputs(inputs)
++        batch_size = im_centered.shape[0]
+         with slim.arg_scope(net_arg_scope()):
+-            net, end_points = net_fun(im_centered)
++            if is_training or batch_size is None or batch_size == 1:
++                net, end_points = net_fun(im_centered)
++            else:
++                nets, points = [], []
++                with tf.compat.v1.variable_scope(
++                    tf.compat.v1.get_variable_scope(), reuse=tf.compat.v1.AUTO_REUSE
++                ):
++                    for i in range(int(batch_size)):
++                        n_i, ep_i = net_fun(im_centered[i : i + 1])
++                        nets.append(n_i)
++                        points.append(ep_i)
++                net = tf.concat(nets, axis=0)
++                end_points = {k: tf.concat([p[k] for p in points], axis=0) for k in points[0]}
+ 
+         return net, end_points
+ 
+@@ -94,5 +107,5 @@ class PoseMobileNet(BasePoseNet):
+         return out
+ 
+     def get_net(self, inputs, is_training=False):
+-        net, end_points = self.extract_features(inputs)
++        net, end_points = self.extract_features(inputs, is_training=is_training)
+         return self.prediction_layers(net, end_points)
+-- 
+2.55.0
