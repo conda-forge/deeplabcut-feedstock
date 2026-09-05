@@ -1,0 +1,84 @@
+From e4faeb1dc001747e88907cba862060b66b89f1a6 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 14:35:03 -0400
+Subject: [PATCH] Point the augmentation tests at the vendored augmentation
+ module
+
+"Replace albumentations with a vendored augmentation module" removed
+`albumentations` from the package but left the three test modules that import
+it, so against that patch series the tests do not collect at all:
+
+    ModuleNotFoundError: No module named 'albumentations'
+    ERROR tests/pose_estimation_pytorch/data/test_preprocessor.py
+    ERROR tests/pose_estimation_pytorch/data/test_transforms.py
+    ERROR tests/pose_estimation_pytorch/other/test_dataset.py
+
+That is 29 tests, and they are the only ones that exercise the replacement:
+they build `A.Compose` pipelines and feed them through `Preprocessor`,
+`PoseDataset` and DeepLabCut's own `transforms.py` wrappers.
+
+`deeplabcut.pose_estimation_pytorch.data.augmentation` is a drop-in for the
+part of the albumentations API DeepLabCut uses, so the change is the import
+line and nothing else. All 29 then pass, with no behavioural difference to
+account for. They are not passing vacuously either: disabling the image
+resize in the vendored `Resize.apply` fails three of them.
+
+Their coverage is narrower than it looks, though. They assert shapes, so
+disabling `Resize.apply_to_keypoints` and `apply_to_bboxes`, or
+`Normalize.apply`, leaves all 29 green -- and nothing else covers those. The
+vendored-module patch adds no tests of its own, and the sdist's
+`tests/test_dataset_augmentation.py` is about the imgaug-based TensorFlow
+augmenters, not this module. A transform-by-transform comparison against
+albumentations is still owed.
+
+These three modules are not in the PyPI sdist, so this patch applies to the
+upstream git tree the recipe fetches as a second source rather than to the
+sdist it builds.  `test_dataset.py` is not run there: it resolves the
+openfield example project relative to the installed package, which in a
+conda environment is `site-packages`, and it draws its parameters from
+`random.randint` at collection time.
+---
+ tests/pose_estimation_pytorch/data/test_preprocessor.py | 2 +-
+ tests/pose_estimation_pytorch/data/test_transforms.py   | 2 +-
+ tests/pose_estimation_pytorch/other/test_dataset.py     | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/tests/pose_estimation_pytorch/data/test_preprocessor.py b/tests/pose_estimation_pytorch/data/test_preprocessor.py
+index 9a68d76..2908275 100644
+--- a/tests/pose_estimation_pytorch/data/test_preprocessor.py
++++ b/tests/pose_estimation_pytorch/data/test_preprocessor.py
+@@ -10,7 +10,7 @@
+ #
+ """Tests the pre-processors."""
+ 
+-import albumentations as A
++from deeplabcut.pose_estimation_pytorch.data import augmentation as A
+ import numpy as np
+ import pytest
+ 
+diff --git a/tests/pose_estimation_pytorch/data/test_transforms.py b/tests/pose_estimation_pytorch/data/test_transforms.py
+index f85ce00..6f2217c 100644
+--- a/tests/pose_estimation_pytorch/data/test_transforms.py
++++ b/tests/pose_estimation_pytorch/data/test_transforms.py
+@@ -12,7 +12,7 @@
+ 
+ import random
+ 
+-import albumentations as A
++from deeplabcut.pose_estimation_pytorch.data import augmentation as A
+ import numpy as np
+ import pytest
+ 
+diff --git a/tests/pose_estimation_pytorch/other/test_dataset.py b/tests/pose_estimation_pytorch/other/test_dataset.py
+index 9185523..f826621 100644
+--- a/tests/pose_estimation_pytorch/other/test_dataset.py
++++ b/tests/pose_estimation_pytorch/other/test_dataset.py
+@@ -12,7 +12,7 @@ import os
+ import random
+ from pathlib import Path
+ 
+-import albumentations as A
++from deeplabcut.pose_estimation_pytorch.data import augmentation as A
+ import pytest
+ from torch.utils.data import DataLoader
+ 
