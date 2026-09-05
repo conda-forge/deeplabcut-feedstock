@@ -33,7 +33,8 @@ decoded keypoints identical); export_model still resolves every node name,
 with concat_1 bit-identical and the multi-animal outputs at 2.7e-07 / 3.0e-06
 / 3.9e-06 and Cast_2 identical; the exported pose_cfg.yaml reloads as a plain
 dict with no !!python tags; train_network still runs eagerly end to end and
-writes a snapshot the tf_slim graph reads back.
+writes a snapshot the tf_slim graph reads back bit for bit (0.0e+00 on both
+part_prob and locref).
 ---
 diff --git a/deeplabcut/pose_estimation_tensorflow/core/eager_session.py b/deeplabcut/pose_estimation_tensorflow/core/eager_session.py
 index 1e6fa5c..a77118f 100644
