@@ -1,0 +1,76 @@
+From 18bc897c7ba688f949d8049361172c26d46ba7ba Mon Sep 17 00:00:00 2001
+From: "Axel.Cffrd.Dnty" <150222552+AxelNoun@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 20:08:07 +0200
+Subject: [PATCH] Guard remaining CoW read-only .to_numpy()/.values mutations
+
+Follow-up to the pandas 3.0 CoW sweep (#3362). Three more sites extract a
+NumPy array from a pandas object and mutate it in place; under pandas 3 CoW
+these can be read-only views, raising "assignment destination is read-only".
+
+- refine_training_dataset/tracklets.py: self.data backs self.xy/self.prob,
+  which swap_tracklets and the refine GUI mutate in place (HDF load path;
+  flagged in review).
+- utils/make_labeled_video.py: coords is a view into xyp, masked in place in
+  both the first-frame and per-frame branches.
+- pose_estimation_tensorflow/.../pose_multianimal_imgaug.py: a single-row
+  float Series is read-only; kpts is masked in place when
+  mask_kpts_below_thresh is set.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+Backported from upstream DeepLabCut, which carries this on the `dev`
+branch but has not yet released it:
+https://github.com/DeepLabCut/DeepLabCut/commit/18bc897c7ba688f949d8049361172c26d46ba7ba
+
+---
+ .../datasets/pose_multianimal_imgaug.py                     | 4 +++-
+ deeplabcut/refine_training_dataset/tracklets.py             | 6 +++++-
+ deeplabcut/utils/make_labeled_video.py                      | 4 +++-
+ 3 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/datasets/pose_multianimal_imgaug.py b/deeplabcut/pose_estimation_tensorflow/datasets/pose_multianimal_imgaug.py
+index 525ca297..a2645754 100644
+--- a/deeplabcut/pose_estimation_tensorflow/datasets/pose_multianimal_imgaug.py
++++ b/deeplabcut/pose_estimation_tensorflow/datasets/pose_multianimal_imgaug.py
+@@ -135,7 +135,9 @@ class MAImgaugPoseDataset(BasePoseDataset):
+             item = DataItem()
+             data = df.loc[imagename]
+             # 3 for likelihood
+-            kpts = data.to_numpy().reshape(-1, 3)
++            # copy=True: `kpts` is masked in place below (mask_kpts_below_thresh);
++            # under pandas 3 CoW a single-row float Series returns a read-only view.
++            kpts = data.to_numpy(copy=True).reshape(-1, 3)
+             item.num_joints = kpts.shape[0]
+             joint_ids = np.arange(item.num_joints)[..., np.newaxis]
+             frame_name = "frame_" + str(int(imagename.split("frame")[1])) + ".png"
+diff --git a/deeplabcut/refine_training_dataset/tracklets.py b/deeplabcut/refine_training_dataset/tracklets.py
+index 50b49a97..92972685 100644
+--- a/deeplabcut/refine_training_dataset/tracklets.py
++++ b/deeplabcut/refine_training_dataset/tracklets.py
+@@ -246,7 +246,11 @@ class TrackletManager:
+         self.bodyparts = idx.get_level_values("bodyparts")
+         self.nframes = len(df)
+         self.times = np.arange(self.nframes)
+-        self.data = df.values.reshape((self.nframes, -1, 3)).swapaxes(0, 1)
++        # copy=True: `self.xy`/`self.prob` are views into `self.data` and are
++        # mutated in place (e.g. by `swap_tracklets`), so the backing array must
++        # stay writable. Under pandas 3 CoW, `.values` on a homogeneous float
++        # DataFrame returns a read-only view.
++        self.data = df.to_numpy(copy=True).reshape((self.nframes, -1, 3)).swapaxes(0, 1)
+         self.xy = self.data[:, :, :2]
+         self.prob = self.data[:, :, 2]
+         individuals = idx.get_level_values("individuals")
+diff --git a/deeplabcut/utils/make_labeled_video.py b/deeplabcut/utils/make_labeled_video.py
+index b8bde844..8f0d9cf7 100644
+--- a/deeplabcut/utils/make_labeled_video.py
++++ b/deeplabcut/utils/make_labeled_video.py
+@@ -1017,7 +1017,9 @@ def create_video_with_keypoints_only(
+     ny = int(np.nanmax(df.xs("y", axis=1, level="coords")))
+ 
+     n_frames = df.shape[0]
+-    xyp = df.values.reshape((n_frames, -1, 3))
++    # copy=True: `coords` is a view into `xyp` and is masked in place below;
++    # under pandas 3 CoW `.values` would return a read-only view.
++    xyp = df.to_numpy(copy=True).reshape((n_frames, -1, 3))
+ 
+     if color_by == "bodypart":
+         map_ = bodyparts.map(dict(zip(bodypart_names, range(n_bodyparts), strict=False)))

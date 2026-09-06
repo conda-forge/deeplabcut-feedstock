@@ -1,0 +1,29 @@
+From 7c997771a5326588363563306be2d9a9cdea5ed0 Mon Sep 17 00:00:00 2001
+From: Jaap de Ruyter van Steveninck
+ <32810691+deruyter92@users.noreply.github.com>
+Date: Tue, 28 Jul 2026 09:43:29 +0200
+Subject: [PATCH] Add copy=True to to_numpy in evaluate_multianimal peaks_gt
+
+Guards against the in-place write on the next line producing a
+read-only view when the intermediate frame becomes single-block.
+Backported from upstream DeepLabCut, which carries this on the `dev`
+branch but has not yet released it:
+https://github.com/DeepLabCut/DeepLabCut/commit/7c997771a5326588363563306be2d9a9cdea5ed0
+
+---
+ .../pose_estimation_tensorflow/core/evaluate_multianimal.py     | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/evaluate_multianimal.py b/deeplabcut/pose_estimation_tensorflow/core/evaluate_multianimal.py
+index 5cd893f7..0dc290cc 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/evaluate_multianimal.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/evaluate_multianimal.py
+@@ -328,7 +328,7 @@ def evaluate_multianimal_full(
+                             )
+ 
+                         temp["sample"] = 0
+-                        peaks_gt = temp.loc[:, ["sample", "y", "x", "bodyparts"]].to_numpy()
++                        peaks_gt = temp.loc[:, ["sample", "y", "x", "bodyparts"]].to_numpy(copy=True)
+                         peaks_gt[:, 1:3] = (peaks_gt[:, 1:3] - stride // 2) / stride
+ 
+                         pred = predictma.predict_batched_peaks_and_costs(

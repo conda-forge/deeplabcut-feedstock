@@ -1,0 +1,1652 @@
+From a90da0b863073142f50c364cb42b77c2a9061b9e Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 08:56:18 -0400
+Subject: [PATCH] Port the EfficientNet backbone to eager TensorFlow 2 / Keras
+
+backbones/efficientnet_model.py and backbones/efficientnet_builder.py are a
+vendored copy of the tensorflow/tpu EfficientNet, 826 lines carrying 29
+tf.compat.v1 references and, through nnets/utils.py, the only two imports of
+tensorflow.python.tpu in DeepLabCut.  They use no tf_slim at all, so the whole
+backbone fits in one eager tf.keras.Model.
+
+backbones/efficientnet_keras.py is that model.  It contains no tf.compat.v1,
+no private TPU module, no variable_scope, no placeholder and no Session.  It
+registers as KerasBackboneFactory("efficientnet"), takes raw images and does
+its own normalisation -- cfg["mean_pixel"] subtracted, then STDDEV_RGB divided
+out, which is what PoseEfficientNet.extract_features does -- and returns
+(net, end_points).  nnets/efficientnet.py gains PoseEfficientNetKeras, a
+BaseKerasPoseNet registered for KERAS_ENGINE, so test(), inference(),
+add_inference_layers() and train() are inherited unchanged.  The TF1 path is
+untouched and stays the default; resolve_engine picks between them.
+
+What the TPU import was for
+
+  nnets/utils.TpuBatchNormalization is cross-replica batch norm: on a TPU pod
+  each replica sees a shard of the batch, and it sums the per-shard mean and
+  mean-of-square across replicas with tpu_ops.cross_replica_sum so that all
+  replicas normalise by the whole batch's statistics.  Off a TPU there are no
+  replicas, tpu_function.get_tpu_context().number_of_shards is 1, and the
+  class reduces to its base class.  Nothing ever built it: efficientnet_builder
+  passes BatchNormalization and names the TPU class only in a comment, and
+  patch 0018 had to fix a TypeError in its _moments -- proof the code path has
+  never run.  It is deleted here, and with it the two tensorflow.python.tpu
+  imports, which every DeepLabCut TensorFlow import was executing.  Nothing is
+  lost for CPU or GPU use; TPU training would have to reintroduce it, and would
+  today write it with tf.distribute rather than the private module.
+
+  The published cloud-tpu-checkpoints weights are unaffected: they are ordinary
+  name-based checkpoints and the batch-norm statistics in them were computed by
+  that path on Google's hardware, not by anything DeepLabCut runs.
+
+  nnets/utils.BatchNormalization, DepthwiseConv2D and drop_connect move to
+  backbones/efficientnet_model.py verbatim, their only consumer.  They cannot
+  simply be swapped for their Keras equivalents where they stand: they are
+  built inside tf.compat.v1.variable_scope, so they take their names from the
+  scope, while a plain Keras layer takes it from the enclosing model -- every
+  batch-norm and depthwise variable of the network would be renamed and no
+  checkpoint would load.  The unit moves when this file does.  The move leaves
+  the TF1 graph bit-for-bit identical: same 308 (b0) and 493 (b3) variables,
+  same names, same creation order, 0 update ops with use_batch_norm=False and
+  96 / 154 with it, before and after.
+
+Two properties are reproduced rather than approximated.
+
+Variable naming.  Every layer knows the TF1 variable scope it stands in for
+and reports it from slim_weights(), including the per-scope layer numbering
+tf.compat.v1 generates -- conv2d, conv2d_1, tpu_batch_normalization_2, and the
+separate counter of the nested se scope.  Against the tf_slim graph, for all
+seven net_types DeepLabCut offers:
+
+  efficientnet-b0  308 variables   b1 436   b2 436   b3 493
+  efficientnet-b4  607             b5 735   b6 849
+
+every name and shape identical, in the same creation order, 0 unmapped
+weights, and the endpoint dictionaries identical too (42, 56, 56, 62, 74, 88
+and 100 entries).  Trainable counts match as well: 212, 300, 300, 339, 417,
+505, 583.  Checkpoints therefore convert mechanically in both directions:
+save_tf1_checkpoint output restores into the unmodified tf_slim graph with
+tf.compat.v1.train.Saver (308/308 variables), a snapshot that graph writes
+loads back into the Keras net (308/308, 0 missing, 0 unused, max |diff| 0.0),
+and compare_to_tf1_checkpoint reports 0.0 on the round trip.
+
+The published ImageNet weights need two renames that no other backbone does:
+they carry neither the efficientnet/ scope nor the raw variables, only their
+/ExponentialMovingAverage shadow copies, which is the rename core/train.py
+performs for the TF1 graph.  nnets/checkpoint.load_tf1_checkpoint grows a
+rename hook for it rather than this file growing a private loader, and
+nnets/efficientnet.imagenet_ckpt_name is that hook.  All 304 backbone weights
+of efficientnet-b0 load, 0 missing, 0 mismatched.
+
+Batch norm.  PoseEfficientNet.get_net ignores is_training and defaults
+use_batch_norm to False, so the backbone normalises with the stored moving
+averages and never updates them, while training as much as at inference; the
+TF1 graph has zero UPDATE_OPS to say the same thing.  That is reproduced, not
+corrected -- it is why the port needs none of the per-image batch-norm
+machinery the MobileNet one does, and why an image's prediction cannot depend
+on the images sharing its batch.  A tf.function traced on [None, H, W, 3] gives
+bit-identical output for an image at batch sizes 2, 4 and 8 whatever the
+companions are; only the batch size itself moves the result, by 8e-7 relative,
+which is the convolution kernels blocking differently and happens with oneDNN
+off as well.
+
+Equivalence against the tf_slim implementation, all seven net_types at batch
+sizes 1 and 4, 46 to 104 tensors each (every endpoint, the feature map and the
+part_pred and locref heads), 128x160 input, real ImageNet weights loaded on
+both sides from the same checkpoint:
+
+  worst relative deviation   4.97e-6, always on a block's expansion_output
+  keypoints through predict.argmax_pose_predict
+                             max 2.4e-5 px, mean 3.6e-6 to 7.3e-6 px
+  peak likelihoods           max 4.5e-7
+  argmax cell                identical for 140 of 140 keypoints
+
+That residual is the float32 noise floor, not a defect of the port.  Running
+the very same Keras code in float64 moves the feature map by 9.6e-7 and
+part_pred by 1.4e-6, against 1.4e-6 and 1.7e-6 for the gap to tf_slim; and
+re-associating one line of the port's own arithmetic -- the squeeze-and-excite
+spatial mean summed in two passes instead of one reduce_mean, algebraically
+identical -- moves them by 7.5e-7 and 1.3e-6.  Evaluating the port in float64
+does not bring it closer to tf_slim's float32 result (1.41e-6 against 1.38e-6),
+which places the remainder in tf_slim's own rounding.  Two correct float32
+implementations of this network cannot agree more closely than this.
+
+Landmines checked rather than assumed.  The backbone carries no weight
+regularisation at all -- the original convolutions pass no kernel_regularizer,
+because EfficientNet's weight decay lives in the optimizer -- so the Keras
+model adds none, and the pose net has exactly the two regularization losses
+the tf_slim graph has, both from the heads, both through
+slim_l2_regularizer's factor of a half.  Batch norm is pinned to
+efficientnet_builder's momentum of 0.99 and epsilon of 1e-3 rather than left
+on the Keras defaults, which agree today.  conv_kernel_initializer is kept as
+it is, including computing fan_out from a depthwise kernel's trailing 1.
+tf.compat.v1.div becomes tf.math.divide in drop_connect, and
+tf.compat.v1.logging.info becomes tf.get_logger().info in the fourteen places
+the two TF1 files log from.
+
+Multi-animal eager training on EfficientNet works with this: core/train_eager
+builds the net through the factory, restores the ImageNet backbone through the
+rename hook (304/304), agrees with the score-map size patch 0016 derives (26
+for a 200 px input at stride 8, which is what the network emits), and three
+optimisation steps move the loss and the weights.  It was failing at
+PoseNetFactory.create for want of a registered Keras net.
+
+Not done here.  backbones/efficientnet_model.py and efficientnet_builder.py
+stay in the tree, with 15 and 2 tf.compat.v1 references, because the TF1 path
+stays selectable and because PoseMultiNet's own efficientnet branch calls
+eff.build_model_base; they and the one reference left in nnets/efficientnet.py
+retire together with the TF1 engine.  This patch takes the tree from 114
+tf.compat.v1 references to 99 and removes the last import of
+tensorflow.python.tpu.
+---
+ .../backbones/efficientnet_builder.py         |  16 +-
+ .../backbones/efficientnet_keras.py           | 545 ++++++++++++++++++
+ .../backbones/efficientnet_model.py           |  71 ++-
+ .../core/train_multianimal.py                 |  21 +-
+ .../nnets/__init__.py                         |   3 +-
+ .../nnets/checkpoint.py                       |  31 +-
+ .../nnets/efficientnet.py                     |  93 ++-
+ .../pose_estimation_tensorflow/nnets/utils.py |  74 ---
+ tests/test_nnets_efficientnet_keras.py        | 380 ++++++++++++
+ 9 files changed, 1123 insertions(+), 111 deletions(-)
+ create mode 100644 deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_keras.py
+ create mode 100644 tests/test_nnets_efficientnet_keras.py
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_builder.py b/deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_builder.py
+index a7147ea..8852005 100644
+--- a/deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_builder.py
++++ b/deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_builder.py
+@@ -20,7 +20,8 @@ from pathlib import Path
+ import tensorflow as tf
+ 
+ import deeplabcut.pose_estimation_tensorflow.backbones.efficientnet_model as efficientnet_model
+-import deeplabcut.pose_estimation_tensorflow.nnets.utils as utils
++
++logger = tf.get_logger()
+ 
+ MEAN_RGB = [0.485 * 255, 0.456 * 255, 0.406 * 255]
+ STDDEV_RGB = [0.229 * 255, 0.224 * 255, 0.225 * 255]
+@@ -178,10 +179,7 @@ def efficientnet(
+         depth_divisor=8,
+         min_depth=None,
+         relu_fn=tf.nn.swish,
+-        # The default is TPU-specific batch norm.
+-        # The alternative is tf.layers.BatchNormalization.
+-        # batch_norm=utils.TpuBatchNormalization,  # TPU-specific requirement.
+-        batch_norm=utils.BatchNormalization,
++        batch_norm=efficientnet_model.BatchNormalization,
+         use_se=True,
+     )
+     decoder = BlockDecoder()
+@@ -201,8 +199,8 @@ def get_model_params(model_name, override_params):
+         # in global_params.
+         global_params = global_params._replace(**override_params)
+ 
+-    tf.compat.v1.logging.info("global_params= %s", global_params)
+-    tf.compat.v1.logging.info("blocks_args= %s", blocks_args)
++    logger.info("global_params= %s", global_params)
++    logger.info("blocks_args= %s", blocks_args)
+     return blocks_args, global_params
+ 
+ 
+@@ -239,7 +237,7 @@ def build_model(
+     if not training or fine_tuning:
+         if not override_params:
+             override_params = {}
+-        override_params["batch_norm"] = utils.BatchNormalization
++        override_params["batch_norm"] = efficientnet_model.BatchNormalization
+         override_params["relu_fn"] = functools.partial(swish, use_native=False)
+     blocks_args, global_params = get_model_params(model_name, override_params)
+ 
+@@ -249,7 +247,7 @@ def build_model(
+             if not tf.io.gfile.exists(model_dir):
+                 tf.io.gfile.makedirs(model_dir)
+             with tf.io.gfile.GFile(param_file, "w") as f:
+-                tf.compat.v1.logging.info(f"writing to {param_file}")
++                logger.info(f"writing to {param_file}")
+                 f.write(f"model_name= {model_name}\n\n")
+                 f.write(f"global_params= {str(global_params)}\n\n")
+                 f.write(f"blocks_args= {str(blocks_args)}\n\n")
+diff --git a/deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_keras.py b/deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_keras.py
+new file mode 100644
+index 0000000..a720624
+--- /dev/null
++++ b/deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_keras.py
+@@ -0,0 +1,545 @@
++#
++# Copyright 2019 The TensorFlow Authors. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++"""EfficientNet as an eager ``tf.keras.Model``.
++
++A drop-in replacement for ``backbones/efficientnet_model.py`` +
++``backbones/efficientnet_builder.py``, restricted to the configurations
++DeepLabCut actually builds: ``build_model_base``, i.e. ``features_only``, for
++``efficientnet-b0`` ... ``efficientnet-b6``.
++
++Contains none of the TF1 compatibility API, none of TensorFlow's private TPU
++modules, no ``variable_scope``, no placeholder and no Session.
++
++Variable naming is reproduced exactly rather than approximated.  Every layer
++knows the TF1 variable scope it stands in for, and ``slim_weights()`` reports
++it, so ``nnets/checkpoint.py`` moves weights in both directions and the
++published ``cloud-tpu-checkpoints`` ImageNet weights load unchanged.
++
++Three upstream details that are easy to get wrong:
++
++* The backbone carries **no** weight regularisation at all.  The original
++  TF1 ``layers.Conv2D`` calls pass no ``kernel_regularizer`` --
++  EfficientNet's weight decay lives in the optimizer, not in the graph -- and
++  the TF1 pose graph accordingly holds exactly two regularization losses, both
++  from the heads.  A ``keras.regularizers.l2`` here would be a change in
++  behaviour, not a translation, so there is none.
++
++* Batch norm normalises with the stored moving averages and never updates
++  them, at inference *and* while training: ``PoseEfficientNet.get_net``
++  ignores ``is_training`` and defaults ``use_batch_norm`` to ``False``.  The
++  TF1 graph has zero ``UPDATE_OPS`` to prove it.  That is why this port needs
++  none of the per-image batch-norm machinery the MobileNet one does.
++
++* ``momentum``/``epsilon`` are pinned to the values
++  ``efficientnet_builder.efficientnet`` puts in ``GlobalParams`` (0.99, 1e-3)
++  rather than left on the Keras defaults, which happen to agree today.
++"""
++
++import collections
++import math
++import re
++
++import numpy as np
++import tensorflow as tf
++
++from ..nnets.factory import KerasBackboneFactory
++
++#: ImageNet channel statistics, as in ``efficientnet_builder``.
++MEAN_RGB = [0.485 * 255, 0.456 * 255, 0.406 * 255]
++STDDEV_RGB = [0.229 * 255, 0.224 * 255, 0.225 * 255]
++
++#: ``efficientnet_builder.efficientnet``'s GlobalParams
++BN_MOMENTUM = 0.99
++BN_EPSILON = 1e-3
++DEPTH_DIVISOR = 8
++DROP_CONNECT_RATE = 0.2
++
++#: the variable scope ``PoseEfficientNet.extract_features`` opens
++SCOPE = "efficientnet"
++
++#: (width_coefficient, depth_coefficient, resolution, dropout_rate)
++EFFICIENTNET_PARAMS = {
++    "efficientnet-b0": (1.0, 1.0, 224, 0.2),
++    "efficientnet-b1": (1.0, 1.1, 240, 0.2),
++    "efficientnet-b2": (1.1, 1.2, 260, 0.3),
++    "efficientnet-b3": (1.2, 1.4, 300, 0.3),
++    "efficientnet-b4": (1.4, 1.8, 380, 0.4),
++    "efficientnet-b5": (1.6, 2.2, 456, 0.4),
++    "efficientnet-b6": (1.8, 2.6, 528, 0.5),
++    "efficientnet-b7": (2.0, 3.1, 600, 0.5),
++}
++
++#: NOTE the stride of the sixth entry is 11 and not 22: that is DeepLabCut's
++#: change, to get an output stride of 16 instead of 32.
++BLOCKS_ARGS = (
++    "r1_k3_s11_e1_i32_o16_se0.25",
++    "r2_k3_s22_e6_i16_o24_se0.25",
++    "r2_k5_s22_e6_i24_o40_se0.25",
++    "r3_k3_s22_e6_i40_o80_se0.25",
++    "r3_k5_s11_e6_i80_o112_se0.25",
++    "r4_k5_s11_e6_i112_o192_se0.25",
++    "r1_k3_s11_e6_i192_o320_se0.25",
++)
++
++BlockArgs = collections.namedtuple(
++    "BlockArgs",
++    [
++        "kernel_size",
++        "num_repeat",
++        "input_filters",
++        "output_filters",
++        "expand_ratio",
++        "id_skip",
++        "strides",
++        "se_ratio",
++        "conv_type",
++    ],
++)
++BlockArgs.__new__.__defaults__ = (None,) * len(BlockArgs._fields)
++
++
++def decode_block_string(block_string):
++    """``efficientnet_builder.BlockDecoder._decode_block_string``."""
++    options = {}
++    for op in block_string.split("_"):
++        splits = re.split(r"(\d.*)", op)
++        if len(splits) >= 2:
++            key, value = splits[:2]
++            options[key] = value
++    if "s" not in options or len(options["s"]) != 2:
++        raise ValueError("Strides options should be a pair of integers.")
++    return BlockArgs(
++        kernel_size=int(options["k"]),
++        num_repeat=int(options["r"]),
++        input_filters=int(options["i"]),
++        output_filters=int(options["o"]),
++        expand_ratio=int(options["e"]),
++        id_skip=("noskip" not in block_string),
++        se_ratio=float(options["se"]) if "se" in options else None,
++        strides=[int(options["s"][0]), int(options["s"][1])],
++        conv_type=int(options["c"]) if "c" in options else 0,
++    )
++
++
++def conv_kernel_initializer(shape, dtype=None):
++    """``efficientnet_model.conv_kernel_initializer``.
++
++    A normal distribution rather than the truncated one
++    ``tf.variance_scaling_initializer`` uses.  For a depthwise kernel the
++    shape is ``[k, k, in, 1]``, so ``out_filters`` is 1 -- that oddity is
++    upstream's and is reproduced rather than corrected.
++    """
++    kernel_height, kernel_width, _, out_filters = shape
++    fan_out = int(kernel_height * kernel_width * out_filters)
++    return tf.random.normal(shape, mean=0.0, stddev=np.sqrt(2.0 / fan_out), dtype=dtype)
++
++
++def dense_kernel_initializer(shape, dtype=None):
++    """``efficientnet_model.dense_kernel_initializer``."""
++    init_range = 1.0 / np.sqrt(shape[1])
++    return tf.random.uniform(shape, -init_range, init_range, dtype=dtype)
++
++
++def round_filters(filters, width_coefficient, depth_divisor=DEPTH_DIVISOR, min_depth=None):
++    """``efficientnet_model.round_filters``."""
++    if not width_coefficient:
++        return filters
++    filters *= width_coefficient
++    min_depth = min_depth or depth_divisor
++    new_filters = max(min_depth, int(filters + depth_divisor / 2) // depth_divisor * depth_divisor)
++    if new_filters < 0.9 * filters:  # do not round down by more than 10%
++        new_filters += depth_divisor
++    return int(new_filters)
++
++
++def round_repeats(repeats, depth_coefficient):
++    """``efficientnet_model.round_repeats``."""
++    if not depth_coefficient:
++        return repeats
++    return int(math.ceil(depth_coefficient * repeats))
++
++
++def drop_connect(inputs, is_training, drop_connect_rate):
++    """``efficientnet_model.drop_connect``, with ``tf.math.divide`` for TF1's ``div``."""
++    if not is_training:
++        return inputs
++    keep_prob = 1.0 - drop_connect_rate
++    batch_size = tf.shape(inputs)[0]
++    random_tensor = keep_prob + tf.random.uniform([batch_size, 1, 1, 1], dtype=inputs.dtype)
++    binary_tensor = tf.floor(random_tensor)
++    return tf.math.divide(inputs, keep_prob) * binary_tensor
++
++
++# ---------------------------------------------------------------------------
++# Layers that keep their TF1 variable names
++# ---------------------------------------------------------------------------
++
++
++class EffConv(tf.keras.layers.Layer):
++    """One TF1 ``layers.Conv2D`` of the original EfficientNet.
++
++    ``slim_scope`` is the TF1 variable scope this layer stands in for, e.g.
++    ``"efficientnet/efficientnet-b0/blocks_3/se/conv2d_1"``.  No
++    ``kernel_regularizer``: the layers it replaces have none.
++    """
++
++    def __init__(self, slim_scope, filters, kernel_size, strides=1, use_bias=False, **kwargs):
++        super().__init__(name=slim_scope.replace("/", "."), **kwargs)
++        self.slim_scope = slim_scope
++        self.conv = tf.keras.layers.Conv2D(
++            filters,
++            kernel_size=kernel_size,
++            strides=strides,
++            kernel_initializer=conv_kernel_initializer,
++            padding="same",
++            data_format="channels_last",
++            use_bias=use_bias,
++        )
++
++    def call(self, inputs):
++        return self.conv(inputs)
++
++    def slim_weights(self):
++        out = {f"{self.slim_scope}/kernel": self.conv.kernel}
++        if self.conv.use_bias:
++            out[f"{self.slim_scope}/bias"] = self.conv.bias
++        return out
++
++
++class EffDepthwiseConv(tf.keras.layers.Layer):
++    """``nnets/utils.DepthwiseConv2D``: a plain Keras depthwise convolution."""
++
++    def __init__(self, slim_scope, kernel_size, strides=1, **kwargs):
++        super().__init__(name=slim_scope.replace("/", "."), **kwargs)
++        self.slim_scope = slim_scope
++        self.conv = tf.keras.layers.DepthwiseConv2D(
++            kernel_size,
++            strides=strides,
++            depth_multiplier=1,
++            depthwise_initializer=conv_kernel_initializer,
++            padding="same",
++            data_format="channels_last",
++            use_bias=False,
++        )
++
++    def call(self, inputs):
++        return self.conv(inputs)
++
++    def slim_weights(self):
++        return {f"{self.slim_scope}/depthwise_kernel": self.conv.depthwise_kernel}
++
++
++class EffBatchNorm(tf.keras.layers.Layer):
++    """``nnets/utils.BatchNormalization``, i.e. the non-TPU branch.
++
++    The TF1 class is called ``tpu_batch_normalization`` only so that its
++    variable names match ``TpuBatchNormalization``'s; the computation is
++    the TF1 ``layers.BatchNormalization``'s and nothing more.
++    """
++
++    def __init__(self, slim_scope, **kwargs):
++        super().__init__(name=slim_scope.replace("/", "."), **kwargs)
++        self.slim_scope = slim_scope
++        self.bn = tf.keras.layers.BatchNormalization(
++            axis=-1,
++            momentum=BN_MOMENTUM,
++            epsilon=BN_EPSILON,
++            center=True,
++            scale=True,
++        )
++
++    def call(self, inputs, training=False):
++        return self.bn(inputs, training=training)
++
++    def slim_weights(self):
++        return {
++            f"{self.slim_scope}/gamma": self.bn.gamma,
++            f"{self.slim_scope}/beta": self.bn.beta,
++            f"{self.slim_scope}/moving_mean": self.bn.moving_mean,
++            f"{self.slim_scope}/moving_variance": self.bn.moving_variance,
++        }
++
++
++class EffDense(tf.keras.layers.Layer):
++    """The classification head's TF1 ``layers.Dense``."""
++
++    def __init__(self, slim_scope, units, **kwargs):
++        super().__init__(name=slim_scope.replace("/", "."), **kwargs)
++        self.slim_scope = slim_scope
++        self.dense = tf.keras.layers.Dense(units, kernel_initializer=dense_kernel_initializer)
++
++    def call(self, inputs):
++        return self.dense(inputs)
++
++    def slim_weights(self):
++        return {
++            f"{self.slim_scope}/kernel": self.dense.kernel,
++            f"{self.slim_scope}/bias": self.dense.bias,
++        }
++
++
++class _ScopeCounter:
++    """Reproduce TF1's per-variable-scope layer numbering.
++
++    The original layers take their names from the variable scope that is open
++    when they are first called -- ``conv2d``, ``conv2d_1``, ... -- with a
++    separate counter for the nested ``se`` scope.
++    """
++
++    def __init__(self, prefix):
++        self.prefix = prefix
++        self._counts = {}
++
++    def name(self, base, scope=""):
++        key = (scope, base)
++        n = self._counts.get(key, 0)
++        self._counts[key] = n + 1
++        suffix = "" if n == 0 else f"_{n}"
++        parts = [self.prefix] + ([scope] if scope else []) + [base + suffix]
++        return "/".join(parts)
++
++
++class MBConvBlock(tf.keras.layers.Layer):
++    """``efficientnet_model.MBConvBlock``: mobile inverted residual bottleneck."""
++
++    def __init__(self, block_args, slim_scope, relu_fn=tf.nn.swish, use_se=True, **kwargs):
++        super().__init__(name=slim_scope.replace("/", "."), **kwargs)
++        self.slim_scope = slim_scope
++        self._block_args = block_args
++        self._relu_fn = relu_fn
++        self._spatial_dims = [1, 2]
++        self._has_se = use_se and block_args.se_ratio is not None and 0 < block_args.se_ratio <= 1
++        self.endpoints = {}
++        self._build(_ScopeCounter(slim_scope))
++
++    def block_args(self):
++        return self._block_args
++
++    def _build(self, names):
++        args = self._block_args
++        filters = args.input_filters * args.expand_ratio
++        if args.expand_ratio != 1:
++            self._expand_conv = EffConv(names.name("conv2d"), filters, [1, 1], [1, 1])
++            self._bn0 = EffBatchNorm(names.name("tpu_batch_normalization"))
++
++        self._depthwise_conv = EffDepthwiseConv(
++            names.name("depthwise_conv2d"), [args.kernel_size, args.kernel_size], args.strides
++        )
++        self._bn1 = EffBatchNorm(names.name("tpu_batch_normalization"))
++
++        if self._has_se:
++            num_reduced_filters = max(1, int(args.input_filters * args.se_ratio))
++            self._se_reduce = EffConv(
++                names.name("conv2d", scope="se"), num_reduced_filters, [1, 1], [1, 1], use_bias=True
++            )
++            self._se_expand = EffConv(
++                names.name("conv2d", scope="se"), filters, [1, 1], [1, 1], use_bias=True
++            )
++
++        self._project_conv = EffConv(names.name("conv2d"), args.output_filters, [1, 1], [1, 1])
++        self._bn2 = EffBatchNorm(names.name("tpu_batch_normalization"))
++
++    def _call_se(self, input_tensor):
++        se_tensor = tf.reduce_mean(input_tensor, axis=self._spatial_dims, keepdims=True)
++        se_tensor = self._se_expand(self._relu_fn(self._se_reduce(se_tensor)))
++        return tf.sigmoid(se_tensor) * input_tensor
++
++    def call(self, inputs, training=False, drop_out=False, drop_connect_rate=None):
++        args = self._block_args
++        if args.expand_ratio != 1:
++            x = self._relu_fn(self._bn0(self._expand_conv(inputs), training=training))
++        else:
++            x = inputs
++
++        x = self._relu_fn(self._bn1(self._depthwise_conv(x), training=training))
++
++        if self._has_se:
++            x = self._call_se(x)
++
++        self.endpoints = {"expansion_output": x}
++
++        x = self._bn2(self._project_conv(x), training=training)
++        if args.id_skip and all(s == 1 for s in args.strides) and args.input_filters == args.output_filters:
++            if drop_connect_rate:
++                x = drop_connect(x, drop_out, drop_connect_rate)
++            x = tf.add(x, inputs)
++        return x
++
++
++class MBConvBlockWithoutDepthwise(MBConvBlock):
++    """``efficientnet_model.MBConvBlockWithoutDepthwise`` (``conv_type=1``).
++
++    Unreachable from DeepLabCut, whose block strings never carry ``c1``; kept
++    so that :func:`decode_block_string` stays a faithful decoder.
++    """
++
++    def _build(self, names):
++        args = self._block_args
++        filters = args.input_filters * args.expand_ratio
++        if args.expand_ratio != 1:
++            self._expand_conv = EffConv(names.name("conv2d"), filters, [3, 3], [1, 1])
++            self._bn0 = EffBatchNorm(names.name("tpu_batch_normalization"))
++
++        self._project_conv = EffConv(
++            names.name("conv2d"), args.output_filters, [1, 1], args.strides
++        )
++        self._bn1 = EffBatchNorm(names.name("tpu_batch_normalization"))
++
++    def call(self, inputs, training=False, drop_out=False, drop_connect_rate=None):
++        args = self._block_args
++        if args.expand_ratio != 1:
++            x = self._relu_fn(self._bn0(self._expand_conv(inputs), training=training))
++        else:
++            x = inputs
++
++        self.endpoints = {"expansion_output": x}
++
++        x = self._bn1(self._project_conv(x), training=training)
++        if args.id_skip and all(s == 1 for s in args.strides) and args.input_filters == args.output_filters:
++            if drop_connect_rate:
++                x = drop_connect(x, drop_out, drop_connect_rate)
++            x = tf.add(x, inputs)
++        return x
++
++
++_CONV_BLOCKS = {0: MBConvBlock, 1: MBConvBlockWithoutDepthwise}
++
++
++@KerasBackboneFactory.register("efficientnet")
++class EfficientNet(tf.keras.Model):
++    """``efficientnet_model.Model`` as built by ``build_model_base``.
++
++    Takes raw images and does its own normalisation -- subtract
++    ``cfg["mean_pixel"]`` and divide by :data:`STDDEV_RGB`, mirroring
++    ``PoseEfficientNet.extract_features``.  Returns ``(net, end_points)``.
++    """
++
++    def __init__(
++        self,
++        cfg,
++        blocks_args=BLOCKS_ARGS,
++        relu_fn=tf.nn.swish,
++        use_se=True,
++        include_top=False,
++        num_classes=1000,
++        drop_connect_rate=DROP_CONNECT_RATE,
++        scope=SCOPE,
++        **kwargs,
++    ):
++        super().__init__(**kwargs)
++        model_name = cfg["net_type"].replace("_", "-")
++        if model_name not in EFFICIENTNET_PARAMS:
++            raise NotImplementedError(f"model name is not pre-defined: {model_name}")
++        width, depth, _resolution, dropout_rate = EFFICIENTNET_PARAMS[model_name]
++        self.model_name = model_name
++        self.scope = f"{scope}/{model_name}" if scope else model_name
++        # A copy, not the caller's list: assigning a structure to a
++        # tf.keras.Model attribute has Keras replace it with a ListWrapper,
++        # and pose_cfg.yaml is written back out with ruamel, which cannot
++        # represent one.  Nothing else of ``cfg`` is kept.
++        self.mean_pixel = list(cfg["mean_pixel"])
++        self._relu_fn = relu_fn
++        self._include_top = include_top
++        self._drop_connect_rate = drop_connect_rate
++
++        # Stem.
++        self._conv_stem = EffConv(f"{self.scope}/stem/conv2d", round_filters(32, width), [3, 3], [2, 2])
++        self._bn0 = EffBatchNorm(f"{self.scope}/stem/tpu_batch_normalization")
++
++        # Blocks.
++        self._blocks = []
++        for block_string in blocks_args:
++            args = block_string if isinstance(block_string, BlockArgs) else decode_block_string(block_string)
++            if args.num_repeat <= 0:
++                raise ValueError("num_repeat must be positive")
++            args = args._replace(
++                input_filters=round_filters(args.input_filters, width),
++                output_filters=round_filters(args.output_filters, width),
++                num_repeat=round_repeats(args.num_repeat, depth),
++            )
++            cls = _CONV_BLOCKS[args.conv_type]
++            self._append_block(cls, args, relu_fn, use_se)
++            if args.num_repeat > 1:
++                args = args._replace(input_filters=args.output_filters, strides=[1, 1])
++            for _ in range(args.num_repeat - 1):
++                self._append_block(cls, args, relu_fn, use_se)
++
++        self.output_depth = self._blocks[-1].block_args().output_filters
++
++        # Head.  ``build_model_base`` never reaches it, so neither the TF1
++        # graph nor this model has head weights unless ``include_top`` asks.
++        if include_top:
++            self._conv_head = EffConv(
++                f"{self.scope}/head/conv2d", round_filters(1280, width), [1, 1], [1, 1]
++            )
++            self._bn1 = EffBatchNorm(f"{self.scope}/head/tpu_batch_normalization")
++            self._avg_pooling = tf.keras.layers.GlobalAveragePooling2D(data_format="channels_last")
++            self._dropout = tf.keras.layers.Dropout(dropout_rate) if dropout_rate > 0 else None
++            self._fc = EffDense(f"{self.scope}/head/dense", num_classes) if num_classes else None
++
++    def _append_block(self, cls, args, relu_fn, use_se):
++        idx = len(self._blocks)
++        self._blocks.append(
++            cls(args, f"{self.scope}/blocks_{idx}", relu_fn=relu_fn, use_se=use_se)
++        )
++
++    def preprocess(self, inputs):
++        """``BasePoseNet.center_inputs`` followed by the builder's scaling."""
++        dtype = self.compute_dtype
++        mean = tf.constant(self.mean_pixel, dtype=dtype, shape=[1, 1, 1, 3])
++        stddev = tf.constant(STDDEV_RGB, dtype=dtype, shape=[1, 1, 3])
++        return (tf.cast(inputs, dtype) - mean) / stddev
++
++    def call(self, inputs, training=False, drop_out=False, features_only=True):
++        end_points = {}
++        outputs = self._relu_fn(self._bn0(self._conv_stem(self.preprocess(inputs)), training=training))
++        end_points["stem"] = outputs
++
++        reduction_idx = 0
++        n_blocks = len(self._blocks)
++        for idx, block in enumerate(self._blocks):
++            is_reduction = idx == n_blocks - 1 or self._blocks[idx + 1].block_args().strides[0] > 1
++            if is_reduction:
++                reduction_idx += 1
++            drop_rate = self._drop_connect_rate
++            if drop_rate:
++                drop_rate *= float(idx) / n_blocks
++            outputs = block(
++                outputs, training=training, drop_out=drop_out, drop_connect_rate=drop_rate
++            )
++            end_points[f"block_{idx}"] = outputs
++            if is_reduction:
++                end_points[f"reduction_{reduction_idx}"] = outputs
++            for k, v in block.endpoints.items():
++                end_points[f"block_{idx}/{k}"] = v
++                if is_reduction:
++                    end_points[f"reduction_{reduction_idx}/{k}"] = v
++
++        end_points["features"] = outputs
++
++        if not features_only:
++            if not self._include_top:
++                raise ValueError("build this model with include_top=True to run the head")
++            outputs = self._relu_fn(self._bn1(self._conv_head(outputs), training=training))
++            outputs = self._avg_pooling(outputs)
++            if self._dropout is not None:
++                outputs = self._dropout(outputs, training=drop_out)
++            end_points["global_pool"] = outputs
++            if self._fc is not None:
++                outputs = self._fc(outputs)
++            end_points["head"] = outputs
++
++        return outputs, end_points
+diff --git a/deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_model.py b/deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_model.py
+index 96dfb05..2c8b406 100644
+--- a/deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_model.py
++++ b/deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_model.py
+@@ -26,7 +26,48 @@ import math
+ import numpy as np
+ import tensorflow as tf
+ 
+-import deeplabcut.pose_estimation_tensorflow.nnets.utils as utils
++logger = tf.get_logger()
++
++# ---------------------------------------------------------------------------
++# Layers.  These used to live in nnets/utils.py, whose other users are all off
++# the TF1 API now; they stay TF1 layers because the whole of this file is, and
++# because the published EfficientNet checkpoints are keyed by the names such a
++# layer derives from the enclosing variable scope.  They move out together with
++# the rest of this file, not before it.
++#
++# TpuBatchNormalization did not come with them: cross-replica batch norm needs
++# TensorFlow's private TPU modules, and nothing ever built it --
++# efficientnet_builder passes BatchNormalization and only mentions the TPU
++# class in a comment.  See backbones/efficientnet_keras.py.
++# ---------------------------------------------------------------------------
++class BatchNormalization(tf.compat.v1.layers.BatchNormalization):
++    """Fixed default name of BatchNormalization to match TpuBatchNormalization."""
++
++    def __init__(self, name="tpu_batch_normalization", **kwargs):
++        super().__init__(name=name, **kwargs)
++
++
++def drop_connect(inputs, is_training, drop_connect_rate):
++    """Apply drop connect."""
++    if not is_training:
++        return inputs
++
++    # Compute keep_prob
++    # TODO(tanmingxing): add support for training progress.
++    keep_prob = 1.0 - drop_connect_rate
++
++    # Compute drop_connect tensor
++    batch_size = tf.shape(input=inputs)[0]
++    random_tensor = keep_prob
++    random_tensor += tf.random.uniform([batch_size, 1, 1, 1], dtype=inputs.dtype)
++    binary_tensor = tf.floor(random_tensor)
++    output = tf.math.divide(inputs, keep_prob) * binary_tensor
++    return output
++
++
++class DepthwiseConv2D(tf.keras.layers.DepthwiseConv2D, tf.compat.v1.layers.Layer):
++    """Wrap keras DepthwiseConv2D to tf.layers."""
++
+ 
+ GlobalParams = collections.namedtuple(
+     "GlobalParams",
+@@ -124,7 +165,7 @@ def round_filters(filters, global_params):
+     # Make sure that round down does not go down by more than 10%.
+     if new_filters < 0.9 * filters:
+         new_filters += divisor
+-    tf.compat.v1.logging.info(f"round_filter input={orig_f} output={new_filters}")
++    logger.info(f"round_filter input={orig_f} output={new_filters}")
+     return int(new_filters)
+ 
+ 
+@@ -198,7 +239,7 @@ class MBConvBlock(tf.keras.layers.Layer):
+ 
+         kernel_size = self._block_args.kernel_size
+         # Depth-wise convolution phase:
+-        self._depthwise_conv = utils.DepthwiseConv2D(
++        self._depthwise_conv = DepthwiseConv2D(
+             [kernel_size, kernel_size],
+             strides=self._block_args.strides,
+             depthwise_initializer=conv_kernel_initializer,
+@@ -262,7 +303,7 @@ class MBConvBlock(tf.keras.layers.Layer):
+         """
+         se_tensor = tf.reduce_mean(input_tensor=input_tensor, axis=self._spatial_dims, keepdims=True)
+         se_tensor = self._se_expand(self._relu_fn(self._se_reduce(se_tensor)))
+-        tf.compat.v1.logging.info(f"Built Squeeze and Excitation with tensor shape: {se_tensor.shape}")
++        logger.info(f"Built Squeeze and Excitation with tensor shape: {se_tensor.shape}")
+         return tf.sigmoid(se_tensor) * input_tensor
+ 
+     def call(self, inputs, use_batch_norm=False, drop_out=False, drop_connect_rate=None):
+@@ -275,15 +316,15 @@ class MBConvBlock(tf.keras.layers.Layer):
+         Returns:
+           A output tensor.
+         """
+-        tf.compat.v1.logging.info(f"Block input: {inputs.name} shape: {inputs.shape}")
++        logger.info(f"Block input: {inputs.name} shape: {inputs.shape}")
+         if self._block_args.expand_ratio != 1:
+             x = self._relu_fn(self._bn0(self._expand_conv(inputs), training=use_batch_norm))
+         else:
+             x = inputs
+-        tf.compat.v1.logging.info(f"Expand: {x.name} shape: {x.shape}")
++        logger.info(f"Expand: {x.name} shape: {x.shape}")
+ 
+         x = self._relu_fn(self._bn1(self._depthwise_conv(x), training=use_batch_norm))
+-        tf.compat.v1.logging.info(f"DWConv: {x.name} shape: {x.shape}")
++        logger.info(f"DWConv: {x.name} shape: {x.shape}")
+ 
+         if self._has_se:
+             with tf.compat.v1.variable_scope("se"):
+@@ -299,9 +340,9 @@ class MBConvBlock(tf.keras.layers.Layer):
+             ):
+                 # only apply drop_connect if skip presents.
+                 if drop_connect_rate:
+-                    x = utils.drop_connect(x, drop_out, drop_connect_rate)
++                    x = drop_connect(x, drop_out, drop_connect_rate)
+                 x = tf.add(x, inputs)
+-        tf.compat.v1.logging.info(f"Project: {x.name} shape: {x.shape}")
++        logger.info(f"Project: {x.name} shape: {x.shape}")
+         return x
+ 
+ 
+@@ -353,12 +394,12 @@ class MBConvBlockWithoutDepthwise(MBConvBlock):
+         Returns:
+           A output tensor.
+         """
+-        tf.compat.v1.logging.info(f"Block input: {inputs.name} shape: {inputs.shape}")
++        logger.info(f"Block input: {inputs.name} shape: {inputs.shape}")
+         if self._block_args.expand_ratio != 1:
+             x = self._relu_fn(self._bn0(self._expand_conv(inputs), training=use_batch_norm))
+         else:
+             x = inputs
+-        tf.compat.v1.logging.info(f"Expand: {x.name} shape: {x.shape}")
++        logger.info(f"Expand: {x.name} shape: {x.shape}")
+ 
+         self.endpoints = {"expansion_output": x}
+ 
+@@ -370,9 +411,9 @@ class MBConvBlockWithoutDepthwise(MBConvBlock):
+             ):
+                 # only apply drop_connect if skip presents.
+                 if drop_connect_rate:
+-                    x = utils.drop_connect(x, drop_out, drop_connect_rate)
++                    x = drop_connect(x, drop_out, drop_connect_rate)
+                 x = tf.add(x, inputs)
+-        tf.compat.v1.logging.info(f"Project: {x.name} shape: {x.shape}")
++        logger.info(f"Project: {x.name} shape: {x.shape}")
+         return x
+ 
+ 
+@@ -490,7 +531,7 @@ class Model(tf.keras.Model):
+         # Calls Stem layers
+         with tf.compat.v1.variable_scope("stem"):
+             outputs = self._relu_fn(self._bn0(self._conv_stem(inputs), training=use_batch_norm))
+-        tf.compat.v1.logging.info(f"Built stem layers with output shape: {outputs.shape}")
++        logger.info(f"Built stem layers with output shape: {outputs.shape}")
+         self.endpoints["stem"] = outputs
+ 
+         # Calls blocks.
+@@ -505,7 +546,7 @@ class Model(tf.keras.Model):
+                 drop_rate = self._global_params.drop_connect_rate
+                 if drop_rate:
+                     drop_rate *= float(idx) / len(self._blocks)
+-                    tf.compat.v1.logging.info(f"block_{idx} drop_connect_rate: {drop_rate}")
++                    logger.info(f"block_{idx} drop_connect_rate: {drop_rate}")
+                 outputs = block.call(
+                     outputs,
+                     use_batch_norm=use_batch_norm,
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py b/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py
+index c7af77e..44981b1 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/train_multianimal.py
+@@ -32,6 +32,7 @@ from deeplabcut.pose_estimation_tensorflow.nnets import (
+     ensure_eager_execution,
+     load_tf1_checkpoint,
+ )
++from deeplabcut.pose_estimation_tensorflow.nnets.efficientnet import imagenet_ckpt_name
+ from deeplabcut.pose_estimation_tensorflow.nnets.utils import get_batch_spec
+ from deeplabcut.pose_estimation_tensorflow.util.logging import setup_logging
+ from deeplabcut.utils import auxfun_models, auxiliaryfunctions
+@@ -43,22 +44,27 @@ BACKBONE_SCOPES = {
+ }
+ 
+ 
+-def restore_weights(net, checkpoint_path, net_type, include_prefixes=None):
++def restore_weights(net, checkpoint_path, net_type, include_prefixes=None, rename=None):
+     """Load ``checkpoint_path`` into ``net``, redownloading it when it is missing.
+ 
+     Same contract as ``auxfun_models.smart_restore``: a checkpoint that does not
+     load and that sits where DeepLabCut keeps its pretrained weights is fetched
+-    again before the load is retried.
++    again before the load is retried.  ``rename`` is for backbones whose
++    published weights are not keyed by DeepLabCut's names.
+     """
+     try:
+-        return load_tf1_checkpoint(net, checkpoint_path, include_prefixes=include_prefixes)
++        return load_tf1_checkpoint(
++            net, checkpoint_path, include_prefixes=include_prefixes, rename=rename
++        )
+     except (ValueError, tf.errors.OpError) as err:
+         dlcparent_path = auxiliaryfunctions.get_deeplabcut_path()
+         expected = auxfun_models.MODELTYPE_FILEPATH_MAP.get(net_type)
+         if expected is None or str(checkpoint_path) != str(dlcparent_path / expected):
+             raise
+         auxfun_models.check_for_weights(net_type, dlcparent_path)
+-        return load_tf1_checkpoint(net, checkpoint_path, include_prefixes=include_prefixes)
++        return load_tf1_checkpoint(
++            net, checkpoint_path, include_prefixes=include_prefixes, rename=rename
++        )
+ 
+ 
+ def build_net(cfg):
+@@ -147,6 +153,7 @@ def train(
+         cfg["resume_weights_only"] = True
+         print("replacing default init weights with: ", init_weights)
+ 
++    rename = None
+     stem = Path(cfg["init_weights"]).stem
+     if "snapshot" in stem and keepdeconvweights:
+         print("Loading already trained DLC with backbone:", net_type)
+@@ -169,9 +176,13 @@ def train(
+         if scope is None:
+             print("Wait for DLC 2.3.")
+         include_prefixes = [scope] if scope else []
++        # The published EfficientNet weights carry neither the efficientnet/
++        # scope nor the raw variables, only their moving-average shadows.
++        if "efficientnet" in net_type:
++            rename = imagenet_ckpt_name
+         start_iter = 0
+ 
+-    restore_weights(net, cfg["init_weights"], net_type, include_prefixes)
++    restore_weights(net, cfg["init_weights"], net_type, include_prefixes, rename)
+ 
+     global_step = tf.Variable(start_iter, dtype=tf.int64, trainable=False, name="global_step")
+     if "efficientnet" in net_type:
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py b/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py
+index 0617a72..6d0331c 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py
+@@ -11,7 +11,7 @@
+ 
+ from .base import BaseKerasPoseNet, BasePoseNet, ensure_eager_execution
+ from .checkpoint import load_tf1_checkpoint, save_tf1_checkpoint, tf1_weight_values
+-from .efficientnet import PoseEfficientNet
++from .efficientnet import PoseEfficientNet, PoseEfficientNetKeras
+ from .factory import (
+     KERAS_ENGINE,
+     TF1_ENGINE,
+@@ -29,6 +29,7 @@ __all__ = [
+     "KERAS_ENGINE",
+     "KerasBackboneFactory",
+     "PoseEfficientNet",
++    "PoseEfficientNetKeras",
+     "PoseMobileNet",
+     "PoseMultiNet",
+     "PoseMultiNetKeras",
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/checkpoint.py b/deeplabcut/pose_estimation_tensorflow/nnets/checkpoint.py
+index a78ccc8..3254b1b 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/checkpoint.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/checkpoint.py
+@@ -65,23 +65,44 @@ def _weight_map(model, include_prefixes=None):
+     return weights
+ 
+ 
+-def load_tf1_checkpoint(model, ckpt_path, include_prefixes=None, allow_missing=False, verbose=False):
++def load_tf1_checkpoint(
++    model, ckpt_path, include_prefixes=None, allow_missing=False, verbose=False, rename=None
++):
+     """Assign a TF1 checkpoint's tensors to a Keras pose net's weights.
+ 
+     ``include_prefixes`` restricts the load the way
+     ``slim.get_variables_to_restore(include=[...])`` does, which is how a bare
+     ImageNet backbone checkpoint is loaded into a full pose net.
++
++    ``rename`` maps a weight's ``tf_slim`` name to the name the checkpoint
++    stores it under, returning ``None`` for a weight the checkpoint is not
++    expected to carry.  Some published backbones do not use DeepLabCut's
++    names: EfficientNet's ImageNet checkpoints have neither the
++    ``efficientnet/`` scope nor the raw variables, only their
++    ``/ExponentialMovingAverage`` shadow copies -- see
++    ``nnets/efficientnet.imagenet_ckpt_name``.
+     """
+     reader = tf.train.load_checkpoint(ckpt_path)
+     available = reader.get_variable_to_shape_map()
+     weights = _weight_map(model, include_prefixes)
++    if rename is not None:
++        renamed = {}
++        for name, variable in weights.items():
++            ckpt_name = rename(name)
++            if ckpt_name is not None:
++                renamed[name] = (ckpt_name, variable)
++        weights = renamed
++    else:
++        weights = {name: (name, variable) for name, variable in weights.items()}
+ 
+     loaded, missing, mismatched = [], [], []
+-    for name, variable in weights.items():
+-        if name not in available:
++    claimed = set()
++    for name, (ckpt_name, variable) in weights.items():
++        if ckpt_name not in available:
+             missing.append(name)
+             continue
+-        value = reader.get_tensor(name)
++        claimed.add(ckpt_name)
++        value = reader.get_tensor(ckpt_name)
+         if tuple(value.shape) != tuple(variable.shape):
+             mismatched.append((name, tuple(value.shape), tuple(variable.shape)))
+             continue
+@@ -91,7 +112,7 @@ def load_tf1_checkpoint(model, ckpt_path, include_prefixes=None, allow_missing=F
+     unused = [
+         name
+         for name in available
+-        if name not in weights and not name.startswith(NON_WEIGHT_TENSORS)
++        if name not in claimed and not name.startswith(NON_WEIGHT_TENSORS)
+     ]
+     report = CheckpointReport(loaded, missing, unused, mismatched)
+     if verbose:
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/efficientnet.py b/deeplabcut/pose_estimation_tensorflow/nnets/efficientnet.py
+index 04b8eba..3e15b5c 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/efficientnet.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/efficientnet.py
+@@ -18,8 +18,13 @@ import tensorflow as tf
+ 
+ import deeplabcut.pose_estimation_tensorflow.backbones.efficientnet_builder as eff
+ 
+-from .base import BasePoseNet
+-from .factory import PoseNetFactory
++# Imported for its side effect: it registers the Keras backbone.
++from deeplabcut.pose_estimation_tensorflow.backbones import efficientnet_keras  # noqa: F401
++from deeplabcut.pose_estimation_tensorflow.backbones.efficientnet_keras import SCOPE as BACKBONE_SCOPE
++
++from .base import BaseKerasPoseNet, BasePoseNet
++from .checkpoint import load_tf1_checkpoint
++from .factory import KERAS_ENGINE, KerasBackboneFactory, PoseNetFactory
+ 
+ 
+ @PoseNetFactory.register("efficientnet")
+@@ -51,3 +56,87 @@ class PoseEfficientNet(BasePoseNet):
+     def test(self, inputs):
+         heads = self.get_net(inputs, self.cfg["use_batch_norm"], self.cfg["use_drop_out"])
+         return self.add_inference_layers(heads)
++
++
++# --------------------------------------------------------------------------
++# TensorFlow 2 / Keras implementation
++# --------------------------------------------------------------------------
++
++
++@PoseNetFactory.register("efficientnet", engine=KERAS_ENGINE)
++class PoseEfficientNetKeras(BaseKerasPoseNet):
++    """Keras twin of :class:`PoseEfficientNet`.
++
++    ``use_batch_norm`` and ``use_drop_out`` are carried through instead of
++    ``is_training`` because that is what the TF1 class does: its ``get_net``
++    ignores ``is_training`` and defaults both to ``False``, so the backbone's
++    batch norm uses the stored moving averages and never updates them, while
++    training as much as at inference.  The TF1 graph holds zero ``UPDATE_OPS``,
++    which is the same statement.  ``test()`` is the one caller that overrides
++    them, from ``pose_cfg.yaml``.
++    """
++
++    def __init__(self, cfg):
++        super().__init__(cfg)
++        if "use_batch_norm" not in self.cfg:
++            self.cfg["use_batch_norm"] = False
++        if "use_drop_out" not in self.cfg:
++            self.cfg["use_drop_out"] = False
++        self.backbone = KerasBackboneFactory.create(cfg)
++        n_joints = cfg["num_joints"]
++        self._add_head("part_pred", "pose/part_pred/block4", n_joints + cfg.get("num_idchannel", 0))
++        if cfg["location_refinement"]:
++            self._add_head("locref", "pose/locref_pred/block4", n_joints * 2)
++        if cfg["pairwise_predict"] and "multi-animal" not in cfg["dataset_type"]:
++            self._add_head("pairwise_pred", "pose/pairwise_pred/block4", n_joints * (n_joints - 1) * 2)
++        if cfg["partaffinityfield_predict"] and "multi-animal" in cfg["dataset_type"]:
++            self._add_head("pairwise_pred", "pose/pairwise_pred/block4", cfg["num_limbs"] * 2)
++        # No intermediate-supervision head: BasePoseNet.train() skips it for
++        # efficientnet and PoseEfficientNet never built one.
++
++    def extract_features(self, inputs, is_training=False, use_batch_norm=False, use_drop_out=False):
++        return self.backbone(inputs, training=use_batch_norm, drop_out=use_drop_out)
++
++    def prediction_layers(self, features, end_points, is_training=False):
++        out = {"features": features}
++        for key, layer in self._heads.items():
++            out[key] = layer(features, training=is_training)
++        return out
++
++    def get_net(self, inputs, use_batch_norm=False, use_drop_out=False, is_training=False):
++        features, end_points = self.extract_features(
++            inputs, use_batch_norm=use_batch_norm, use_drop_out=use_drop_out
++        )
++        return self.prediction_layers(features, end_points, is_training=is_training)
++
++    def call(self, inputs, training=False):
++        return self.get_net(inputs, is_training=training)
++
++    def test(self, inputs):
++        heads = self.get_net(inputs, self.cfg["use_batch_norm"], self.cfg["use_drop_out"])
++        return self.add_inference_layers(heads)
++
++
++#: How the published ``cloud-tpu-checkpoints`` weights are stored.  DeepLabCut
++#: restores the shadow copies rather than the raw variables -- ``core/train.py``
++#: does the same rename for the TF1 graph.
++EMA_SUFFIX = "/ExponentialMovingAverage"
++
++
++def imagenet_ckpt_name(slim_name, scope=BACKBONE_SCOPE):
++    """The ImageNet checkpoint's name for one of this net's weights.
++
++    ``None`` for the heads, which those checkpoints do not carry.
++    """
++    prefix = scope + "/"
++    if not slim_name.startswith(prefix):
++        return None
++    return slim_name[len(prefix) :] + EMA_SUFFIX
++
++
++def load_imagenet_checkpoint(model, ckpt_path, **kwargs):
++    """Load the published ``cloud-tpu-checkpoints`` EfficientNet weights.
++
++    Only the backbone is restored; the heads keep their initial values.
++    """
++    return load_tf1_checkpoint(model, ckpt_path, rename=imagenet_ckpt_name, **kwargs)
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/utils.py b/deeplabcut/pose_estimation_tensorflow/nnets/utils.py
+index 01202bc..429b5dd 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/utils.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/utils.py
+@@ -18,8 +18,6 @@ import functools
+ 
+ import numpy as np
+ import tensorflow as tf
+-from tensorflow.python.tpu import tpu_function
+-from tensorflow.python.tpu.ops import tpu_ops
+ 
+ from deeplabcut.pose_estimation_tensorflow.datasets import Batch
+ 
+@@ -154,75 +152,3 @@ def build_optimizer(learning_rate, optimizer_name="rmsprop", decay=0.9, epsilon=
+     else:
+         logger.fatal(f"Unknown optimizer: {optimizer_name}")
+     return optimizer
+-
+-
+-class TpuBatchNormalization(tf.compat.v1.layers.BatchNormalization):
+-    """Cross replica batch normalization."""
+-
+-    def __init__(self, fused=False, **kwargs):
+-        if fused in (True, None):
+-            raise ValueError("TpuBatchNormalization does not support fused=True.")
+-        super().__init__(fused=fused, **kwargs)
+-
+-    @staticmethod
+-    def _cross_replica_average(t, num_shards_per_group):
+-        """Calculates the average value of input tensor across TPU replicas."""
+-        num_shards = tpu_function.get_tpu_context().number_of_shards
+-        group_assignment = None
+-        if num_shards_per_group > 1:
+-            if num_shards % num_shards_per_group != 0:
+-                raise ValueError(f"num_shards: {num_shards} mod shards_per_group: {num_shards_per_group}, should be 0")
+-            num_groups = num_shards // num_shards_per_group
+-            group_assignment = [
+-                [x for x in range(num_shards) if x // num_shards_per_group == y] for y in range(num_groups)
+-            ]
+-        return tpu_ops.cross_replica_sum(t, group_assignment) / tf.cast(num_shards_per_group, t.dtype)
+-
+-    def _moments(self, inputs, reduction_axes, keep_dims, mask=None):
+-        """Compute the mean and variance: it overrides the original _moments."""
+-        shard_mean, shard_variance = super()._moments(inputs, reduction_axes, keep_dims=keep_dims, mask=mask)
+-
+-        num_shards = tpu_function.get_tpu_context().number_of_shards or 1
+-        if num_shards <= 8:  # Skip cross_replica for 2x2 or smaller slices.
+-            num_shards_per_group = 1
+-        else:
+-            num_shards_per_group = max(8, num_shards // 8)
+-        logger.info(f"TpuBatchNormalization with num_shards_per_group {num_shards_per_group}")
+-        if num_shards_per_group > 1:
+-            # Compute variance using: Var[X]= E[X^2] - E[X]^2.
+-            shard_square_of_mean = tf.math.square(shard_mean)
+-            shard_mean_of_square = shard_variance + shard_square_of_mean
+-            group_mean = self._cross_replica_average(shard_mean, num_shards_per_group)
+-            group_mean_of_square = self._cross_replica_average(shard_mean_of_square, num_shards_per_group)
+-            group_variance = group_mean_of_square - tf.math.square(group_mean)
+-            return group_mean, group_variance
+-        return shard_mean, shard_variance
+-
+-
+-class BatchNormalization(tf.compat.v1.layers.BatchNormalization):
+-    """Fixed default name of BatchNormalization to match TpuBatchNormalization."""
+-
+-    def __init__(self, name="tpu_batch_normalization", **kwargs):
+-        super().__init__(name=name, **kwargs)
+-
+-
+-def drop_connect(inputs, is_training, drop_connect_rate):
+-    """Apply drop connect."""
+-    if not is_training:
+-        return inputs
+-
+-    # Compute keep_prob
+-    # TODO(tanmingxing): add support for training progress.
+-    keep_prob = 1.0 - drop_connect_rate
+-
+-    # Compute drop_connect tensor
+-    batch_size = tf.shape(input=inputs)[0]
+-    random_tensor = keep_prob
+-    random_tensor += tf.random.uniform([batch_size, 1, 1, 1], dtype=inputs.dtype)
+-    binary_tensor = tf.floor(random_tensor)
+-    output = tf.math.divide(inputs, keep_prob) * binary_tensor
+-    return output
+-
+-
+-class DepthwiseConv2D(tf.keras.layers.DepthwiseConv2D, tf.compat.v1.layers.Layer):
+-    """Wrap keras DepthwiseConv2D to tf.layers."""
+diff --git a/tests/test_nnets_efficientnet_keras.py b/tests/test_nnets_efficientnet_keras.py
+new file mode 100644
+index 0000000..03bb265
+--- /dev/null
++++ b/tests/test_nnets_efficientnet_keras.py
+@@ -0,0 +1,380 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""Tests for the eager EfficientNet pose net in ``nnets/efficientnet.py``.
++
++These never build a TF1 graph.  The numbers they assert -- weight counts,
++variable names, endpoint names -- are the ones the ``tf_slim`` graph produces,
++read off it once and pinned here.
++"""
++import numpy as np
++import pytest
++
++tf = pytest.importorskip("tensorflow")
++
++from deeplabcut.pose_estimation_tensorflow.datasets import Batch  # noqa: E402
++from deeplabcut.pose_estimation_tensorflow.nnets import (  # noqa: E402
++    KERAS_ENGINE,
++    KerasBackboneFactory,
++    PoseEfficientNetKeras,
++    PoseNetFactory,
++    ensure_eager_execution,
++    load_tf1_checkpoint,
++    save_tf1_checkpoint,
++)
++from deeplabcut.pose_estimation_tensorflow.nnets.checkpoint import (  # noqa: E402
++    compare_to_tf1_checkpoint,
++)
++from deeplabcut.pose_estimation_tensorflow.nnets import base as nnets_base  # noqa: E402
++from deeplabcut.pose_estimation_tensorflow.nnets.efficientnet import (  # noqa: E402
++    PoseEfficientNet,
++    imagenet_ckpt_name,
++)
++from deeplabcut.utils.auxiliaryfunctions import (  # noqa: E402
++    read_plainconfig,
++    write_plainconfig,
++)
++
++
++@pytest.fixture(scope="module", autouse=True)
++def eager():
++    """Turn eager on for this module.
++
++    ``core/train.py`` disables it process-wide at import.  Turning it back on
++    only works before the eager context has been touched, so a module that
++    turns it off again on the way out makes every later Keras test skip --
++    which is what happens when this file and ``test_nnets_keras.py`` run in the
++    same session.  Eager is therefore left on, and the TF1 tests that follow
++    build their graphs in subprocesses anyway.
++    """
++    try:
++        ensure_eager_execution()
++    except RuntimeError as err:  # a TF1 graph was built earlier in this process
++        pytest.skip(str(err))
++    yield
++
++
++def pose_cfg(**kwargs):
++    cfg = {
++        "stride": 8.0,
++        "weigh_part_predictions": False,
++        "mean_pixel": [123.68, 116.779, 103.939],
++        "location_refinement": True,
++        "locref_stdev": 7.2801,
++        "locref_loss_weight": 1.0,
++        "locref_huber_loss": True,
++        "intermediate_supervision": False,
++        "intermediate_supervision_layer": 3,
++        "weight_decay": 0.0001,
++        "batch_size": 1,
++        "dataset_type": "imgaug",
++        "pairwise_huber_loss": True,
++        "pairwise_predict": False,
++        "partaffinityfield_predict": False,
++        "pairwise_loss_weight": 1.0,
++        "num_joints": 4,
++        "num_limbs": 0,
++        "net_type": "efficientnet-b0",
++    }
++    cfg.update(kwargs)
++    return cfg
++
++
++#: ``net_type -> number of variables the tf_slim graph creates`` (304 backbone
++#: weights plus the four of the part_pred and locref heads).
++VARIABLE_COUNTS = {
++    "efficientnet-b0": 308,
++    "efficientnet-b1": 436,
++    "efficientnet-b2": 436,
++    "efficientnet-b3": 493,
++}
++
++SIZE = (128, 160)
++
++
++def build(cfg, batch_size=None):
++    if batch_size is not None:
++        cfg = dict(cfg, batch_size=batch_size)
++    model = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++    model.build_for([cfg["batch_size"], SIZE[0], SIZE[1], 3])
++    return model
++
++
++def images(n, seed=0):
++    rng = np.random.RandomState(seed)
++    return tf.constant(rng.uniform(0, 255, (n, SIZE[0], SIZE[1], 3)), dtype=tf.float32)
++
++
++# ---------------------------------------------------------------------------
++# selection
++# ---------------------------------------------------------------------------
++def test_tf1_stays_the_default():
++    assert type(PoseNetFactory.create(pose_cfg())) is PoseEfficientNet
++
++
++def test_keras_engine_selects_the_keras_net():
++    net = PoseNetFactory.create(pose_cfg(tf_engine="keras"))
++    assert isinstance(net, PoseEfficientNetKeras)
++    assert isinstance(net, tf.keras.Model)
++
++
++def test_backbone_is_registered():
++    assert KerasBackboneFactory.supports("efficientnet-b0")
++
++
++# ---------------------------------------------------------------------------
++# structure
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("net_type", sorted(VARIABLE_COUNTS))
++def test_weight_count_matches_the_tf_slim_graph(net_type):
++    model = build(pose_cfg(net_type=net_type))
++    assert len(model.weights) == VARIABLE_COUNTS[net_type]
++    assert len(model.slim_weight_map()) == VARIABLE_COUNTS[net_type]
++    assert model.unmapped_weights() == []
++
++
++def test_variable_names_are_the_tf1_ones():
++    model = build(pose_cfg())
++    names = set(model.slim_weight_map())
++    for name in (
++        "efficientnet/efficientnet-b0/stem/conv2d/kernel",
++        "efficientnet/efficientnet-b0/stem/tpu_batch_normalization/moving_variance",
++        "efficientnet/efficientnet-b0/blocks_0/depthwise_conv2d/depthwise_kernel",
++        "efficientnet/efficientnet-b0/blocks_0/se/conv2d/bias",
++        "efficientnet/efficientnet-b0/blocks_0/se/conv2d_1/kernel",
++        "efficientnet/efficientnet-b0/blocks_0/conv2d/kernel",
++        "efficientnet/efficientnet-b0/blocks_0/tpu_batch_normalization_1/gamma",
++        "efficientnet/efficientnet-b0/blocks_1/conv2d_1/kernel",
++        "efficientnet/efficientnet-b0/blocks_15/tpu_batch_normalization_2/beta",
++        "pose/part_pred/block4/weights",
++        "pose/locref_pred/block4/biases",
++    ):
++        assert name in names, name
++    # the head layers of the classifier are not built: build_model_base stops
++    # at the last block, so there is no head/ scope in the tf_slim graph either
++    assert not any("/head/" in name for name in names)
++
++
++def test_endpoints_are_the_tf1_ones():
++    model = build(pose_cfg())
++    _features, end_points = model.extract_features(images(1))
++    assert end_points["features"].shape == (1, 8, 10, 320)
++    assert end_points["stem"].shape == (1, 64, 80, 32)
++    assert set(end_points) == (
++        {"stem", "features"}
++        | {f"block_{i}" for i in range(16)}
++        | {f"block_{i}/expansion_output" for i in range(16)}
++        | {f"reduction_{i}" for i in range(1, 5)}
++        | {f"reduction_{i}/expansion_output" for i in range(1, 5)}
++    )
++
++
++def test_backbone_carries_no_weight_regularisation():
++    """EfficientNet's weight decay lives in the optimizer, not in the graph.
++
++    The tf_slim graph holds exactly two REGULARIZATION_LOSSES, both from the
++    heads; a regularizer on the backbone would be a change in behaviour.
++    """
++    model = build(pose_cfg())
++    assert model.backbone.losses == []
++    assert len(model.losses) == 2
++
++
++def test_heads_use_the_slim_weight_decay():
++    """``slim.l2_regularizer(s)`` is ``s*sum(w^2)/2``, ``keras.l2(s)`` is not."""
++    cfg = pose_cfg()
++    model = build(cfg)
++    head = model._heads["part_pred"]
++    kernel = head.conv.kernel
++    expected = 0.5 * cfg["weight_decay"] * float(tf.reduce_sum(kernel**2))
++    assert float(head.losses[0]) == pytest.approx(expected, rel=1e-6)
++
++
++# ---------------------------------------------------------------------------
++# behaviour
++# ---------------------------------------------------------------------------
++def test_heads_have_the_expected_shapes():
++    model = build(pose_cfg(), batch_size=2)
++    out = model.get_net(images(2))
++    assert out["part_pred"].shape == (2, 16, 20, 4)
++    assert out["locref"].shape == (2, 16, 20, 8)
++    assert out["features"].shape == (2, 8, 10, 320)
++
++
++def test_prediction_of_an_image_does_not_depend_on_its_companions():
++    """Batch norm uses the moving averages, so images cannot interact.
++
++    Only the batch *size* changes anything, and only because the convolution
++    kernels block differently, by about 1e-6 relative; the companions
++    themselves make no difference at all.
++
++    The bound is absolute rather than scaled to the output.  Untrained, this
++    net's part_pred spans only about 3e-4, so a 1e-5 *relative* bound came to
++    3e-9 and sat a factor of ten over the kernel noise -- close enough to
++    dispatch differences on another CPU to fail there and nowhere else, which
++    is how the MobileNet sibling of this test broke.  1e-7 is 300x clear of
++    the noise seen here and still 3000x inside the signal.  Unlike MobileNet
++    there is no batch-dependent norm mode to catch: EfficientNet's batch norm
++    never reads the batch (see ``efficientnet_keras``'s module docstring, and
++    the TF1 graph's zero UPDATE_OPS), so what this bounds is gross leakage
++    between companions, not a norm regression.
++    """
++    model = build(pose_cfg(), batch_size=1)
++    predict = tf.function(
++        model.get_net, input_signature=[tf.TensorSpec([None, *SIZE, 3], tf.float32)]
++    )
++    batch = images(8)
++    reference = predict(batch[:1])["part_pred"].numpy()
++    for n in (2, 4, 8):
++        same_size = predict(batch[:n])["part_pred"].numpy()[:1]
++        assert np.abs(same_size - reference).max() < 1e-7
++        shuffled = tf.concat([batch[:1], batch[1:n][::-1]], axis=0)
++        assert np.array_equal(predict(shuffled)["part_pred"].numpy()[:1], same_size)
++
++
++def test_train_reaches_every_trainable_weight():
++    cfg = pose_cfg(batch_size=2)
++    model = build(cfg)
++    rng = np.random.RandomState(0)
++    n = cfg["num_joints"]
++    batch = {
++        Batch.inputs: images(2),
++        Batch.part_score_targets: tf.constant(rng.randint(0, 2, (2, 16, 20, n)), tf.float32),
++        Batch.part_score_weights: tf.ones((2, 16, 20, n)),
++        Batch.locref_targets: tf.constant(rng.normal(0, 1, (2, 16, 20, 2 * n)), tf.float32),
++        Batch.locref_mask: tf.ones((2, 16, 20, 2 * n)),
++    }
++    with tf.GradientTape() as tape:
++        loss = model.train(batch)
++    grads = tape.gradient(loss["total_loss"], model.trainable_weights)
++    assert all(g is not None for g in grads)
++    assert np.isfinite(float(loss["total_loss"]))
++
++
++def test_train_does_not_move_the_batch_norm_statistics():
++    """``PoseEfficientNet.get_net`` ignores ``is_training``, so nothing updates.
++
++    The tf_slim graph has zero ``UPDATE_OPS``; this is the same statement.
++    """
++    cfg = pose_cfg(batch_size=2)
++    model = build(cfg)
++    moving = {k: v for k, v in model.slim_weight_map().items() if "moving_" in k}
++    before = {k: v.numpy().copy() for k, v in moving.items()}
++    n = cfg["num_joints"]
++    model.train(
++        {
++            Batch.inputs: images(2, seed=1),
++            Batch.part_score_targets: tf.zeros((2, 16, 20, n)),
++            Batch.part_score_weights: tf.ones((2, 16, 20, n)),
++            Batch.locref_targets: tf.zeros((2, 16, 20, 2 * n)),
++            Batch.locref_mask: tf.ones((2, 16, 20, 2 * n)),
++        }
++    )
++    for name, variable in moving.items():
++        assert np.array_equal(before[name], variable.numpy()), name
++
++
++def test_test_and_inference_run():
++    model = build(pose_cfg())
++    out = model.test(images(1))
++    assert {"part_prob", "peak_inds", "locref", "features"} <= set(out)
++    pose = model.inference(images(1))["pose"]
++    assert pose.shape[1] == 3
++
++
++# ---------------------------------------------------------------------------
++# checkpoints
++# ---------------------------------------------------------------------------
++def test_checkpoint_round_trip(tmp_path):
++    model = build(pose_cfg())
++    prefix = save_tf1_checkpoint(model, str(tmp_path / "snapshot"), global_step=1000)
++    assert prefix.endswith("-1000")
++    other = build(pose_cfg())
++    report = load_tf1_checkpoint(other, prefix)
++    assert report.ok and not report.unused
++    assert len(report.loaded) == len(model.slim_weight_map())
++    assert max(compare_to_tf1_checkpoint(other, prefix).values()) == 0.0
++    before = {k: v.numpy() for k, v in model.slim_weight_map().items()}
++    for name, variable in other.slim_weight_map().items():
++        assert np.array_equal(before[name], variable.numpy()), name
++
++
++def multi_animal_cfg(**kwargs):
++    return pose_cfg(
++        num_joints=6,
++        num_limbs=5,
++        dataset_type="multi-animal-imgaug",
++        partaffinityfield_predict=True,
++        pairwise_predict=True,
++        **kwargs,
++    )
++
++
++def test_multi_animal_config_adds_the_pairwise_head():
++    model = build(multi_animal_cfg())
++    assert sorted(model._heads) == ["locref", "pairwise_pred", "part_pred"]
++    out = model.get_net(images(1))
++    assert out["pairwise_pred"].shape == (1, 16, 20, 10)
++    # 304 backbone weights, plus two each for part_pred, locref and pairwise
++    assert len(model.slim_weight_map()) == 310
++    assert model.unmapped_weights() == []
++
++
++# ---------------------------------------------------------------------------
++# the caller's pose_cfg must come back unharmed
++# ---------------------------------------------------------------------------
++CONFIG_LISTS = {
++    "mean_pixel": [123.68, 116.779, 103.939],
++    "all_joints": [[0], [1], [2], [3]],
++    "all_joints_names": ["a", "b", "c", "d"],
++    "multi_step": [[0.005, 10000], [0.02, 430000]],
++}
++
++
++def assert_config_survives(tmp_path, build_it):
++    """Build a net and check the caller's config is byte-identical after.
++
++    Assigning a structure to a ``tf.keras.Model`` attribute makes Keras replace
++    it with a ``ListWrapper`` in place, and DeepLabCut writes pose_cfg.yaml back
++    out with ``write_plainconfig``.
++    """
++    cfg = pose_cfg(**CONFIG_LISTS)
++    before, after = tmp_path / "before.yaml", tmp_path / "after.yaml"
++    write_plainconfig(str(before), cfg)
++    build_it(cfg)
++    write_plainconfig(str(after), cfg)
++    assert before.read_text() == after.read_text()
++    assert read_plainconfig(str(before)) == read_plainconfig(str(after))
++    for key in CONFIG_LISTS:
++        assert type(cfg[key]) is list, (key, type(cfg[key]))
++
++
++def test_backbone_leaves_the_caller_config_alone(tmp_path):
++    assert_config_survives(tmp_path, KerasBackboneFactory.create)
++
++
++@pytest.mark.skipif(
++    not hasattr(nnets_base, "set_untracked"),
++    reason="BaseKerasPoseNet still assigns cfg through Keras attribute tracking",
++)
++def test_pose_net_leaves_the_caller_config_alone(tmp_path):
++    assert_config_survives(tmp_path, lambda cfg: PoseNetFactory.create(cfg, engine=KERAS_ENGINE))
++
++
++# ---------------------------------------------------------------------------
++# the published ImageNet checkpoints are keyed differently
++# ---------------------------------------------------------------------------
++def test_imagenet_checkpoint_names():
++    assert (
++        imagenet_ckpt_name("efficientnet/efficientnet-b0/stem/conv2d/kernel")
++        == "efficientnet-b0/stem/conv2d/kernel/ExponentialMovingAverage"
++    )
++    # the heads are not in those checkpoints
++    assert imagenet_ckpt_name("pose/part_pred/block4/weights") is None
+-- 
+2.55.0
+

@@ -1,0 +1,591 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 15:41:14 -0400
+Subject: [PATCH] Restore the augmentation behaviour albumentations 1.4.1 had
+
+Patch 0010 replaced albumentations with a vendored module, and 0032 pinned its
+geometry against albumentations 1.4.1 and found it bit-exact. What it also found
+were four behaviours that are not geometry and do not match, three of which a
+stock `aug_default.yaml` training run reaches on every batch. None of them
+raises; each one silently changes what the model trains on, which is exactly
+what a "no behaviour change" port is supposed to rule out.
+
+`GaussNoise` drew about 24% less noise than the reference. albumentations
+sampled a *variance* uniformly and took its root, so `gaussian_noise: 12.75`
+gave sigma = sqrt(U(0, 12.75**2)): mean 8.448, standard deviation 3.040. The
+vendored transform took a `std_range` as a fraction of 255 and sampled it
+uniformly -- 255 * U(0, 0.05): the same support, mean 6.408, standard deviation
+3.668. The `std_range` name and the fraction-of-255 convention come from
+albumentations 2.x, whose distribution is the uniform one; carrying the 2.x
+spelling while owing the 1.4.1 distribution is what let the two drift apart, so
+the parameter goes back to 1.4.1's `var_limit` and `mean` and `build_transforms`
+back to the `var_limit=(0, noise**2), mean=0` call it made before 0010. Measured
+after the change: mean 8.494, standard deviation 3.003, KS D = 0.0029 against
+the reference sample (p = 0.36).
+
+`MotionBlur` blurred systematically harder. albumentations drew the kernel size
+from `range(3, 8, 2)`, so P(3) = P(5) = P(7) = 1/3 and the mean kernel was 4.99.
+The vendored transform drew every integer in [3, 7] and rounded even sizes up,
+which folds 4 into 5 and 6 into 7 and leaves 3 alone: 0.199 / 0.402 / 0.399,
+mean 5.40, an 8% wider blur. Drawing from the sizes the limits actually allow
+gives 0.336 / 0.333 / 0.332 and mean 4.99 again.
+
+Bounding boxes were clipped once against the final canvas instead of after every
+transform. albumentations ran its box filter after each transform in the
+pipeline, clipping to the image that transform left behind and dropping the
+boxes with nothing left; the vendored `Compose` clipped only at the end. The two
+agree until a transform moves annotations back *into* the frame after an earlier
+one pushed them out -- which is what padding does, and both `crop_sampling` in
+`aug_default.yaml` and `auto_padding` in the hrnet and dekr configs put padding
+directly after `affine`. A box pushed past the frame edge by a rotation or a
+scaling therefore came back with its excursion intact, extending into the black
+padding over pixels it never covered. Driving the stock config with pinned
+affine parameters, 11 of 12 draws produced a different box, by up to 74 px on a
+448 canvas; after the change, 0 of 12.
+
+That last one is not confined to metadata. `data/dataset.py` computes each
+instance's `area` as the width times the height of its augmented box, and
+`models/target_generators/dekr_targets.py` weights the DEKR offset loss by
+`1 / sqrt(area)` and resolves overlapping instances by comparing areas, so a box
+that keeps its excursion changes the loss weights of every pixel it covers. The
+torchvision detector regresses `labels["boxes"]` directly, though
+`base_detector.yaml` has no padding after its affine and so is unaffected as
+shipped, and `runners/train.py` rescales evaluation predictions with the same
+boxes. The bottom-up heatmap and PAF losses do not read boxes at all.
+
+Fourth, an `affine:` block naming only some of `rotation`, `scaling` and
+`translation` raised `TypeError`, either at build time or on the first batch.
+`config/data.py` types the block `dict | None` and validates it by calling
+`build_transforms`, so a partial block is a configuration a user is invited to
+write, and albumentations answered it with scale 1, rotation 0 and no
+translation. `Affine` now defaults each unset parameter to its identity. An
+entirely empty `affine: {}` stays the identity here rather than reproducing
+albumentations' answer to it -- a random scale, translation, rotation *and*
+shear -- which would mean inventing a shear the module has no other use for and
+turning a block that asks for nothing into an augmentation.
+
+Tests: the three strict xfails in `tests/test_augmentation_geometry.py` that
+recorded these deviations are removed, since they now XPASS. The two remaining
+ones -- the crop larger than the image, and `Compose(seed=...)` re-seeding on
+every call -- are untouched. In their place the file gains the reference
+distributions for both sampled parameters (kernel-size probabilities and mean;
+sigma's mean, standard deviation and a KS test against `P(sigma <= s) = s**2 /
+var_limit`), the `gaussian_noise` config wiring, four clipping cases measured on
+albumentations 1.4.1 -- padding after a translation, a box dropped along with
+its label before the padding, a rotation clipped to the rotated frame, and the
+`crop_sampling` shape -- and the partial and empty affine blocks compared
+against the pinned affine geometry the file already pins. Thirteen new source
+mutations join the thirty-four already there, among them drawing sigma
+uniformly, rounding even kernel sizes up, clipping only against the final
+canvas, and defaulting a missing affine parameter to something other than the
+identity. All forty-seven are killed; the suite is 58 passed, 2 xfailed.
+---
+ .../data/augmentation.py                      | 107 +++++--
+ .../data/transforms.py                        |   4 +-
+ tests/test_augmentation_geometry.py           | 297 +++++++++++++++---
+ 3 files changed, 334 insertions(+), 74 deletions(-)
+
+diff --git a/deeplabcut/pose_estimation_pytorch/data/augmentation.py b/deeplabcut/pose_estimation_pytorch/data/augmentation.py
+index 4da17aa..27b879e 100644
+--- a/deeplabcut/pose_estimation_pytorch/data/augmentation.py
++++ b/deeplabcut/pose_estimation_pytorch/data/augmentation.py
+@@ -343,27 +343,60 @@ class Compose(BaseCompose):
+             image, keypoints, bboxes = transform.apply_all(image, keypoints, bboxes, rng)
+             keypoints = _as_keypoints(keypoints)
+             bboxes = np.asarray(bboxes, dtype=float).reshape(-1, 4) if len(bboxes) else np.zeros((0, 4), dtype=float)
++            # boxes are clipped against the canvas each transform leaves behind, not
++            # only against the final one: a box pushed off the frame by a rotation
++            # must lose the part that left the frame before a later transform pads
++            # or crops around it, or the excursion is carried into the padding
++            bboxes, tails, labels = self._filter_bboxes(bboxes, tails, labels, image)
+ 
+         result = dict(data)
+         result["image"] = image
+         result["keypoints"] = _keypoints_out(keypoints)
+-
+-        if len(bboxes):
+-            height, width = image.shape[:2]
+-            clipped = bboxes.copy()
+-            clipped[:, [0, 2]] = np.clip(clipped[:, [0, 2]], 0, width)
+-            clipped[:, [1, 3]] = np.clip(clipped[:, [1, 3]], 0, height)
+-            areas = (clipped[:, 2] - clipped[:, 0]) * (clipped[:, 3] - clipped[:, 1])
+-            keep = areas > self.bbox_params.min_area if self.bbox_params else areas > 0
+-            bboxes = clipped[keep]
+-            tails = [tail for tail, keep_it in zip(tails, keep) if keep_it]
+-            for field, values in labels.items():
+-                labels[field] = [value for value, keep_it in zip(values, keep) if keep_it]
+-
++        bboxes, tails, labels = self._filter_bboxes(bboxes, tails, labels, image)
+         result["bboxes"] = _join_bboxes(corners_to_coco(bboxes) if len(bboxes) else bboxes, tails)
+         result.update(labels)
+         return result
+ 
++    def _filter_bboxes(
++        self,
++        bboxes: NDArray,
++        tails: list[NDArray],
++        labels: dict[str, list[Any]],
++        image: NDArray,
++    ) -> tuple[NDArray, list[NDArray], dict[str, list[Any]]]:
++        """Clip boxes to the image and drop the ones left with no area.
++
++        Returns the surviving boxes together with the trailing box columns and the
++        bbox label fields, filtered the same way, so the three stay aligned.
++        """
++        if not len(bboxes):
++            return bboxes, tails, labels
++
++        height, width = image.shape[:2]
++        clipped = bboxes.copy()
++        clipped[:, [0, 2]] = np.clip(clipped[:, [0, 2]], 0, width)
++        clipped[:, [1, 3]] = np.clip(clipped[:, [1, 3]], 0, height)
++        areas = (clipped[:, 2] - clipped[:, 0]) * (clipped[:, 3] - clipped[:, 1])
++
++        min_area = self.bbox_params.min_area if self.bbox_params else 0.0
++        min_visibility = self.bbox_params.min_visibility if self.bbox_params else 0.0
++        keep = areas > min_area
++        if min_visibility > 0:
++            full = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
++            visible = np.divide(areas, full, out=np.zeros_like(areas), where=full > 0)
++            keep &= visible >= min_visibility
++
++        if keep.all():
++            return clipped, tails, labels
++        return (
++            clipped[keep],
++            [tail for tail, keep_it in zip(tails, keep) if keep_it],
++            {
++                field: [value for value, keep_it in zip(values, keep) if keep_it]
++                for field, values in labels.items()
++            },
++        )
++
+ 
+ class HorizontalFlip(DualTransform):
+     """Mirror the image left-to-right."""
+@@ -577,15 +610,20 @@ class Affine(DualTransform):
+ 
+     def __init__(
+         self,
+-        scale: tuple[float, float] | float = 1.0,
+-        rotate: tuple[float, float] | float = 0.0,
+-        translate_px: tuple[int, int] | int = 0,
++        scale: tuple[float, float] | float | None = 1.0,
++        rotate: tuple[float, float] | float | None = 0.0,
++        translate_px: tuple[int, int] | int | None = 0,
+         interpolation: int = cv2.INTER_LINEAR,
+         border_mode: int = cv2.BORDER_CONSTANT,
+         value: float | Sequence[float] = 0,
+         p: float = 0.5,
+     ) -> None:
+         super().__init__(p=p)
++        # a parameter left unset is the identity for that parameter, so that a
++        # configuration block naming only some of them is not a crash
++        scale = 1.0 if scale is None else scale
++        rotate = 0.0 if rotate is None else rotate
++        translate_px = 0 if translate_px is None else translate_px
+         self.scale = scale if isinstance(scale, (tuple, list)) else (scale, scale)
+         self.rotate = rotate if isinstance(rotate, (tuple, list)) else (-rotate, rotate)
+         self.translate_px = translate_px if isinstance(translate_px, (tuple, list)) else (-translate_px, translate_px)
+@@ -713,9 +751,11 @@ class MotionBlur(ImageOnlyTransform):
+         self, image: NDArray, keypoints: NDArray, bboxes: NDArray, rng: np.random.Generator
+     ) -> dict[str, Any]:
+         low, high = self.blur_limit
+-        ksize = int(rng.integers(low, high + 1))
+-        if ksize % 2 == 0:
+-            ksize += 1
++        # the kernel size is drawn uniformly from the sizes the limits actually
++        # allow, ``low, low + 2, ...``; drawing from every integer in the range
++        # and rounding up would make the smallest size half as likely as the rest
++        sizes = np.arange(low, high + 1, 2)
++        ksize = int(sizes[rng.integers(len(sizes))])
+         kernel = np.zeros((ksize, ksize), dtype=np.float32)
+         # a random straight line through the kernel centre
+         x1, x2 = rng.integers(0, ksize, size=2).tolist()
+@@ -735,31 +775,38 @@ class MotionBlur(ImageOnlyTransform):
+ 
+ 
+ class GaussNoise(ImageOnlyTransform):
+-    """Add zero-mean Gaussian noise.
+-
+-    ``std_range`` is the standard deviation as a fraction of the 0-255 intensity
+-    range, so 0.05 means a standard deviation of about 12.75 grey levels.
++    """Add Gaussian noise whose variance is drawn from ``var_limit``.
++
++    ``var_limit`` bounds the *variance* of the noise, in squared grey levels of the
++    0-255 intensity range; a draw's standard deviation is the square root of the
++    drawn variance. Drawing the variance and taking its root is not the same as
++    drawing the standard deviation directly: over ``(0, s ** 2)`` the mean standard
++    deviation is ``2 * s / 3`` rather than ``s / 2``, so a uniform draw would be
++    about a quarter weaker for the same upper bound.
+     """
+ 
+     def __init__(
+         self,
+-        std_range: tuple[float, float] = (0.0, 0.05),
+-        mean_range: tuple[float, float] = (0.0, 0.0),
++        var_limit: tuple[float, float] | float = (10.0, 50.0),
++        mean: float = 0.0,
+         per_channel: bool = True,
+         p: float = 0.5,
+     ) -> None:
+         super().__init__(p=p)
+-        self.std_range = std_range
+-        self.mean_range = mean_range
++        if not isinstance(var_limit, (tuple, list)):
++            var_limit = (0.0, var_limit)
++        if var_limit[0] < 0 or var_limit[1] < 0:
++            raise ValueError(f"var_limit must be non-negative, got {var_limit}.")
++        self.var_limit = (float(var_limit[0]), float(var_limit[1]))
++        self.mean = float(mean)
+         self.per_channel = per_channel
+ 
+     def get_params(
+         self, image: NDArray, keypoints: NDArray, bboxes: NDArray, rng: np.random.Generator
+     ) -> dict[str, Any]:
+-        std = float(rng.uniform(*self.std_range)) * 255.0
+-        mean = float(rng.uniform(*self.mean_range)) * 255.0
++        std = float(rng.uniform(*self.var_limit)) ** 0.5
+         shape = image.shape if self.per_channel else (*image.shape[:2], 1)
+-        return {"noise": rng.normal(mean, std, size=shape).astype(np.float32)}
++        return {"noise": rng.normal(self.mean, std, size=shape).astype(np.float32)}
+ 
+     def apply(self, image: NDArray, noise: NDArray | None = None, **params: Any) -> NDArray:
+         noisy = image.astype(np.float32) + noise
+diff --git a/deeplabcut/pose_estimation_pytorch/data/transforms.py b/deeplabcut/pose_estimation_pytorch/data/transforms.py
+index 2b7d8c0..c900050 100644
+--- a/deeplabcut/pose_estimation_pytorch/data/transforms.py
++++ b/deeplabcut/pose_estimation_pytorch/data/transforms.py
+@@ -150,8 +150,8 @@ def build_transforms(augmentations: dict) -> BaseCompose:
+             noise = 0.05 * 255
+         transforms.append(
+             GaussNoise(
+-                std_range=(0.0, noise / 255.0),
+-                mean_range=(0.0, 0.0),
++                var_limit=(0, noise**2),
++                mean=0,
+                 per_channel=True,
+                 p=0.5,
+             )
+diff --git a/tests/test_augmentation_geometry.py b/tests/test_augmentation_geometry.py
+index 96407ea..9f70d7c 100644
+--- a/tests/test_augmentation_geometry.py
++++ b/tests/test_augmentation_geometry.py
+@@ -300,10 +300,70 @@ def test_affine_scales_about_the_centre(affine_image):
+     _, kpts, boxes, _ = run(affine_pipeline(0, 2.0, 0), affine_image, AFFINE_KP, AFFINE_BB)
+     # a keypoint may leave the image; it keeps its coordinates
+     np.testing.assert_allclose(kpts[:, :2], [[-10.0, -10.0], [30.0, 20.0]], atol=1e-9)
+-    # boxes are clipped to the image at the end of the pipeline
++    # boxes are clipped to the image the transform leaves behind
+     np.testing.assert_allclose(boxes, [[0.0, 0.0, 30.0, 10.0]], atol=1e-9)
+ 
+ 
++# --------------------------------------------------------------------------------
++# a partial affine block
++# --------------------------------------------------------------------------------
++@pytest.mark.parametrize(
++    "affine_cfg, expected_kpts, expected_boxes",
++    [
++        # no scaling and no translation: both default to the identity, so this is the
++        # 90 degree rotation of test_affine_rotates_about_the_pixel_centre
++        ({"p": 1.0, "rotation": 90}, [[15.0, 40.0], [30.0, 20.0]], [[15.0, 20.0, 10.0, 20.0]]),
++        # no rotation and no scaling: the pure 7 px translation
++        ({"p": 1.0, "translation": 7}, [[17.0, 12.0], [37.0, 27.0]], [[17.0, 12.0, 20.0, 10.0]]),
++        # no rotation and no translation: the pure doubling about the centre
++        ({"p": 1.0, "scaling": [2.0, 2.0]}, [[-10.0, -10.0], [30.0, 20.0]], [[0.0, 0.0, 30.0, 10.0]]),
++        # only scaling left out
++        (
++            {"p": 1.0, "rotation": 90, "translation": 0},
++            [[15.0, 40.0], [30.0, 20.0]],
++            [[15.0, 20.0, 10.0, 20.0]],
++        ),
++    ],
++)
++def test_partial_affine_block_defaults_the_missing_parameters(
++    affine_image, affine_cfg, expected_kpts, expected_boxes
++):
++    """A key left out of the affine block is that parameter's identity.
++
++    ``config/data.py`` types the block ``dict | None`` and validates it by calling
++    ``build_transforms``, so a block naming only some of the three is a configuration
++    a user can write; albumentations answered it with scale 1, rotation 0 and no
++    translation rather than a ``TypeError``.
++    """
++    pipeline = build({"affine": affine_cfg})
++    transform = pipeline.transforms[0]
++    transform.p = 1.0
++    # pin only the parameters the block actually names; the others must come out of
++    # the constructor already set to the identity
++    if "rotation" in affine_cfg:
++        transform.rotate = (affine_cfg["rotation"], affine_cfg["rotation"])
++    if "translation" in affine_cfg:
++        transform.translate_px = (affine_cfg["translation"], affine_cfg["translation"])
++
++    _, kpts, boxes, _ = run(pipeline, affine_image, AFFINE_KP, AFFINE_BB)
++    np.testing.assert_allclose(kpts[:, :2], expected_kpts, atol=1e-9)
++    np.testing.assert_allclose(boxes, expected_boxes, atol=1e-9)
++
++
++def test_an_empty_affine_block_is_the_identity(affine_image):
++    """``affine: {}`` names nothing at all, so nothing is applied.
++
++    albumentations answered an entirely empty parameter set with a random scale,
++    translation, rotation *and shear* -- a surprise the vendored module does not
++    reproduce, and could not without a shear it has no other use for.
++    """
++    pipeline = build({"affine": {}})
++    pipeline.transforms[0].p = 1.0
++    _, kpts, boxes, _ = run(pipeline, affine_image, AFFINE_KP, AFFINE_BB)
++    np.testing.assert_allclose(kpts[:, :2], [[10.0, 5.0], [30.0, 20.0]], atol=1e-9)
++    np.testing.assert_allclose(boxes, [[10.0, 5.0, 20.0, 10.0]], atol=1e-9)
++
++
+ # --------------------------------------------------------------------------------
+ # crop_sampling
+ # --------------------------------------------------------------------------------
+@@ -459,6 +519,200 @@ def test_grayscale_blends_towards_the_luma_plane():
+     np.testing.assert_array_equal(T.Grayscale(alpha=0.0).apply(image), image)
+ 
+ 
++# --------------------------------------------------------------------------------
++# sampled parameters
++#
++# These two transforms only touch pixels, so there is no geometry to pin; what has
++# to match the reference is the distribution the parameter is drawn from. Both
++# alternatives below have the right support and the wrong density, which is exactly
++# the kind of difference that never raises and changes every batch.
++# --------------------------------------------------------------------------------
++def test_motion_blur_kernel_size_is_uniform_over_the_odd_sizes():
++    """albumentations drew uniformly from ``range(3, 8, 2)`` -- {3, 5, 7}, 1/3 each.
++
++    Drawing from every integer in [3, 7] and rounding even sizes up instead gives
++    0.20 / 0.40 / 0.40 and a mean kernel of 5.40 rather than 4.99: an 8% wider blur
++    on every image the transform fires on.
++    """
++    transform = aug.MotionBlur(blur_limit=(3, 7), p=1.0)
++    rng = np.random.default_rng(0)
++    image = np.zeros((16, 16, 3), np.uint8)
++    sizes = np.array(
++        [transform.get_params(image, np.zeros((0, 2)), np.zeros((0, 4)), rng)["kernel"].shape[0]
++         for _ in range(20000)]
++    )
++    assert set(np.unique(sizes)) == {3, 5, 7}
++    for k in (3, 5, 7):
++        assert abs((sizes == k).mean() - 1 / 3) < 0.02, f"P(ksize={k}) = {(sizes == k).mean():.3f}"
++    assert abs(sizes.mean() - 5.0) < 0.06, f"mean ksize = {sizes.mean():.3f}"
++
++
++def test_motion_blur_blur_limit_bounds_the_kernel():
++    """The limits are inclusive and the step is 2, so (3, 5) never yields 7."""
++    rng = np.random.default_rng(0)
++    image = np.zeros((16, 16, 3), np.uint8)
++    transform = aug.MotionBlur(blur_limit=(3, 5), p=1.0)
++    sizes = {transform.get_params(image, np.zeros((0, 2)), np.zeros((0, 4)), rng)["kernel"].shape[0]
++             for _ in range(200)}
++    assert sizes == {3, 5}
++
++
++def test_gauss_noise_sigma_is_the_root_of_a_uniform_variance():
++    """``gaussian_noise: 12.75`` becomes ``var_limit=(0, 12.75 ** 2)``.
++
++    The standard deviation of a draw is then ``sqrt(U(0, 12.75 ** 2))``, whose mean
++    is ``2 * 12.75 / 3 = 8.5`` and whose standard deviation is ``12.75 / sqrt(18) =
++    3.01``. Drawing the standard deviation uniformly over the same support instead
++    gives mean 6.375 and standard deviation 3.68 -- the same strongest and weakest
++    noise, about a quarter less of it on average, on every image the transform
++    fires on.
++    """
++    from scipy import stats
++
++    var_limit = 12.75 ** 2
++    transform = aug.GaussNoise(var_limit=(0.0, var_limit), mean=0.0, per_channel=True, p=1.0)
++    rng = np.random.default_rng(0)
++    # 16k samples per draw, so the sample standard deviation reads sigma back to
++    # about 0.6% and the comparison is against the drawn value, not an estimate of it
++    image = np.zeros((128, 128, 1), np.uint8)
++    sigmas = np.array(
++        [transform.get_params(image, np.zeros((0, 2)), np.zeros((0, 4)), rng)["noise"].std()
++         for _ in range(400)]
++    )
++    assert abs(sigmas.mean() - (2 / 3) * 12.75) < 0.25, f"mean sigma = {sigmas.mean():.3f}"
++    assert abs(sigmas.std() - 12.75 / np.sqrt(18)) < 0.25, f"std of sigma = {sigmas.std():.3f}"
++    assert sigmas.max() <= 12.75 * 1.02, f"max sigma = {sigmas.max():.3f}"
++    # P(sigma <= s) = s**2 / var_limit on [0, sqrt(var_limit)]
++    result = stats.kstest(sigmas, lambda s: np.clip(np.asarray(s, float) ** 2 / var_limit, 0.0, 1.0))
++    assert result.pvalue > 0.01, f"KS D = {result.statistic:.4f}, p = {result.pvalue:.4f}"
++
++
++def test_gaussian_noise_config_value_is_the_upper_standard_deviation():
++    """``gaussian_noise: 12.75`` is a standard deviation, so the variance limit is its square.
++
++    Passing the value through as a variance, or as a fraction of 255, silently
++    changes how much noise every image gets.
++    """
++    (transform,) = build({"gaussian_noise": 12.75}).transforms
++    assert isinstance(transform, aug.GaussNoise)
++    assert transform.var_limit == (0.0, 12.75 ** 2)
++    assert transform.mean == 0.0
++    assert transform.per_channel is True
++    # a non-numeric truthy value falls back to a standard deviation of 0.05 * 255
++    (fallback,) = build({"gaussian_noise": "yes"}).transforms
++    assert fallback.var_limit == (0.0, (0.05 * 255) ** 2)
++
++
++def test_gauss_noise_mean_is_in_grey_levels():
++    transform = aug.GaussNoise(var_limit=(0.0, 0.0), mean=7.0, p=1.0)
++    rng = np.random.default_rng(0)
++    noise = transform.get_params(np.zeros((64, 64, 1), np.uint8), np.zeros((0, 2)), np.zeros((0, 4)), rng)["noise"]
++    np.testing.assert_allclose(noise, 7.0)
++
++
++# --------------------------------------------------------------------------------
++# bounding boxes are clipped after every transform
++#
++# albumentations clipped boxes to the image, and dropped the ones left with no area,
++# after each transform in the pipeline rather than once against the final canvas.
++# The two only disagree when a transform moves the annotations *into* the frame
++# after an earlier one pushed them out -- which is exactly what the padding in
++# `crop_sampling` and in `auto_padding` does, both of which the shipped configs put
++# straight after `affine`. Every expected value below was measured on albumentations
++# 1.4.1.
++# --------------------------------------------------------------------------------
++CLIP_PAD = {
++    "auto_padding": {
++        "min_height": 96,
++        "min_width": 128,
++        "pad_height_divisor": None,
++        "pad_width_divisor": None,
++        "position": "center",
++        "border_mode": "constant",
++    }
++}
++
++
++def affine_then(rotate, translate, tail_cfg):
++    """``affine`` with pinned parameters, followed by whatever ``tail_cfg`` builds."""
++    pipeline = build(
++        {"affine": {"p": 1.0, "rotation": 0, "scaling": [1.0, 1.0], "translation": 0}, **tail_cfg}
++    )
++    transform = pipeline.transforms[0]
++    transform.rotate = (rotate, rotate)
++    transform.scale = (1.0, 1.0)
++    transform.translate_px = (translate, translate)
++    transform.p = 1.0
++    return pipeline
++
++
++def test_padding_after_an_affine_does_not_restore_the_part_that_left_the_frame(image):
++    """The box is pushed 5 px off the left edge, then padding moves it back inside.
++
++    Clipping only at the end returns ``(29, 33, 20, 10)``: the whole 20 px width,
++    5 px of which now lies in the black padding, over pixels the box never covered.
++    """
++    boxes = [(10.0, 20.0, 20.0, 10.0)]  # corners (10, 20, 30, 30), translated to (-5, 5, 15, 15)
++    img, _, out_boxes, labels = run(affine_then(0, -15, CLIP_PAD), image, KEYPOINTS, boxes)
++    assert img.shape == (96, 128, 3)
++    np.testing.assert_allclose(out_boxes, [[34.0, 33.0, 15.0, 10.0]], atol=1e-9)
++    assert labels == [0]
++
++
++def test_a_box_pushed_off_the_frame_is_dropped_before_the_padding(image):
++    """A box entirely outside the frame is gone, and takes its label with it.
++
++    Clipping only at the end keeps all three, because the padding puts the box that
++    left the frame back inside the final canvas.
++    """
++    boxes = [
++        (10.0, 20.0, 20.0, 10.0),  # -> (-5, 5, 15, 15): clipped to (0, 5, 15, 15)
++        (0.0, 0.0, 8.0, 8.0),  # -> (-15, -15, -7, -7): entirely outside, dropped
++        (30.0, 10.0, 25.0, 20.0),  # -> (15, -5, 40, 15): clipped to (15, 0, 40, 15)
++    ]
++    _, _, out_boxes, labels = run(affine_then(0, -15, CLIP_PAD), image, KEYPOINTS, boxes)
++    np.testing.assert_allclose(
++        out_boxes, [[34.0, 33.0, 15.0, 10.0], [49.0, 28.0, 25.0, 15.0]], atol=1e-9
++    )
++    assert labels == [0, 2]
++
++
++def test_rotation_then_padding_clips_the_enclosing_box_to_the_rotated_frame(image):
++    """A box covering the frame grows to 70 x 63 under a 30 degree rotation.
++
++    Clipped against the frame it comes back as the frame; carried past the padding
++    unclipped it keeps the whole enclosing box of the rotated corners.
++    """
++    boxes = [(10.0, 20.0, 20.0, 10.0), (0.0, 0.0, 59.0, 39.0)]
++    _, _, out_boxes, labels = run(affine_then(30, 0, CLIP_PAD), image, KEYPOINTS, boxes)
++    np.testing.assert_allclose(
++        out_boxes,
++        [
++            [46.862504626203446, 47.68301270189222, 22.320508075688764, 18.66025403784439],
++            [34.0, 28.0, 60.0, 40.0],
++        ],
++        atol=1e-8,
++    )
++    assert labels == [0, 1]
++
++
++def test_crop_sampling_padding_clips_the_same_way(image):
++    """The shipped ``crop_sampling`` block pads before it crops, so it does too.
++
++    ``aug_default.yaml`` asks for a 448 x 448 crop; any frame smaller than that in
++    either axis is padded up to it first, and the padding is what carries an
++    excursion back inside the canvas.
++    """
++    cfg = {"crop_sampling": {"width": 80, "height": 56, "max_shift": 0.1, "method": "uniform"}}
++    pipeline = affine_then(0, -15, cfg)
++    crop = pipeline.transforms[2]
++    crop.get_params = lambda image, keypoints, bboxes, rng: crop.crop_coords(image.shape[:2], 0.0, 0.0)
++
++    img, _, out_boxes, _ = run(pipeline, image, KEYPOINTS, [(10.0, 20.0, 20.0, 10.0)])
++    assert img.shape == (56, 80, 3)
++    np.testing.assert_allclose(out_boxes, [[10.0, 13.0, 15.0, 10.0]], atol=1e-9)
++
++
+ # --------------------------------------------------------------------------------
+ # Compose bookkeeping
+ # --------------------------------------------------------------------------------
+@@ -552,44 +806,3 @@ def test_compose_seed_does_not_repeat_the_same_augmentation():
+     assert not all(np.array_equal(outs[0], other) for other in outs[1:])
+ 
+ 
+-@pytest.mark.parametrize(
+-    "affine_cfg",
+-    [{"p": 1.0, "translation": 40}, {"p": 1.0, "rotation": 30}, {"p": 1.0, "rotation": 30, "translation": 0}],
+-)
+-@pytest.mark.xfail(strict=True, reason="a partial affine block raises TypeError instead of defaulting to the identity")
+-def test_partial_affine_block_defaults_the_missing_parameters(image, affine_cfg):
+-    """albumentations treated a missing rotation/scaling/translation as the identity."""
+-    pipeline = build({"affine": affine_cfg})
+-    run(pipeline, image, KEYPOINTS, BBOXES)
+-
+-
+-@pytest.mark.xfail(strict=True, reason="ksize is drawn from {3,4,5,6,7} then rounded up, so 3 is half as likely")
+-def test_motion_blur_kernel_size_is_uniform_over_the_odd_sizes():
+-    """albumentations drew uniformly from {3, 5, 7}; the vendored draw is 0.20/0.40/0.40."""
+-    transform = aug.MotionBlur(blur_limit=(3, 7), p=1.0)
+-    rng = np.random.default_rng(0)
+-    image = np.zeros((16, 16, 3), np.uint8)
+-    sizes = np.array(
+-        [transform.get_params(image, np.zeros((0, 2)), np.zeros((0, 4)), rng)["kernel"].shape[0]
+-         for _ in range(20000)]
+-    )
+-    for k in (3, 5, 7):
+-        assert abs((sizes == k).mean() - 1 / 3) < 0.02, f"P(ksize={k}) = {(sizes == k).mean():.3f}"
+-
+-
+-@pytest.mark.xfail(strict=True, reason="sigma is drawn uniformly instead of as the root of a uniform variance")
+-def test_gauss_noise_sigma_matches_the_reference_distribution():
+-    """``gaussian_noise: 12.75`` meant sigma = sqrt(U(0, 12.75**2)), mean 8.5.
+-
+-    The vendored transform draws sigma = 255 * U(0, 0.05), mean 6.375 -- the same
+-    support but about 24% less noise on average.
+-    """
+-    transform = aug.GaussNoise(std_range=(0.0, 12.75 / 255.0), p=1.0)
+-    rng = np.random.default_rng(0)
+-    # a large plane per draw, so the sample standard deviation is an unbiased read of sigma
+-    image = np.zeros((96, 96, 1), np.uint8)
+-    sigmas = np.array(
+-        [transform.get_params(image, np.zeros((0, 2)), np.zeros((0, 4)), rng)["noise"].std()
+-         for _ in range(300)]
+-    )
+-    assert abs(sigmas.mean() - (2 / 3) * 12.75) < 0.3, f"mean sigma = {sigmas.mean():.3f}"

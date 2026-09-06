@@ -1,0 +1,59 @@
+From 252183c22d35fbf5577bc5e9aa4ebf81ab06e340 Mon Sep 17 00:00:00 2001
+From: natsukium <tomoya.otabi@gmail.com>
+Date: Mon, 20 Jul 2026 22:37:22 +0900
+Subject: [PATCH] Estimate tracklet rank with a dense SVD instead of
+ interpolative SVD
+
+Tracklet stitching estimated a Hankelet's rank from its singular values via
+scipy.linalg.interpolative.svd. On NumPy 2 that randomized routine raises
+"array must not contain infs or NaNs" on finite input, so any stitching that
+computes tracklet affinities fails at runtime.
+
+Only the singular values matter, so use np.linalg.svd(compute_uv=False):
+exact, deterministic, identical on NumPy 1.22.4 and 2. It also returns zeros
+for an all-zero matrix instead of raising, making the #2827 guard against
+scipy>=1.11's all-zero ValueError redundant; it is removed.
+
+scipy is removing the backend's noncompliant randomization:
+https://github.com/scipy/scipy/issues/18367
+Backported from upstream DeepLabCut, which carries this on the `dev`
+branch but has not yet released it:
+https://github.com/DeepLabCut/DeepLabCut/commit/252183c22d35fbf5577bc5e9aa4ebf81ab06e340
+
+---
+ deeplabcut/refine_training_dataset/stitch.py | 12 ++++--------
+ 1 file changed, 4 insertions(+), 8 deletions(-)
+
+diff --git a/deeplabcut/refine_training_dataset/stitch.py b/deeplabcut/refine_training_dataset/stitch.py
+index 3307aac6..f6596367 100644
+--- a/deeplabcut/refine_training_dataset/stitch.py
++++ b/deeplabcut/refine_training_dataset/stitch.py
+@@ -22,7 +22,6 @@ import matplotlib.pyplot as plt
+ import networkx as nx
+ import numpy as np
+ import pandas as pd
+-import scipy.linalg.interpolative as sli
+ from networkx.algorithms.flow import preflow_push
+ from scipy.linalg import hankel
+ from scipy.spatial.distance import directed_hausdorff
+@@ -384,13 +383,10 @@ class Tracklet:
+         4/sqrt(3)
+         """
+         mat = self.to_hankelet()
+-        if np.any(mat):  # check that the matrix contains non-zero entries
+-            # nrows, ncols = mat.shape
+-            # beta = nrows / ncols
+-            # omega = 0.56 * beta ** 3 - 0.95 * beta ** 2 + 1.82 * beta + 1.43
+-            _, s, _ = sli.svd(mat, min(10, min(mat.shape)))
+-        else:
+-            s = np.zeros(min(10, min(mat.shape)))
++        # nrows, ncols = mat.shape
++        # beta = nrows / ncols
++        # omega = 0.56 * beta ** 3 - 0.95 * beta ** 2 + 1.82 * beta + 1.43
++        s = np.linalg.svd(mat, compute_uv=False)[:10]
+ 
+         # return np.argmin(s > omega * np.median(s))
+         eigen = s**2
+-- 
+2.55.0
+

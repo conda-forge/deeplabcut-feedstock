@@ -1,86 +1,173 @@
 context:
-  version: 2.3.11
+  version: 3.0.1
 
 package:
   name: deeplabcut
   version: ${{ version }}
 
 source:
-  url: https://pypi.org/packages/source/d/deeplabcut/deeplabcut-${{ version }}.tar.gz
-  sha256: 0d77464eeb984a702d8b25f28ecc4444baef73b7bec72d79e2f00fecda188189
-  patches:
-    - patches/0001-Do-not-install-download-script.patch
-    - patches/0002-Silence-warnings-about-DLC-lite-mode.patch
-    - patches/0003-Do-not-modify-tensorflow-warnings.patch
-    - patches/0004-Silence-warnings-about-missing-pytorch.patch
-    - patches/0005-Use-qtpy-instead-of-PySide6.patch
-    - patches/0006-Remove-hard-dependency-on-torch.patch
-    - patches/0007-Lazy-Import-pyqt-and-default-to-PySide6.patch
-    - patches/0008-add-outputs-for-multi-animal-model-export.patch
-    - patches/0009-Loosen-dependencies.patch
+  - url: https://pypi.org/packages/source/d/deeplabcut/deeplabcut-${{ version }}.tar.gz
+    sha256: 4c33c8ff4dc15b26f7844945aef5542c2a0055c8ed663040e6ab8dd253e71a52
+    patches:
+      # https://github.com/DeepLabCut/DeepLabCut/commit/c8689e6d6b203339d1d68d6def3709ebe6787240
+      - patches/0001-Move-imgaug-from-core-dependencies-to-TensorFlow-ext.patch
+      # https://github.com/DeepLabCut/DeepLabCut/commit/1107360d59f813341b3222d71c15b3a79f899daa
+      - patches/0002-Replace-NumPy-2.0-removed-array-APIs-with-supported-.patch
+      # https://github.com/DeepLabCut/DeepLabCut/commit/252183c22d35fbf5577bc5e9aa4ebf81ab06e340
+      - patches/0003-Estimate-tracklet-rank-with-a-dense-SVD-instead-of-i.patch
+      # https://github.com/DeepLabCut/DeepLabCut/commit/aafaa2e7df392234f53d18422b21b8a2f7e2c13f
+      - patches/0004-Guard-CoW-read-only-.to_numpy-.values-mutations-3362.patch
+      # https://github.com/DeepLabCut/DeepLabCut/commit/18bc897c
+      - patches/0005-Guard-remaining-CoW-read-only-.to_numpy-.values-mutat.patch
+      # https://github.com/DeepLabCut/DeepLabCut/commit/7c997771a5326588363563306be2d9a9cdea5ed0
+      - patches/0006-Add-copy-True-to-to_numpy-in-evaluate_multianimal-pea.patch
+      - patches/0007-Use-qtpy-instead-of-PySide6.patch
+      - patches/0008-Add-outputs-required-for-multi-animal-model-export.patch
+      - patches/0009-Loosen-dependency-bounds.patch
+      - patches/0010-Replace-albumentations-with-a-vendored-augmentation-.patch
+      - patches/0011-Fix-Path-str-confusion-left-over-from-the-pathlib-mi.patch
+      - patches/0012-Release-the-TensorFlow-session-when-video-analysis-f.patch
+      - patches/0013-Use-batch-norm-moving-averages-at-inference-in-the-M.patch
+      - patches/0014-Make-MobileNet-inference-independent-of-batch-compos.patch
+      - patches/0015-Port-the-ResNet-and-MuNet-pose-nets-to-eager-TensorF.patch
+      - patches/0016-Derive-the-score-map-size-the-way-the-networks-actua.patch
+      - patches/0017-Remove-tf.compat.v1-from-the-TensorFlow-entry-points.patch
+      - patches/0018-Port-the-multi-animal-training-loop-to-eager-Tensor.patch
+      - patches/0019-Keep-the-caller-s-pose_cfg-out-of-Keras-attribute-tr.patch
+      - patches/0020-Remove-tf.compat.v1-from-the-pose-engine.patch
+      - patches/0021-Port-the-EfficientNet-backbone-to-eager-TensorFlow-2.patch
+      - patches/0022-Drop-the-eager-engine-s-config-copy-workaround.patch
+      - patches/0023-Replace-nnets-base.py-s-tf.compat.v1-losses-and-stop.patch
+      - patches/0024-Port-the-MobileNet-backbone-to-eager-TensorFlow-2-Ke.patch
+      - patches/0025-Dispatch-multi-animal-TensorFlow-training-on-the-pos.patch
+      - patches/0026-Set-training-logging-up-before-the-config-is-read.patch
+      - patches/0027-Restore-EfficientNet-ImageNet-weights-in-the-eager-t.patch
+      - patches/0028-Cover-the-EfficientNet-and-MobileNet-Keras-ports-in-.patch
+      - patches/0029-Fail-the-run-when-the-TensorFlow-tests-are-skipped-w.patch
+      - patches/0030-Test-the-Path-str-boundaries-fixed-in-the-pathlib-fo.patch
+      - patches/0032-Cover-the-vendored-augmentation-module-s-geometry.patch
+      - patches/0033-Restore-the-augmentation-behaviour-albumentations-1.patch
+      - patches/0034-Replace-matplotlib.cm.get_cmap-removed-in-matplotlib.patch
+      - patches/0035-Replace-the-pandas-APIs-pandas-3.0-changed-or-deleted.patch
+
+  - url: https://github.com/DeepLabCut/DeepLabCut/archive/refs/tags/v${{ version }}.tar.gz
+    sha256: e25a98a352d8afd32e1f08d936a339dc1e79dc5979bd0edf407d1f4f49b5f20f
+    target_directory: upstream
+    patches:
+      - patches/0031-Point-the-augmentation-tests-at-the-vendored-augment.patch
 
 build:
-  # Confirm with upstream before making this entry point
-  # https://github.com/DeepLabCut/DeepLabCut/pull/1547
-  number: 1
+  number: 0
   noarch: python
-  script: ${{ PYTHON }} -m pip install . -vv --no-deps
+  script: ${{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
   python:
     entry_points:
-      - dlc = deeplabcut.cli:main
       - deeplabcut = deeplabcut.gui.launch_script:launch_dlc
 
 requirements:
   host:
-    - python  ${{ python_min }}.*
+    - python ${{ python_min }}.*
     - pip
+    - setuptools >=61
   run:
-    - python  >=${{ python_min }}
-    - setuptools
-    - dlclibrary >=0.0.6
+    - python >=${{ python_min }}
+    - dlclibrary >=0.0.12
+    - einops
+    - filelock >=3.12
     - filterpy >=1.4.4
-    - ruamel.yaml >=0.15.0
+    - huggingface_hub >=0.23
     - imageio-ffmpeg
-    - imgaug >=0.4.0
-    - numba >=0.54
     - matplotlib-base >=3.3,!=3.7.0,!=3.7.1
     - networkx >=2.6
-    # I (hmaarrfk) am going to ignore their numpy less than 2 pin
-    # https://github.com/DeepLabCut/DeepLabCut/pull/2827#issuecomment-2663911081
-    - numpy >=1.18.5
-    - pandas >=1.0.1,!=1.5.0
+    - numba >=0.54
+    - numpy >=1.22.4
+    - opencv
+    - packaging >=26
+    - pandas >=2.2
+    - bottleneck
+    - numexpr
+    - pillow >=7.1
+    - pycocotools
+    - pydantic >=2
+    - pytables >=3.8.0
+    - pytorch >=2
     - pyyaml
+    - ruamel.yaml >=0.15.0
     - scikit-image >=0.17
     - scikit-learn >=1.0
-    # They actually have a lowerbound on scipy 1.9 but I feel like scipy 1.9 is
-    # a little buggy on conda-forge
     - scipy >=1.10
     - statsmodels >=0.11
-    - pytables >=3.8.0
-    - tf_slim >=1.1.0
-    - tensorpack >=0.11
+    - timm
+    - torchvision
     - tqdm
-    - pillow >=7.1
-    # They don't explicitely depend on opencv in their requirements
-    # but they import it...
-    - opencv
   run_constraints:
     - napari-deeplabcut >=0.2.1.6
-    - tensorflow >=2.0
+    - qtpy >=2.0
+    - qdarkstyle >=3.1
+    - tensorflow >=2.12
+    - tf-keras >=2.15
+    - imgaug >=0.4
+    - tensorpack >=0.11
+    - tf_slim >=1.1
 
 tests:
+  - python:
+      imports:
+        - deeplabcut
+        - deeplabcut.pose_estimation_pytorch.data.augmentation
+        - deeplabcut.pose_estimation_pytorch.data.transforms
+        - deeplabcut.post_processing.filtering
+        - deeplabcut.pose_estimation_3d.triangulation
+        - deeplabcut.refine_training_dataset.stitch
+        - deeplabcut.utils.make_labeled_video
+      pip_check: true
+      python_version:
+        - ${{ python_min }}.*
+        - "*"
   - script:
-      - pip check
-      - python -c "import deeplabcut"
+      - dlc --help
+      - python -m pytest -v
+        upstream/tests/pose_estimation_pytorch/data/test_preprocessor.py
+        upstream/tests/pose_estimation_pytorch/data/test_transforms.py
+    files:
+      source:
+        - upstream/tests/pose_estimation_pytorch/data/test_preprocessor.py
+        - upstream/tests/pose_estimation_pytorch/data/test_transforms.py
     requirements:
       run:
-        - pip
         - python ${{ python_min }}.*
-        # Avoid opengl requirements
         - opencv *headless*
+        - pytest
+  - script:
+      - python -c "import deeplabcut"
+      - python -c "import deeplabcut.pose_estimation_tensorflow"
+      - python -c "import deeplabcut.gui.launch_script"
+      - python -m pytest -v -p no:napari
+        tests/test_nnets_efficientnet_keras.py
+        tests/test_nnets_keras.py
+        tests/test_nnets_keras_equivalence.py
+        tests/test_nnets_keras_mobilenet.py
+        tests/test_nnets_losses.py
+      - python -m pytest -v -p no:napari tests/test_path_str_boundaries.py
+    files:
+      source:
+        - tests/
+    requirements:
+      run:
+        - opencv *headless*
+        - napari-deeplabcut >=0.2.1.6
+        - qtpy >=2.0
+        - qdarkstyle >=3.1
+        - pyside6
+        - tensorflow >=2.12
+        - tf-keras >=2.15
+        - imgaug >=0.4
+        - tensorpack >=0.11
+        - tf_slim >=1.1
+        - pytest
 
 about:
-  license: LGPL-3.0-only
+  license: LGPL-3.0-or-later
   license_file: LICENSE
   summary: DeepLabCut is a toolbox for markerless pose estimation of animals performing various tasks.
   homepage: https://www.deeplabcut.org

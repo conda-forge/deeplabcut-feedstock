@@ -5,7 +5,7 @@ Feedstock license: [BSD-3-Clause](https://github.com/conda-forge/deeplabcut-feed
 
 Home: https://www.deeplabcut.org/
 
-Package license: LGPL-3.0-only
+Package license: LGPL-3.0-or-later
 
 Summary: DeepLabCut is a toolbox for markerless pose estimation of animals performing various tasks.
 
@@ -42,31 +42,73 @@ conda config --add channels conda-forge
 conda config --set channel_priority strict
 ```
 
-Once the `conda-forge` channel has been enabled, `deeplabcut` can be installed with `conda`:
+How to use
+----------
+
+<details>
+<summary>With conda</summary>
 
 ```
 conda install deeplabcut
 ```
 
-or with `mamba`:
+</details>
+
+<details>
+<summary>With mamba</summary>
 
 ```
 mamba install deeplabcut
 ```
 
-It is possible to list all of the versions of `deeplabcut` available on your platform with `conda`:
+</details>
+
+<details>
+<summary>With pixi</summary>
+
+```
+# for adding to your local project
+pixi add deeplabcut
+# for installing globally
+pixi global install deeplabcut
+```
+
+</details>
+
+Search package versions
+-----------------------
+
+It is possible to list all of the versions of `deeplabcut` available on your platform:
+
+<details>
+<summary>With conda</summary>
 
 ```
 conda search deeplabcut --channel conda-forge
 ```
 
-or with `mamba`:
+</details>
+
+<details>
+<summary>With mamba</summary>
 
 ```
 mamba search deeplabcut --channel conda-forge
 ```
 
-Alternatively, `mamba repoquery` may provide more information:
+</details>
+
+<details>
+<summary>With pixi</summary>
+
+```
+pixi search deeplabcut --channel conda-forge
+```
+
+</details>
+
+<details>
+<summary>With mamba repoquery, which may provide more information</summary>
 
 ```
 # Search all versions available on your platform:
@@ -78,6 +120,8 @@ mamba repoquery whoneeds deeplabcut --channel conda-forge
 # List dependencies of `deeplabcut`:
 mamba repoquery depends deeplabcut --channel conda-forge
 ```
+
+</details>
 
 
 About conda-forge

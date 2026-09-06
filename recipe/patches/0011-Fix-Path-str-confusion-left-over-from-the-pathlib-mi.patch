@@ -1,0 +1,265 @@
+From 403b4f2e32522a7c956383b4a199c1893fc306df Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Fri, 4 Sep 2026 20:02:00 -0400
+Subject: [PATCH] Fix Path/str confusion left over from the pathlib migration
+
+Single-animal TensorFlow `analyze_videos` fails outright on every platform:
+
+    cv2.error: OpenCV(4.9.0) :-1: error: (-5:Bad argument) in function 'VideoCapture'
+    > Overload resolution failed:
+    >  - Can't convert object of type 'PosixPath' to 'str' for 'filename'
+
+`collect_video_paths()` returns `list[Path]`, and `compat.analyze_videos`
+additionally coerces every user-supplied video with `_coerce_video_paths`
+before dispatching, but `AnalyzeVideo` hands that value straight to
+`cv2.VideoCapture`, which only accepts `str`. Every other cv2 call site in
+the tree already casts -- `auxfun_videos.py`, `pseudo_label.py`,
+`pose_estimation_pytorch/data/image.py` -- so this one was simply missed.
+
+That crash is one instance of a class of defect: values that became `Path`
+in the pathlib migration now reach APIs, dict keys and string methods that
+still expect `str` (and, in one case, the reverse). Upstream's own sweep --
+f6b0effa15c3 "Harden path-handling after pathlib migration (#3421)", which
+shipped in 3.0.1 -- missed all of the following. Every one of them except
+the `extract_frames` filter is still unfixed on the upstream `dev` branch;
+see the note on that one below.
+
+* pose_estimation_tensorflow/predict_videos.py, `AnalyzeVideo`
+
+  `cv2.VideoCapture(video)`. Hard crash; single-animal TensorFlow video
+  analysis is unusable. The multi-animal branch is unaffected because
+  `AnalyzeMultiAnimalVideo` normalises with `Path(video)` and then calls
+  `VideoWriter(str(video))`.
+
+* refine_training_dataset/outlier_frames.py, `ExtractFramesbasedonPreselection`
+
+  `cfg["video_sets"].get(video)` with a `Path`. `video_sets` is keyed by
+  `str`: `create_project/new.py` writes `os.fspath(...)` and `ProjectConfig`
+  types it `dict[str, Any]`. The lookup therefore silently returns `None`
+  and the per-video crop is dropped, so outlier frames are extracted
+  uncropped and labels are plotted at un-offset coordinates. Silently wrong
+  output rather than a crash, and only when `cropping: true`.
+  `_read_video_specific_cropping_margins`, in the same file, already does
+  the same lookup correctly with `str(video_path)`.
+
+* refine_training_dataset/outlier_frames.py, `find_outliers_in_raw_data`
+
+  `pickle_file.endswith(...)` on a parameter annotated `str | Path`, so the
+  documented `Path` half of the annotation raises `AttributeError`.
+
+* utils/conversioncode.py, `analyze_videos_converth5_to_csv` and
+  `analyze_videos_converth5_to_nwb`
+
+  The `listofvideos=True` branch passes the caller's list through unchanged
+  while `_convert_h5_files_to` was migrated to `Path` and now uses
+  `video.name` and `video.stem`, so a list of `str` -- exactly what the
+  docstring describes -- raises `AttributeError`. This is the mirror image
+  of the same confusion.
+
+* pose_estimation_tensorflow/modelzoo/api/superanimal_inference.py,
+  `_video_inference_superanimal`
+
+  `video.split(".")[-1]` on an element of `videos`, which
+  `modelzoo/video_inference.py` never coerces, so a `Path` raises
+  `AttributeError`. `Path.suffix` is also more correct than splitting on
+  the last dot in the whole path.
+
+* utils/plotting.py, `plot_trajectories`
+
+  `",".join(failures)` where `failures` collects elements of the `Path`
+  list returned by `collect_video_paths`. `TypeError` instead of the
+  diagnostic the branch exists to print, on the very common "you have not
+  run `analyze_videos` yet / wrong scorer / wrong track_method" path, and
+  after all the per-video work is already done.
+
+* generate_training_dataset/frame_extraction.py, `extract_frames`
+
+  `[v for v in cfg["video_sets"] if v in videos_list]` compares `str`
+  config keys against the caller's `videos_list`. The GUI stores selected
+  videos as `set[Path]` (`gui/window.py`, `self.files: set[Path]`) and
+  passes that set straight through, so nothing ever matches, the extraction
+  loop never runs, and `all([])` is `True` -- the user is told "Frame
+  extraction failed. Video files must be corrupted." about perfectly good
+  videos. Silently wrong, and it is the GUI's normal Extract Frames path.
+  `create_project/add.py` shows the intended type: it passes
+  `[os.fspath(video) for video in videos]`. The same comparison in the
+  `mode="match"` branch is corrected too.
+
+  This is the one item here that upstream has since fixed, in #3449 on
+  `dev` (after 3.0.1). That fix is not backported verbatim because it
+  arrives as a 202/-129 line rewrite of the module that also introduces a
+  new `ValueError` on an unmatched selection; what is taken from it is its
+  normalisation, comparing `Path(video)` on both sides, so the behaviour
+  here matches upstream's `_filter_config_videos` without the rewrite or
+  the new exception.
+
+* gui/tabs/create_videos.py
+
+  `", ".join(failed_videos)` over the same `set[Path]`; `TypeError` in the
+  handler, which also skips the `plot_trajectories` call that follows it.
+  Reached simply by running the tab twice on the same video, since
+  `proc_video` returns `None` when the labeled video already exists.
+
+Each fix normalises at the boundary that carries the requirement, matching
+what the surrounding code already does, instead of changing what
+`collect_video_paths` returns or sprinkling casts through the callers. In
+particular the TensorFlow branch is explicitly excluded from the pathlib
+migration upstream (see the note on `_normalize_image_path` in
+pose_estimation_tensorflow/datasets/utils.py), so casting to `str` at the
+point of use is the idiom it already follows.
+
+Verified by running DeepLabCut's own
+examples/testscript_tensorflow_single_animal.py (project creation, frame
+extraction, training, evaluation, `analyze_videos` with and without dynamic
+cropping and with direct cropping, `create_labeled_video`,
+`plot_trajectories`, `extract_outlier_frames`, `merge_datasets`,
+`analyzeskeleton`, `filterpredictions`) and
+examples/testscript_tensorflow_multi_animal.py end to end, plus the
+project's pytest suite.
+---
+ .../generate_training_dataset/frame_extraction.py     |  6 ++++--
+ deeplabcut/gui/tabs/create_videos.py                  |  2 +-
+ .../modelzoo/api/superanimal_inference.py             |  2 +-
+ .../pose_estimation_tensorflow/predict_videos.py      |  2 +-
+ deeplabcut/refine_training_dataset/outlier_frames.py  | 11 ++++++-----
+ deeplabcut/utils/conversioncode.py                    |  4 ++--
+ deeplabcut/utils/plotting.py                          |  2 +-
+ 7 files changed, 16 insertions(+), 13 deletions(-)
+
+diff --git a/deeplabcut/generate_training_dataset/frame_extraction.py b/deeplabcut/generate_training_dataset/frame_extraction.py
+index 7f7b22d..3b48104 100755
+--- a/deeplabcut/generate_training_dataset/frame_extraction.py
++++ b/deeplabcut/generate_training_dataset/frame_extraction.py
+@@ -237,7 +237,8 @@ def extract_frames(
+     if videos_list is None:
+         videos = list(cfg.get("video_sets_original") or cfg["video_sets"])
+     else:  # filter video_list by the ones in the config file
+-        videos = [v for v in cfg["video_sets"] if v in videos_list]
++        selected = {Path(v) for v in videos_list}
++        videos = [v for v in cfg["video_sets"] if Path(v) in selected]
+ 
+     if mode == "manual":
+         from deeplabcut.gui.widgets import launch_napari
+@@ -429,7 +430,8 @@ def extract_frames(
+         print("Config file read successfully.")
+         videos = sorted(cfg["video_sets"].keys())
+         if videos_list is not None:  # filter video_list by the ones in the config file
+-            videos = [v for v in videos if v in videos_list]
++            selected = {Path(v) for v in videos_list}
++            videos = [v for v in videos if Path(v) in selected]
+         project_path = Path(config).parents[0]
+         labels_path = project_path / "labeled-data"
+         try:
+diff --git a/deeplabcut/gui/tabs/create_videos.py b/deeplabcut/gui/tabs/create_videos.py
+index 6cc45c2..2327c61 100644
+--- a/deeplabcut/gui/tabs/create_videos.py
++++ b/deeplabcut/gui/tabs/create_videos.py
+@@ -276,7 +276,7 @@ class CreateVideos(DefaultTab):
+             self.root.writer.write("Labeled videos created.")
+         else:
+             failed_videos = [video for success, video in zip(videos_created, videos, strict=False) if not success]
+-            failed_videos_str = ", ".join(failed_videos)
++            failed_videos_str = ", ".join(str(video) for video in failed_videos)
+             self.root.writer.write(f"Failed to create videos from {failed_videos_str}.")
+ 
+         if self.plot_trajectories.isChecked():
+diff --git a/deeplabcut/pose_estimation_tensorflow/modelzoo/api/superanimal_inference.py b/deeplabcut/pose_estimation_tensorflow/modelzoo/api/superanimal_inference.py
+index d8157fe..25bbc74 100644
+--- a/deeplabcut/pose_estimation_tensorflow/modelzoo/api/superanimal_inference.py
++++ b/deeplabcut/pose_estimation_tensorflow/modelzoo/api/superanimal_inference.py
+@@ -486,7 +486,7 @@ def _video_inference_superanimal(
+             video,
+             superanimal_name,
+             modelfolder=str(modelfolder),
+-            video_extensions=video.split(".")[-1],
++            video_extensions=Path(video).suffix.lstrip("."),
+             scale_list=scale_list,
+         )
+         if not video_adapt:
+diff --git a/deeplabcut/pose_estimation_tensorflow/predict_videos.py b/deeplabcut/pose_estimation_tensorflow/predict_videos.py
+index ddb2845..a083b99 100644
+--- a/deeplabcut/pose_estimation_tensorflow/predict_videos.py
++++ b/deeplabcut/pose_estimation_tensorflow/predict_videos.py
+@@ -925,7 +925,7 @@ def AnalyzeVideo(
+         _ = auxiliaryfunctions.load_analyzed_data(destfolder, vname, DLCscorer)
+     except FileNotFoundError as e:
+         print("Loading ", video)
+-        cap = cv2.VideoCapture(video)
++        cap = cv2.VideoCapture(str(video))
+         if not cap.isOpened():
+             raise OSError("Video could not be opened. Please check the file integrity.") from e
+         # https://docs.opencv.org/2.4/modules/highgui/doc/reading_and_writing_images_and_video.html#videocapture-get
+diff --git a/deeplabcut/refine_training_dataset/outlier_frames.py b/deeplabcut/refine_training_dataset/outlier_frames.py
+index 63efbb1..8ae8584 100644
+--- a/deeplabcut/refine_training_dataset/outlier_frames.py
++++ b/deeplabcut/refine_training_dataset/outlier_frames.py
+@@ -69,17 +69,18 @@ def find_outliers_in_raw_data(
+     if extraction_algo not in ("kmeans", "uniform"):
+         raise ValueError(f"Unsupported extraction algorithm {extraction_algo}.")
+ 
++    pickle_file = Path(pickle_file)
+     video_name = Path(video_file).stem
+-    pickle_name = Path(pickle_file).stem
++    pickle_name = pickle_file.stem
+     if not pickle_name.startswith(video_name):
+         raise ValueError("Video and pickle files do not match.")
+ 
+-    with Path(pickle_file).open("rb") as file:
++    with pickle_file.open("rb") as file:
+         data = pickle.load(file)
+-    if pickle_file.endswith("_full.pickle"):
++    if pickle_file.name.endswith("_full.pickle"):
+         inds, data = find_outliers_in_raw_detections(data, threshold=pcutoff)
+         with_annotations = False
+-    elif pickle_file.endswith("_assemblies.pickle"):
++    elif pickle_file.name.endswith("_assemblies.pickle"):
+         assemblies = dict()
+         for k, lst in data.items():
+             if k == "single":
+@@ -698,7 +699,7 @@ def ExtractFramesbasedonPreselection(
+         duration = clip.duration
+ 
+     if cfg["cropping"]:  # one might want to adjust
+-        coords = (cfg["video_sets"].get(video) or {}).get("crop")
++        coords = (cfg["video_sets"].get(str(video)) or {}).get("crop")
+         if coords is not None:
+             coords = list(map(int, coords.split(", ")))
+     else:
+diff --git a/deeplabcut/utils/conversioncode.py b/deeplabcut/utils/conversioncode.py
+index ec1414b..a8125f1 100644
+--- a/deeplabcut/utils/conversioncode.py
++++ b/deeplabcut/utils/conversioncode.py
+@@ -232,7 +232,7 @@ def analyze_videos_converth5_to_csv(video_folder, videotype=".mp4", listofvideos
+             )
+     """
+     if listofvideos:  # can also be called with a list of videos (from GUI)
+-        videos = video_folder  # GUI gives a list of videos
++        videos = [Path(v) for v in video_folder]  # GUI gives a list of videos
+         if len(videos) > 0:
+             h5_files = collect_video_paths(Path(videos[0]).parent, extensions=".h5")
+         else:
+@@ -269,7 +269,7 @@ def analyze_videos_converth5_to_nwb(
+             )
+     """
+     if listofvideos:  # can also be called with a list of videos (from GUI)
+-        videos = video_folder  # GUI gives a list of videos
++        videos = [Path(v) for v in video_folder]  # GUI gives a list of videos
+         if len(videos) > 0:
+             h5_files = collect_video_paths(Path(videos[0]).parent, extensions=".h5")
+         else:
+diff --git a/deeplabcut/utils/plotting.py b/deeplabcut/utils/plotting.py
+index 48ae871..f6d7a46 100644
+--- a/deeplabcut/utils/plotting.py
++++ b/deeplabcut/utils/plotting.py
+@@ -317,7 +317,7 @@ def plot_trajectories(
+ 
+     if len(failures) > 0:
+         # Some videos were not evaluated.
+-        failed_videos = ",".join(failures)
++        failed_videos = ",".join(str(video) for video in failures)
+         if len(multianimal_errors) > 0:
+             verbose_error = ": " + " ".join(multianimal_errors)
+         else:
+-- 
+2.55.0
+

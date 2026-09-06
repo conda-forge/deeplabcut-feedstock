@@ -1,0 +1,223 @@
+From 52ef926b4eb304f1ae8e2f606d9c00b9a20f412b Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 08:13:58 -0400
+Subject: [PATCH] Remove tf.compat.v1 from the TensorFlow entry points and
+ tests
+
+Seven of the tree's tf.compat.v1 references live outside the network and
+training/inference code that the other TF2 patches rewrite: four graph
+resets in the evaluation, visualisation and training entry points, one
+logging call in the package __init__, and four Session uses in the tests.
+None of them needs a v1 shim; each has a supported TF2 spelling that this
+patch swaps in, and the behaviour is unchanged.
+
+tf.compat.v1.reset_default_graph() -> tf.keras.backend.clear_session().
+The six call sites (core/evaluate.py, core/evaluate_multianimal.py,
+visualizemaps.py, training.py) all do the same thing: drop the graph
+before building a model, and drop it again between successive snapshots
+so ops do not accumulate across an evaluation loop.  clear_session() is
+the documented TF2 replacement for exactly that pattern, it calls
+reset_default_graph() itself while eager execution is disabled, and it is
+already the idiom this codebase uses -- predict_videos.py:223 has called
+tf.keras.backend.clear_session() since before any of these patches.  The
+only observable difference is that the fresh graph carries the two Keras
+learning-phase ops that clear_session() re-creates, which the old code
+would have created lazily on the first Keras layer anyway.
+
+tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR) ->
+tf.get_logger().setLevel(logging.ERROR).  tf.compat.v1.logging is a thin
+wrapper over the "tensorflow" Python logger and its level constants are
+the logging module's own, so the two forms are the same call.  Measured
+after importing deeplabcut.pose_estimation_tensorflow, before and after:
+logger level 40, tf.compat.v1.logging.get_verbosity() 40, propagate True,
+one StreamHandler; an INFO and a WARNING record are dropped and an ERROR
+record is emitted, identically in both.
+
+tf.compat.v1.Session() -> tf.keras.backend.get_value() in
+tests/test_predict_multianimal.py and tests/test_tf_install_smoke.py.
+find_local_peak_indices_maxpool_nms is built from tf.nn.max_pool2d,
+tf.equal and tf.where, so it returns an eager tensor as soon as eager
+execution is on and there is nothing for a Session to run.  The old form
+was a latent dependency on core/train.py disabling eager execution
+process-wide at import: with that call removed, the three
+test_predict_multianimal tests fail with "RuntimeError: The Session graph
+is empty".  get_value() reads the tensor in either mode, so the tests
+pass both as the tree stands today and once eager execution comes back.
+
+Evidence, all on a container with tensorflow 2.15.0 and tf_keras 2.15.0.
+
+evaluate_network on a trained resnet_50 single-animal project and a
+trained dlcrnetms5 multi-animal project, before and after: the prediction
+h5 files are bit-identical (max abs diff 0.0), and CombinedEvaluation-
+results.csv, the per-shuffle results csv, dist_5.csv and the full
+detection pickle are byte-identical.  Reported errors are unchanged --
+"train error: 309.25 pixels. Test error: 292.41 pixels" both times.
+
+extract_maps on the same project hashes to
+d157323bdb3b1d22d42d8265847474c9cc51fff7dfb6a53e3c11b47780580d0b over
+three runs before and three runs after with TF_ENABLE_ONEDNN_OPTS=0.
+With oneDNN left on, that hash alternates between two values run to run
+regardless of which version of the code is installed -- a scoremap sum of
+199.099339 versus 199.0993365, 1.3e-8 relative -- so the difference is
+oneDNN's own summation order, not this change.
+
+train_network for two iterations on the same project succeeds before and
+after, and return_train_network_path returns the same three paths.
+
+The test suite (excluding gui/, which needs Qt, and tools/, which does
+not import) gives 3368 passed, 15 failed, 30 skipped, 5 xfailed both
+before and after, with the same 15 failures -- missing test data and
+pytorch dataset tests, none of them related.
+---
+ deeplabcut/pose_estimation_tensorflow/__init__.py        | 4 +++-
+ deeplabcut/pose_estimation_tensorflow/core/evaluate.py   | 4 ++--
+ .../core/evaluate_multianimal.py                         | 4 ++--
+ deeplabcut/pose_estimation_tensorflow/training.py        | 2 +-
+ deeplabcut/pose_estimation_tensorflow/visualizemaps.py   | 2 +-
+ tests/test_predict_multianimal.py                        | 9 +++------
+ tests/test_tf_install_smoke.py                           | 6 +-----
+ 7 files changed, 13 insertions(+), 18 deletions(-)
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/__init__.py b/deeplabcut/pose_estimation_tensorflow/__init__.py
+index 31282b7..fff1136 100644
+--- a/deeplabcut/pose_estimation_tensorflow/__init__.py
++++ b/deeplabcut/pose_estimation_tensorflow/__init__.py
+@@ -13,11 +13,13 @@
+ #
+ 
+ # Suppress tensorflow warning messages
++import logging
++
+ import tensorflow as tf
+ 
+ from . import _tf_legacy
+ 
+-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
++tf.get_logger().setLevel(logging.ERROR)
+ 
+ from deeplabcut.pose_estimation_tensorflow.config import *
+ from deeplabcut.pose_estimation_tensorflow.core.evaluate import *
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/evaluate.py b/deeplabcut/pose_estimation_tensorflow/core/evaluate.py
+index cb48afe..8f0ef96 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/evaluate.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/evaluate.py
+@@ -602,7 +602,7 @@ def evaluate_network(
+         if "TF_CUDNN_USE_AUTOTUNE" in os.environ:
+             del os.environ["TF_CUDNN_USE_AUTOTUNE"]  # was potentially set during training
+ 
+-        tf.compat.v1.reset_default_graph()
++        tf.keras.backend.clear_session()
+         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  #
+         #    tf.logging.set_verbosity(tf.logging.WARN)
+ 
+@@ -869,7 +869,7 @@ def evaluate_network(
+                                 foldername,
+                             )  # Rescaling coordinates to have figure in original size!
+ 
+-                        tf.compat.v1.reset_default_graph()
++                        tf.keras.backend.clear_session()
+                         # print(final_result)
+                     else:
+                         DataMachine = pd.read_hdf(resultsfilename)
+diff --git a/deeplabcut/pose_estimation_tensorflow/core/evaluate_multianimal.py b/deeplabcut/pose_estimation_tensorflow/core/evaluate_multianimal.py
+index 0dc290c..34bc3c3 100644
+--- a/deeplabcut/pose_estimation_tensorflow/core/evaluate_multianimal.py
++++ b/deeplabcut/pose_estimation_tensorflow/core/evaluate_multianimal.py
+@@ -118,7 +118,7 @@ def evaluate_multianimal_full(
+     if "TF_CUDNN_USE_AUTOTUNE" in os.environ:
+         del os.environ["TF_CUDNN_USE_AUTOTUNE"]  # was potentially set during training
+ 
+-    tf.compat.v1.reset_default_graph()
++    tf.keras.backend.clear_session()
+     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  #
+     if gputouse is not None:  # gpu selectinon
+         os.environ["CUDA_VISIBLE_DEVICES"] = str(gputouse)
+@@ -514,7 +514,7 @@ def evaluate_multianimal_full(
+                     metadata = {"data": dictionary}
+                     _ = auxfun_multianimal.SaveFullMultiAnimalData(PredicteData, metadata, resultsfilename)
+ 
+-                    tf.compat.v1.reset_default_graph()
++                    tf.keras.backend.clear_session()
+ 
+                 n_multibpts = len(cfg["multianimalbodyparts"])
+                 if n_multibpts == 1:
+diff --git a/deeplabcut/pose_estimation_tensorflow/training.py b/deeplabcut/pose_estimation_tensorflow/training.py
+index 5e08abb..cb7e76b 100644
+--- a/deeplabcut/pose_estimation_tensorflow/training.py
++++ b/deeplabcut/pose_estimation_tensorflow/training.py
+@@ -127,7 +127,7 @@ def train_network(
+ 
+     from deeplabcut.utils import auxiliaryfunctions
+ 
+-    tf.compat.v1.reset_default_graph()
++    tf.keras.backend.clear_session()
+     start_path = Path.cwd()
+ 
+     # Read file path for pose_config file. >> pass it on
+diff --git a/deeplabcut/pose_estimation_tensorflow/visualizemaps.py b/deeplabcut/pose_estimation_tensorflow/visualizemaps.py
+index 64d886c..919c36f 100644
+--- a/deeplabcut/pose_estimation_tensorflow/visualizemaps.py
++++ b/deeplabcut/pose_estimation_tensorflow/visualizemaps.py
+@@ -79,7 +79,7 @@ def extract_maps(
+     from deeplabcut.utils import auxiliaryfunctions
+     from deeplabcut.utils.auxfun_videos import imread, imresize
+ 
+-    tf.compat.v1.reset_default_graph()
++    tf.keras.backend.clear_session()
+     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  #
+     #    tf.logging.set_verbosity(tf.logging.WARN)
+ 
+diff --git a/tests/test_predict_multianimal.py b/tests/test_predict_multianimal.py
+index 4646a6c..f15d869 100644
+--- a/tests/test_predict_multianimal.py
++++ b/tests/test_predict_multianimal.py
+@@ -38,8 +38,7 @@ def test_extract_detections(model_outputs, ground_truth_detections):
+         RADIUS,
+         THRESHOLD,
+     )
+-    with tf.compat.v1.Session() as sess:
+-        inds = sess.run(inds)
++    inds = tf.keras.backend.get_value(inds)
+     pos = predict_multianimal.calc_peak_locations(locrefs, inds, STRIDE)
+     s, r, c, b = inds.T
+     prob = scmaps[s, r, c, b].reshape((-1, 1))
+@@ -56,8 +55,7 @@ def test_association_costs(model_outputs, ground_truth_detections):
+         RADIUS,
+         THRESHOLD,
+     )
+-    with tf.compat.v1.Session() as sess:
+-        peak_inds = sess.run(peak_inds)
++    peak_inds = tf.keras.backend.get_value(peak_inds)
+     graph = [[i, j] for i in range(12) for j in range(i + 1, 12)]
+     preds = predict_multianimal.compute_peaks_and_costs(
+         *model_outputs,
+@@ -83,8 +81,7 @@ def test_compute_peaks_and_costs_no_graph(model_outputs):
+         RADIUS,
+         THRESHOLD,
+     )
+-    with tf.compat.v1.Session() as sess:
+-        peak_inds = sess.run(peak_inds)
++    peak_inds = tf.keras.backend.get_value(peak_inds)
+     preds = predict_multianimal.compute_peaks_and_costs(
+         *model_outputs,
+         peak_inds,
+diff --git a/tests/test_tf_install_smoke.py b/tests/test_tf_install_smoke.py
+index af19b8c..eedf441 100644
+--- a/tests/test_tf_install_smoke.py
++++ b/tests/test_tf_install_smoke.py
+@@ -25,11 +25,7 @@ def test_tensorflow_imports_and_has_matmul() -> None:
+     b = tf.constant([[3.0], [4.0]])
+     c = tf.matmul(a, b)
+ 
+-    if tf.executing_eagerly():
+-        result = c.numpy()
+-    else:
+-        with tf.compat.v1.Session() as sess:
+-            result = sess.run(c)
++    result = tf.keras.backend.get_value(c)
+ 
+     assert (result == [[11.0]]).all()
+ 
+-- 
+2.55.0
+

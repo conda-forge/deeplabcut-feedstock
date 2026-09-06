@@ -1,0 +1,580 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 09:22:34 -0400
+Subject: [PATCH] Replace nnets/base.py's tf.compat.v1 losses, and stop the
+ eager fixture skipping later modules
+
+Two things, both in the files this agent owns.
+
+1. nnets/losses.py
+
+`BasePoseNet.train()` built its three terms with `tf.compat.v1.losses.
+sigmoid_cross_entropy`, `.huber_loss` and `.mean_squared_error` -- five
+references across four call sites, the last of the losses' TF1 dependencies.
+They are replaced by a small module that reproduces them exactly.
+
+The reduction is the entire difficulty.  `tf.compat.v1.losses.*` default to
+`Reduction.SUM_BY_NONZERO_WEIGHTS`, which divides by the number of elements the
+weight tensor is non-zero at after broadcasting -- not by the number of
+elements.  DeepLabCut passes a 0/1 mask as `weights` for its locref and
+pairwise terms, so the denominator there is the count of unmasked elements, and
+`tf.reduce_mean` is not a substitute.
+
+How wrong it would be depends on the project, which is what makes it a trap.
+Measured on the real batches `PoseDatasetFactory` produces:
+
+  single animal, "default"        locref_mask non-zero on 0.15% of elements
+                                  v1 0.559652865, reduce_mean 0.000833985
+                                  -- 671x too small
+  multi-animal, "multi-animal-imgaug"
+                                  locref_mask and pairwise_mask non-zero on
+                                  100.00% -- reduce_mean agrees exactly
+
+The maDLC loader is dense by configuration rather than by nature:
+`pose_multianimal_imgaug` builds `np.ones(locref_size)` unless
+`weigh_only_present_joints`, which defaults to False.  So a `reduce_mean`
+implementation validated on a stock multi-animal project agrees to the last
+digit and then scales the locref term down by nearly three orders of magnitude
+on every single-animal project -- training still runs, the loss still falls,
+and only the balance between the score-map term and the locref term is wrong.
+The part-detection term agrees either way, because its weights are the scalar
+1.0 under the default `weigh_part_predictions: False`.  There is a test that
+fails if anyone later "simplifies" the reduction to `reduce_mean`.
+
+Verification drives the real `train()` body twice on the same fixed head
+tensors, once through nnets/losses.py and once with the module globals swapped
+back to `tf.compat.v1.losses.*`, so nothing is reimplemented for the check:
+
+  8 real single-animal batches, huber and mean_squared_error
+      |d value| 0.0 on every term of every batch
+      |d gradient| w.r.t. the heads <= 3.7e-09
+  8 real multi-animal + PAF batches, huber and mean_squared_error
+      |d value| 0.0, |d gradient| <= 9.1e-13
+  edge cases the real batches do not reach, in graph mode and in eager mode:
+      sparse, fractional and trailing-1-broadcast part_score_weights;
+      all-zero locref and pairwise masks; intermediate supervision
+      |d value| 0.0 on all of them, and the 0/0 masks give 0.0, not nan
+
+The one behavioural difference is that the v1 helpers also append the loss to
+`GraphKeys.LOSSES`.  Nothing in DeepLabCut reads that collection -- there is no
+`get_total_loss`, `get_losses` or `get_regularization_losses` anywhere in the
+package -- so dropping the side effect changes nothing.  Relatedly, and for the
+same reason, the eager trainer must not add `model.losses` to the tape: the
+weight-decay regularizers `layers.prediction_layer` registers have never been
+summed into the loss either.
+
+`prediction_layers`' `tf.compat.v1.variable_scope` is deliberately left alone.
+Patching out just that one call site and dumping the variable names shows why:
+replacing it with `tf.name_scope`, the usual TF2 substitution, leaves the
+variable count at 271 but renames all six head keys from
+`pose/part_pred/block4/weights` to `part_pred/block4/weights`.  Every snapshot
+DeepLabCut has written is keyed by the first form, and `export.py` reads
+`pose/locref_pred/block4/BiasAdd` and `pose/pairwise_pred/block4/BiasAdd` out
+of the frozen graph by name, so a restore with `allow_missing` would silently
+load nothing.  It belongs to the tf_slim nets and goes when they do; the Keras
+path never reaches it, passing the scope to `keras_prediction_layer` as a
+string.
+
+That leaves two `tf.compat.v1` references in nnets/base.py: that
+`variable_scope`, and `enable_eager_execution` in `ensure_eager_execution`.
+
+2. tests/test_nnets_keras.py's eager fixture
+
+The fixture disabled eager again on teardown, to leave the flag as it found it.
+That cannot work: eager can be turned back on only until the eager context has
+been touched, so the flag only ever flips one way.  Whichever Keras test module
+ran second therefore had `ensure_eager_execution` raise, and this fixture turns
+that into a skip -- so an entire module's tests were reported as skipped rather
+than failed, and nothing looked wrong.  Eager is now left on.
+
+Since patch 0020 moved `disable_eager_execution` out of `core/train.py`'s import
+and into `core/legacy_tf1.ensure_graph_mode`, eager is on by default and the
+teardown no longer fires, so the cascade does not reproduce on a plain run.  It
+returns as soon as anything enters graph mode first.  Making that explicit --
+calling `ensure_graph_mode()` and then running the two Keras modules in one
+pytest session, this module first:
+
+  before   61 passed, 25 skipped
+  after    81 passed,  4 skipped
+
+The 4 remaining skips are parametrisations with no Keras implementation yet.
+
+The two docstrings that still described the old import-time
+`disable_eager_execution` are corrected, in `ensure_eager_execution` and in
+tests/test_nnets_keras_equivalence.py, along with the error message advising
+separate processes.  Both engines can now share a process in either order --
+checked by writing a snapshot from the Keras net and restoring it into the
+tf_slim graph, agreeing to 3.7e-06 relative with the Keras engine built first
+and 3.1e-06 with graph mode entered first.  The equivalence tests keep their
+subprocess per engine anyway: eager is per-process global state, and isolating
+it is what makes that module independent of collection order.
+
+Full TensorFlow test suite: 2511 passed, 5 skipped, 5 xfailed.  The three
+failures that remain -- `test_pose_net_leaves_the_caller_config_alone` and the
+two `[*-efficientnet-b0]` config parametrisations -- are present unchanged on
+the shipped tree before this patch and are not addressed here; see the report.
+---
+ .../pose_estimation_tensorflow/nnets/base.py  |  34 ++-
+ .../nnets/losses.py                           |  80 ++++++
+ tests/test_nnets_keras.py                     |  15 +-
+ tests/test_nnets_keras_equivalence.py         |  10 +-
+ tests/test_nnets_losses.py                    | 230 ++++++++++++++++++
+ 5 files changed, 338 insertions(+), 31 deletions(-)
+ create mode 100644 deeplabcut/pose_estimation_tensorflow/nnets/losses.py
+ create mode 100644 tests/test_nnets_losses.py
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/base.py b/deeplabcut/pose_estimation_tensorflow/nnets/base.py
+index b82b0af2..28f657c1 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/base.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/base.py
+@@ -20,6 +20,7 @@ from .layers import (
+     keras_prediction_layer_stage,
+     prediction_layer,
+ )
++from .losses import huber_loss, mean_squared_error, sigmoid_cross_entropy
+ from .utils import make_2d_gaussian_kernel
+ 
+ 
+@@ -41,7 +42,7 @@ class BasePoseNet(metaclass=abc.ABCMeta):
+             part_score_weights = 1.0
+ 
+         def add_part_loss(pred_layer):
+-            return tf.compat.v1.losses.sigmoid_cross_entropy(
++            return sigmoid_cross_entropy(
+                 batch[Batch.part_score_targets], heads[pred_layer], part_score_weights
+             )
+ 
+@@ -56,11 +57,7 @@ class BasePoseNet(metaclass=abc.ABCMeta):
+             locref_pred = heads["locref"]
+             locref_targets = batch[Batch.locref_targets]
+             locref_weights = batch[Batch.locref_mask]
+-            loss_func = (
+-                tf.compat.v1.losses.huber_loss
+-                if self.cfg["locref_huber_loss"]
+-                else tf.compat.v1.losses.mean_squared_error
+-            )
++            loss_func = huber_loss if self.cfg["locref_huber_loss"] else mean_squared_error
+             loss["locref_loss"] = self.cfg["locref_loss_weight"] * loss_func(
+                 locref_targets, locref_pred, locref_weights
+             )
+@@ -70,11 +67,7 @@ class BasePoseNet(metaclass=abc.ABCMeta):
+             pairwise_pred = heads["pairwise_pred"]
+             pairwise_targets = batch[Batch.pairwise_targets]
+             pairwise_weights = batch[Batch.pairwise_mask]
+-            loss_func = (
+-                tf.compat.v1.losses.huber_loss
+-                if self.cfg["pairwise_huber_loss"]
+-                else tf.compat.v1.losses.mean_squared_error
+-            )
++            loss_func = huber_loss if self.cfg["pairwise_huber_loss"] else mean_squared_error
+             loss["pairwise_loss"] = self.cfg["pairwise_loss_weight"] * loss_func(
+                 pairwise_targets, pairwise_pred, pairwise_weights
+             )
+@@ -263,22 +256,23 @@ def set_untracked(obj, name, value):
+ def ensure_eager_execution():
+     """Make sure eager execution is on, and say so loudly when it cannot be.
+ 
+-    ``pose_estimation_tensorflow/core/train.py`` calls
+-    ``tf.compat.v1.disable_eager_execution()`` at import time, which turns
+-    eager off for the whole process, including for code that never touches the
+-    TF1 engine.  Until that call is gone the Keras pose nets have to turn it
+-    back on.  That only works before any TF1 graph has been built, which is why
+-    this raises instead of silently returning a graph-mode model.
++    Eager is the default now.  ``core/legacy_tf1.ensure_graph_mode()`` turns it
++    off, but only when a ``tf_slim`` graph is about to be built, so in a process
++    that never builds one this returns immediately.  Where graph mode has been
++    entered, eager can still be turned back on until TF1 ops actually exist;
++    past that point it cannot, and this raises rather than quietly handing back
++    a graph-mode model.
+     """
+     if tf.executing_eagerly():
+         return
+     try:
+         tf.compat.v1.enable_eager_execution()
+-    except ValueError as err:  # a TF1 graph already exists in this process
++    except ValueError as err:  # TF1 ops already exist in this process
+         raise RuntimeError(
+             "The Keras pose nets need eager execution, but this process has "
+-            "already built a TF1 graph. Run the TF1 and the Keras engine in "
+-            "separate processes."
++            "already built a TF1 graph. Build the Keras net before anything "
++            "calls core.legacy_tf1.ensure_graph_mode(), or use a separate "
++            "process."
+         ) from err
+ 
+ 
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/losses.py b/deeplabcut/pose_estimation_tensorflow/nnets/losses.py
+new file mode 100644
+index 00000000..c69f78f0
+--- /dev/null
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/losses.py
+@@ -0,0 +1,80 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""The three losses ``BasePoseNet.train`` uses, without ``tf.compat.v1``.
++
++``tf.compat.v1.losses.*`` reduce with ``Reduction.SUM_BY_NONZERO_WEIGHTS``,
++which is **not** ``tf.reduce_mean``: it divides by the number of elements the
++weight tensor is non-zero at, after broadcasting, rather than by the number of
++elements.  DeepLabCut passes a 0/1 mask as ``weights`` for its locref and
++pairwise terms, so for those the denominator is the count of *unmasked*
++elements.
++
++That distinction is invisible on a stock multi-animal project and severe on a
++single-animal one.  ``pose_multianimal_imgaug`` builds ``np.ones(locref_size)``
++unless ``weigh_only_present_joints`` is set, and that key defaults to False, so
++maDLC masks are dense and ``reduce_mean`` happens to agree exactly.  The
++single-animal loaders mask down to the labelled keypoints, where the mask is
++non-zero on well under 1% of elements, and ``reduce_mean`` is then several
++hundred times too small -- which rescales the locref term against the
++part-detection term without making training visibly fail.
++"""
++import tensorflow as tf
++
++
++def sum_by_nonzero_weights(losses, weights):
++    """``tf.compat.v1.losses.Reduction.SUM_BY_NONZERO_WEIGHTS``.
++
++    ``sum(losses * weights) / count(broadcast weights != 0)``, and 0.0 rather
++    than nan when nothing is weighted -- a batch can carry an all-zero mask
++    when it holds no labelled keypoint of some type.
++    """
++    weights = tf.convert_to_tensor(weights, dtype=losses.dtype)
++    broadcast = tf.broadcast_to(weights, tf.shape(losses))
++    count = tf.reduce_sum(tf.cast(tf.not_equal(broadcast, 0.0), losses.dtype))
++    return tf.math.divide_no_nan(tf.reduce_sum(losses * broadcast), count)
++
++
++def sigmoid_cross_entropy(multi_class_labels, logits, weights=1.0):
++    """``tf.compat.v1.losses.sigmoid_cross_entropy`` with ``label_smoothing=0``.
++
++    ``BasePoseNet.train`` never passes a smoothing, so the labels are used as
++    they are; the v1 helper would otherwise rewrite them as
++    ``labels * (1 - s) + 0.5 * s``.
++    """
++    losses = tf.nn.sigmoid_cross_entropy_with_logits(
++        labels=tf.cast(multi_class_labels, logits.dtype), logits=logits
++    )
++    return sum_by_nonzero_weights(losses, weights)
++
++
++def huber_loss(labels, predictions, weights=1.0, delta=1.0):
++    """``tf.compat.v1.losses.huber_loss``, whose ``delta`` also defaults to 1.0.
++
++    The argument order is the v1 one, ``(labels, predictions, weights)``, since
++    ``train()`` calls it as ``loss_func(locref_targets, locref_pred, mask)``.
++    """
++    error = tf.cast(labels, predictions.dtype) - predictions
++    absolute = tf.abs(error)
++    delta = tf.convert_to_tensor(delta, dtype=predictions.dtype)
++    quadratic = tf.minimum(absolute, delta)
++    linear = absolute - quadratic
++    return sum_by_nonzero_weights(0.5 * quadratic**2 + delta * linear, weights)
++
++
++def mean_squared_error(labels, predictions, weights=1.0):
++    """``tf.compat.v1.losses.mean_squared_error``.
++
++    Despite the name this reduces by ``SUM_BY_NONZERO_WEIGHTS`` as well, so it
++    is neither ``tf.keras.losses.MeanSquaredError`` nor ``reduce_mean``.
++    Reached only when ``locref_huber_loss`` or ``pairwise_huber_loss`` is off.
++    """
++    losses = tf.math.squared_difference(tf.cast(labels, predictions.dtype), predictions)
++    return sum_by_nonzero_weights(losses, weights)
+diff --git a/tests/test_nnets_keras.py b/tests/test_nnets_keras.py
+index 00cd2317..35b213dc 100644
+--- a/tests/test_nnets_keras.py
++++ b/tests/test_nnets_keras.py
+@@ -35,19 +35,20 @@ from deeplabcut.pose_estimation_tensorflow.nnets.factory import (  # noqa: E402
+ 
+ @pytest.fixture(scope="module", autouse=True)
+ def eager():
+-    """Turn eager on for this module only.
+-
+-    ``core/train.py`` disables it process-wide at import, and the TF1 tests
+-    that run after this file need it left that way, so the flag is restored.
++    """Turn eager on for this module, and leave it on.
++
++    Eager cannot be re-enabled once the eager context has been touched, so a
++    module that turns it off again on the way out makes every later Keras test
++    skip -- silently, because ``ensure_eager_execution`` then raises and this
++    fixture turns that into a skip.  Restoring the flag is therefore not an
++    option, and nothing needs it restored: the tf_slim comparisons in
++    ``test_nnets_keras_equivalence.py`` build their graphs in subprocesses.
+     """
+-    was_eager = tf.executing_eagerly()
+     try:
+         ensure_eager_execution()
+     except RuntimeError as err:  # a TF1 graph was built earlier in this process
+         pytest.skip(str(err))
+     yield
+-    if not was_eager:
+-        tf.compat.v1.disable_eager_execution()
+ 
+ 
+ def pose_cfg(**kwargs):
+diff --git a/tests/test_nnets_keras_equivalence.py b/tests/test_nnets_keras_equivalence.py
+index b7db933d..c8b0645b 100644
+--- a/tests/test_nnets_keras_equivalence.py
++++ b/tests/test_nnets_keras_equivalence.py
+@@ -10,10 +10,12 @@
+ #
+ """The Keras pose nets must agree with the ``tf_slim`` ones tensor for tensor.
+ 
+-``core/train.py`` calls ``tf.compat.v1.disable_eager_execution()`` at import,
+-so the two engines cannot share a process.  Each side therefore runs in its own
+-subprocess: ``slim`` writes a snapshot plus its outputs, ``keras`` loads that
+-snapshot and compares.  Run this file directly to see the numbers:
++Each side runs in its own subprocess: ``slim`` writes a snapshot plus its
++outputs, ``keras`` loads that snapshot and compares.  The two engines can share
++a process now that graph mode is entered lazily, but eager execution is
++per-process global state that only ever flips one way, so keeping them apart is
++what makes this module independent of the order pytest collects it in.  Run
++this file directly to see the numbers:
+ 
+     python tests/test_nnets_keras_equivalence.py slim /tmp/out r50
+     python tests/test_nnets_keras_equivalence.py keras /tmp/out r50
+diff --git a/tests/test_nnets_losses.py b/tests/test_nnets_losses.py
+new file mode 100644
+index 00000000..218dbb18
+--- /dev/null
++++ b/tests/test_nnets_losses.py
+@@ -0,0 +1,230 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""nnets/losses.py must equal the tf.compat.v1.losses helpers it replaced.
++
++The reduction is the whole point: tf.compat.v1.losses.* use
++SUM_BY_NONZERO_WEIGHTS, which divides by the number of non-zero broadcast
++weights rather than by the number of elements.  DeepLabCut passes a 0/1 mask
++for its locref and pairwise terms, so on a single-animal project -- where the
++mask is non-zero on well under 1% of elements -- tf.reduce_mean is hundreds of
++times too small.  On a stock multi-animal project the mask is all ones and
++reduce_mean happens to agree exactly, which is what makes the mistake easy to
++make and hard to notice.
++"""
++import numpy as np
++import pytest
++
++tf = pytest.importorskip("tensorflow")
++
++from deeplabcut.pose_estimation_tensorflow.datasets import Batch  # noqa: E402
++from deeplabcut.pose_estimation_tensorflow.nnets import base as nnets_base  # noqa: E402
++from deeplabcut.pose_estimation_tensorflow.nnets.losses import (  # noqa: E402
++    huber_loss,
++    mean_squared_error,
++    sigmoid_cross_entropy,
++    sum_by_nonzero_weights,
++)
++
++
++@pytest.fixture(scope="module", autouse=True)
++def eager():
++    """Same contract as the other Keras test modules: turn eager on, leave it on."""
++    try:
++        nnets_base.ensure_eager_execution()
++    except RuntimeError as err:
++        pytest.skip(str(err))
++    yield
++
++
++SHAPE = (2, 9, 7, 4)
++WIDE = (2, 9, 7, 8)
++
++
++def _weights(kind, shape, rng):
++    if kind == "scalar_one":
++        return 1.0
++    if kind == "dense_mask":
++        return np.ones(shape, "float32")
++    if kind == "sparse_mask":
++        return (rng.uniform(size=shape) < 0.02).astype("float32")
++    if kind == "fractional":
++        return (rng.uniform(size=shape) * 3.0).astype("float32")
++    if kind == "broadcast":
++        return (rng.uniform(size=shape[:-1] + (1,)) < 0.3).astype("float32")
++    if kind == "all_zero":
++        return np.zeros(shape, "float32")
++    raise AssertionError(kind)
++
++
++WEIGHTS = ["scalar_one", "dense_mask", "sparse_mask", "fractional", "broadcast", "all_zero"]
++
++
++@pytest.mark.parametrize("kind", WEIGHTS)
++def test_sigmoid_cross_entropy_matches_tf_compat_v1(kind):
++    rng = np.random.RandomState(0)
++    labels = (rng.uniform(size=SHAPE) < 0.1).astype("float32")
++    logits = (rng.normal(size=SHAPE) * 3).astype("float32")
++    weights = _weights(kind, SHAPE, rng)
++    expected = tf.compat.v1.losses.sigmoid_cross_entropy(labels, logits, weights)
++    got = sigmoid_cross_entropy(labels, logits, weights)
++    assert float(got) == float(expected)
++
++
++@pytest.mark.parametrize("kind", WEIGHTS)
++@pytest.mark.parametrize("fn,reference", [
++    (huber_loss, tf.compat.v1.losses.huber_loss),
++    (mean_squared_error, tf.compat.v1.losses.mean_squared_error),
++])
++def test_regression_losses_match_tf_compat_v1(kind, fn, reference):
++    rng = np.random.RandomState(1)
++    labels = rng.normal(size=WIDE).astype("float32")
++    predictions = rng.normal(size=WIDE).astype("float32")
++    weights = _weights(kind, WIDE, rng)
++    assert float(fn(labels, predictions, weights)) == float(reference(labels, predictions, weights))
++
++
++def test_huber_delta_is_one_and_the_knee_is_in_the_right_place():
++    labels = tf.constant([0.0, 0.0, 0.0], tf.float32)
++    predictions = tf.constant([0.5, 1.0, 3.0], tf.float32)
++    expected = tf.compat.v1.losses.huber_loss(
++        labels, predictions, reduction=tf.compat.v1.losses.Reduction.NONE
++    )
++    got = 0.5 * tf.minimum(tf.abs(predictions), 1.0) ** 2 + 1.0 * (
++        tf.abs(predictions) - tf.minimum(tf.abs(predictions), 1.0)
++    )
++    np.testing.assert_array_equal(got.numpy(), expected.numpy())
++    # quadratic below the knee, linear above it
++    np.testing.assert_allclose(expected.numpy(), [0.125, 0.5, 2.5], rtol=0, atol=0)
++
++
++def test_an_all_zero_mask_gives_zero_not_nan():
++    rng = np.random.RandomState(2)
++    labels = rng.normal(size=WIDE).astype("float32")
++    predictions = rng.normal(size=WIDE).astype("float32")
++    zero = np.zeros(WIDE, "float32")
++    for fn in (huber_loss, mean_squared_error):
++        value = float(fn(labels, predictions, zero))
++        assert value == 0.0
++        assert np.isfinite(value)
++
++
++def test_reduce_mean_is_not_the_same_reduction():
++    """Guards the whole point of nnets/losses.py against a later simplification.
++
++    On a sparse mask -- what a single-animal project produces -- reduce_mean is
++    hundreds of times smaller; on a dense one it coincides, which is the trap.
++    """
++    rng = np.random.RandomState(3)
++    labels = rng.normal(size=WIDE).astype("float32")
++    predictions = rng.normal(size=WIDE).astype("float32")
++    elementwise = tf.abs(labels - predictions)  # any elementwise loss will do
++
++    sparse = (rng.uniform(size=WIDE) < 0.01).astype("float32")
++    correct = float(sum_by_nonzero_weights(elementwise, sparse))
++    naive = float(tf.reduce_mean(elementwise * sparse))
++    assert correct > 50 * naive
++
++    dense = np.ones(WIDE, "float32")
++    assert float(sum_by_nonzero_weights(elementwise, dense)) == float(tf.reduce_mean(elementwise))
++
++
++def test_sum_by_nonzero_weights_counts_after_broadcasting():
++    losses = tf.ones((2, 4, 4, 3), tf.float32)
++    weights = np.zeros((2, 4, 4, 1), "float32")
++    weights[0, 0, 0, 0] = 1.0  # one position, three channels once broadcast
++    assert float(sum_by_nonzero_weights(losses, weights)) == 1.0
++    assert float(tf.reduce_sum(tf.broadcast_to(tf.constant(weights), tf.shape(losses)))) == 3.0
++
++
++# ---------------------------------------------------------------------------
++# through BasePoseNet.train()
++# ---------------------------------------------------------------------------
++class _FixedHeads(nnets_base.BasePoseNet):
++    """A pose net with given heads, so train() is the only thing under test."""
++
++    def __init__(self, cfg, heads):
++        super().__init__(cfg)
++        self._fixed_heads = heads
++
++    def extract_features(self, inputs):
++        raise NotImplementedError
++
++    def get_net(self, inputs, is_training=False):
++        return self._fixed_heads
++
++
++def _train_cfg(**kwargs):
++    cfg = {
++        "weigh_part_predictions": False,
++        "intermediate_supervision": False,
++        "net_type": "resnet_50",
++        "location_refinement": True,
++        "locref_huber_loss": True,
++        "locref_loss_weight": 0.05,
++        "pairwise_predict": False,
++        "partaffinityfield_predict": True,
++        "pairwise_huber_loss": True,
++        "pairwise_loss_weight": 0.1,
++    }
++    cfg.update(kwargs)
++    return cfg
++
++
++@pytest.mark.parametrize("huber", [True, False])
++@pytest.mark.parametrize("weigh_parts", [False, True])
++@pytest.mark.parametrize("interm", [False, True])
++def test_train_matches_tf_compat_v1_losses(huber, weigh_parts, interm):
++    """The real train() body, run twice on the same heads, old losses vs new."""
++    rng = np.random.RandomState(4)
++    cfg = _train_cfg(
++        locref_huber_loss=huber,
++        pairwise_huber_loss=huber,
++        weigh_part_predictions=weigh_parts,
++        intermediate_supervision=interm,
++    )
++    heads = {
++        "part_pred": tf.constant((rng.normal(size=SHAPE) * 3).astype("float32")),
++        "locref": tf.constant(rng.normal(size=WIDE).astype("float32")),
++        "pairwise_pred": tf.constant(rng.normal(size=WIDE).astype("float32")),
++    }
++    if interm:
++        heads["part_pred_interm"] = tf.constant(rng.normal(size=SHAPE).astype("float32"))
++    batch = {
++        Batch.inputs: tf.zeros([1, 1, 1, 3]),
++        Batch.part_score_targets: tf.constant((rng.uniform(size=SHAPE) < 0.1).astype("float32")),
++        Batch.part_score_weights: tf.constant((rng.uniform(size=SHAPE) < 0.08).astype("float32")),
++        Batch.locref_targets: tf.constant(rng.normal(size=WIDE).astype("float32")),
++        Batch.locref_mask: tf.constant((rng.uniform(size=WIDE) < 0.02).astype("float32")),
++        Batch.pairwise_targets: tf.constant(rng.normal(size=WIDE).astype("float32")),
++        Batch.pairwise_mask: tf.constant((rng.uniform(size=WIDE) < 0.02).astype("float32")),
++    }
++    net = _FixedHeads(cfg, heads)
++
++    got = {k: float(v) for k, v in net.train(batch).items()}
++
++    saved = {name: getattr(nnets_base, name) for name in
++             ("sigmoid_cross_entropy", "huber_loss", "mean_squared_error")}
++    try:
++        nnets_base.sigmoid_cross_entropy = tf.compat.v1.losses.sigmoid_cross_entropy
++        nnets_base.huber_loss = tf.compat.v1.losses.huber_loss
++        nnets_base.mean_squared_error = tf.compat.v1.losses.mean_squared_error
++        expected = {k: float(v) for k, v in net.train(batch).items()}
++    finally:
++        for name, fn in saved.items():
++            setattr(nnets_base, name, fn)
++
++    assert set(got) == set(expected)
++    expected_terms = {"part_loss", "locref_loss", "pairwise_loss", "total_loss"}
++    if interm:
++        expected_terms.add("part_loss_interm")
++    assert set(got) == expected_terms
++    for key in expected:
++        assert got[key] == expected[key], key

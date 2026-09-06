@@ -1,0 +1,2005 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 08:15:05 -0400
+Subject: [PATCH] Port the ResNet and MuNet pose nets to eager TensorFlow 2 /
+ Keras
+
+nnets/ builds its graphs with tf.compat.v1 and tf_slim: variable_scope,
+arg_scope, slim.conv2d, slim.conv2d_transpose, slim.batch_norm and
+tf_slim.nets.resnet_v1, all of it graph mode behind a Session.  This adds an
+eager tf.keras implementation of the two nets defined in this directory --
+PoseResnet (net_type=resnet_50/101/152) and PoseMultiNet (MuNet/DLCRNet and
+the dual-fusion decoder) -- alongside the existing one, and a shim that moves
+weights between the two in either direction.
+
+The tf_slim implementation stays and stays the default.  Which one gets built
+is decided by nnets/factory.resolve_engine: pose_cfg.yaml's tf_engine key
+first, then the DLC_TF_ENGINE environment variable, then "tf1".  Nothing that
+does not ask for "keras" changes behaviour.
+
+What the Keras path is
+
+  BaseKerasPoseNet (nnets/base.py) is a tf.keras.Model that also derives from
+  BasePoseNet, so test(), inference(), add_inference_layers() and train() are
+  the same code for both engines.  It adds
+
+      extract_features(inputs, is_training=False) -> (net, end_points)
+      get_net(inputs, is_training=False)          -> dict of heads
+      slim_weight_map()  -> {tf_slim variable name: tf.Variable}
+
+  SlimResNetV1 (nnets/resnet.py) is resnet_v1_{50,101,152} written out with
+  slim's semantics.  tf.keras.applications.ResNet50 is a different network and
+  cannot be used: Keras strides the 1x1 convolution of the first unit of each
+  stage where slim strides the 3x3 of the last, Keras has no output_stride or
+  dilation knob (DeepLabCut needs output_stride=16, Keras gives 28 for a
+  200 px input), and Keras convolutions carry biases slim's do not, 318
+  weights against 265.
+
+  PoseMultiNetKeras (nnets/multi.py) reproduces the multi_fusion decoder, the
+  upsampled_features stack for stride 8, 4 and 2, and the four-stage PAF
+  decoder, plus the dual-fusion branch.
+
+  nnets/checkpoint.py maps the two conventions onto each other:
+  load_tf1_checkpoint, save_tf1_checkpoint (via tf.raw_ops.SaveV2, no Session),
+  tf1_weight_values and compare_to_tf1_checkpoint.
+
+  Backbones register with KerasBackboneFactory; any submodule that exposes
+  slim_weights() is picked up by slim_weight_map(), so a backbone added later
+  becomes checkpoint-compatible by implementing that one method.
+
+Three tf_slim behaviours that are easy to get wrong, reproduced explicitly in
+nnets/layers.py:
+
+  slim.l2_regularizer(s) is s * sum(w**2) / 2 while keras.regularizers.l2(s)
+  is s * sum(w**2), a silent factor of two on the weight decay.  The Keras
+  layers use l2(0.5 * weight_decay).
+
+  slim.conv2d and slim.conv2d_transpose create no bias when a normalizer_fn is
+  given, which is why the five decoder_parallel_* convolutions have weights and
+  BatchNorm variables but no biases.
+
+  slim.batch_norm defaults to scale=False -- no gamma -- with decay 0.999 and
+  epsilon 1e-3, while resnet_arg_scope() overrides those to scale=True, decay
+  0.997 and epsilon 1e-5.  resnet_arg_scope() also overrides max_pool2d's
+  padding from slim's VALID default to SAME, and it is called with no
+  arguments, so the backbone's weight decay is 1e-4 whatever pose_cfg.yaml
+  says.  conv2d_same's explicit pad plus VALID is reproduced too; padding=same
+  is not the same thing at stride 2.
+
+  tf.compat.v1.image.resize_images, which the multi_stage decoder uses for its
+  two skip connections, is half_pixel_centers=False.  tf.image.resize is
+  half_pixel_centers=True and is not a drop-in replacement; the port calls
+  tf.raw_ops.ResizeBilinear directly.  The dual-fusion branch really does use
+  the v2 resize, and that difference is preserved.
+
+Batch norm follows the patched behaviour, not the stock one.  The resnet
+backbone is built with is_training=False in both engines, so it always
+normalises with its moving statistics and never updates them.  The MuNet
+decoder threads is_training through, so at inference it uses the moving
+averages and a prediction no longer depends on which other frames share its
+batch.
+
+Equivalence, measured against the tf_slim implementation with the real
+ImageNet resnet_v1_50 and resnet_v1_101 weights restored, over 17
+configurations covering single animal, multi-animal with a PAF head, an
+identity channel, intermediate supervision, batch 4, resnet_50 and resnet_101,
+MuNet at stride 8, 4 and 2, and dual fusion at stride 4:
+
+  every variable maps 1:1, no shape mismatches and no unmapped Keras weight
+      269 / 271 / 273 / 275 / 291 / 293 / 311 / 313 / 524 tensors
+  max |delta| 3.2e-05 on features and 9.4e-06 on the heads
+      (relative 2.4e-06, which is float32 accumulation order)
+  28 further size/config combinations at 200x168, 201x169, 256x256, 99x101,
+      350x480 and 161x129, same agreement
+  predicted keypoints through predict.argmax_pose_predict agree to
+      2.4e-05 px, and always to the same score-map cell
+  the stock ImageNet resnet_v1_50.ckpt loads directly, 265 of its 269 tensors
+      (the other three are the classifier head and mean_rgb, plus global_step)
+
+The round trip works in both directions.  A tf_slim snapshot loads into the
+Keras net, twelve tf.GradientTape steps train it -- 163 trainable variables
+for resnet_50, 195 for MuNet, no None gradients -- save_tf1_checkpoint writes
+it back out, and tf.compat.v1.train.Saver().restore reads it into the
+unmodified tf_slim graph, matching to 1.6e-06.
+
+The MuNet decoder's batch norm was checked against the patched tf_slim graph
+directly.  With a batch of two where one image is held fixed:
+
+  inference, keras   0.000000       inference, tf_slim   0.000000
+  training,  keras   0.1794589      training,  tf_slim   0.1794586
+  inference vs training, keras 0.2321826, tf_slim 0.2321830
+
+Tests: tests/test_nnets_keras.py (49 tests, eager only) and
+tests/test_nnets_keras_equivalence.py, which runs each engine in its own
+subprocess because core/train.py calls tf.compat.v1.disable_eager_execution()
+at import and the two cannot share a process.
+
+Two upstream oddities are reproduced rather than fixed, because a snapshot
+trained by the tf_slim engine has to keep loading:
+
+  PoseMultiNet with multi_stage and no PAF head emits no part_pred at all --
+  stage1_hm_out is built, so the variables exist, but out["part_pred"] is only
+  assigned inside the partaffinityfield_predict branch -- so train() would
+  raise KeyError.  MuNet is only usable multi-animal with a PAF head.
+
+  The multi_stage decoder is unreachable in a stock project: PoseNetFactory
+  routes to it only when stride < 8, and nothing writes such a value.
+---
+ .../nnets/__init__.py                         |  29 +-
+ .../pose_estimation_tensorflow/nnets/base.py  | 115 +++++-
+ .../nnets/checkpoint.py                       | 155 ++++++++
+ .../nnets/factory.py                          | 120 ++++++-
+ .../nnets/layers.py                           | 207 +++++++++--
+ .../pose_estimation_tensorflow/nnets/multi.py | 258 +++++++++++++-
+ .../nnets/resnet.py                           | 196 +++++++++-
+ tests/test_nnets_keras.py                     | 334 ++++++++++++++++++
+ tests/test_nnets_keras_equivalence.py         | 312 ++++++++++++++++
+ 9 files changed, 1681 insertions(+), 45 deletions(-)
+ create mode 100644 deeplabcut/pose_estimation_tensorflow/nnets/checkpoint.py
+ create mode 100644 tests/test_nnets_keras.py
+ create mode 100644 tests/test_nnets_keras_equivalence.py
+
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py b/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py
+index ab0aca78..0617a723 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/__init__.py
+@@ -9,16 +9,37 @@
+ # Licensed under GNU Lesser General Public License v3.0
+ #
+ 
++from .base import BaseKerasPoseNet, BasePoseNet, ensure_eager_execution
++from .checkpoint import load_tf1_checkpoint, save_tf1_checkpoint, tf1_weight_values
+ from .efficientnet import PoseEfficientNet
+-from .factory import PoseNetFactory
++from .factory import (
++    KERAS_ENGINE,
++    TF1_ENGINE,
++    KerasBackboneFactory,
++    PoseNetFactory,
++    resolve_engine,
++)
+ from .mobilenet import PoseMobileNet
+-from .multi import PoseMultiNet
+-from .resnet import PoseResnet
++from .multi import PoseMultiNet, PoseMultiNetKeras
++from .resnet import PoseResnet, PoseResnetKeras, SlimResNetV1
+ 
+ __all__ = [
+-    "PoseNetFactory",
++    "BaseKerasPoseNet",
++    "BasePoseNet",
++    "KERAS_ENGINE",
++    "KerasBackboneFactory",
+     "PoseEfficientNet",
+     "PoseMobileNet",
+     "PoseMultiNet",
++    "PoseMultiNetKeras",
++    "PoseNetFactory",
+     "PoseResnet",
++    "PoseResnetKeras",
++    "SlimResNetV1",
++    "TF1_ENGINE",
++    "ensure_eager_execution",
++    "load_tf1_checkpoint",
++    "resolve_engine",
++    "save_tf1_checkpoint",
++    "tf1_weight_values",
+ ]
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/base.py b/deeplabcut/pose_estimation_tensorflow/nnets/base.py
+index 5f5fccad..ce142052 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/base.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/base.py
+@@ -15,7 +15,11 @@ import tensorflow as tf
+ from deeplabcut.pose_estimation_tensorflow.core import predict_multianimal
+ from deeplabcut.pose_estimation_tensorflow.datasets import Batch
+ 
+-from .layers import prediction_layer
++from .layers import (
++    keras_prediction_layer,
++    keras_prediction_layer_stage,
++    prediction_layer,
++)
+ from .utils import make_2d_gaussian_kernel
+ 
+ 
+@@ -229,3 +233,112 @@ class BasePoseNet(metaclass=abc.ABCMeta):
+             name="img_mean",
+         )
+         return inputs - mean
++
++
++def ensure_eager_execution():
++    """Make sure eager execution is on, and say so loudly when it cannot be.
++
++    ``pose_estimation_tensorflow/core/train.py`` calls
++    ``tf.compat.v1.disable_eager_execution()`` at import time, which turns
++    eager off for the whole process, including for code that never touches the
++    TF1 engine.  Until that call is gone the Keras pose nets have to turn it
++    back on.  That only works before any TF1 graph has been built, which is why
++    this raises instead of silently returning a graph-mode model.
++    """
++    if tf.executing_eagerly():
++        return
++    try:
++        tf.compat.v1.enable_eager_execution()
++    except ValueError as err:  # a TF1 graph already exists in this process
++        raise RuntimeError(
++            "The Keras pose nets need eager execution, but this process has "
++            "already built a TF1 graph. Run the TF1 and the Keras engine in "
++            "separate processes."
++        ) from err
++
++
++class BaseKerasPoseNet(tf.keras.Model, BasePoseNet):
++    """Eager TensorFlow 2 counterpart of :class:`BasePoseNet`.
++
++    Subclasses build their layers in ``__init__`` and implement
++    ``extract_features``.  Everything a caller needs is inherited or defined
++    here:
++
++    * ``extract_features(inputs, is_training=False) -> (net, end_points)``
++    * ``get_net(inputs, is_training=False) -> dict`` with the same keys the
++      ``tf_slim`` nets return (``part_pred``, ``locref``, ``features`` and,
++      where the config asks for them, ``pairwise_pred`` and
++      ``part_pred_interm``)
++    * ``__call__``/``call`` are the Keras entry points and forward to
++      ``get_net``
++    * ``slim_weight_map() -> {tf_slim variable name: tf.Variable}``, which is
++      what ``nnets/checkpoint.py`` uses to read and write TF1 checkpoints
++    * ``test``, ``inference``, ``add_inference_layers`` and ``train`` come
++      straight from :class:`BasePoseNet` and work unchanged in eager mode
++
++    There is no ``Session``, no placeholder, no ``variable_scope`` and no
++    ``arg_scope``: the ``tf_slim`` scope names survive only as strings, in the
++    ``slim_scope`` of each layer.
++    """
++
++    def __init__(self, cfg, **kwargs):
++        ensure_eager_execution()
++        tf.keras.Model.__init__(self, **kwargs)
++        self.cfg = cfg
++        self._heads = {}
++
++    # -- layer construction helpers ----------------------------------------
++    def _add_head(self, key, slim_scope, num_outputs, stage=False):
++        factory = keras_prediction_layer_stage if stage else keras_prediction_layer
++        layer = factory(self.cfg, slim_scope, num_outputs)
++        self._heads[key] = layer
++        setattr(self, "_head_" + slim_scope.replace("/", "_"), layer)
++        return layer
++
++    # -- the contract ------------------------------------------------------
++    def extract_features(self, inputs, is_training=False):
++        raise NotImplementedError
++
++    def prediction_layers(self, features, end_points, is_training=False):
++        raise NotImplementedError
++
++    def get_net(self, inputs, is_training=False):
++        features, end_points = self.extract_features(inputs, is_training=is_training)
++        return self.prediction_layers(features, end_points, is_training=is_training)
++
++    def call(self, inputs, training=False):
++        return self.get_net(inputs, is_training=training)
++
++    # -- checkpoint plumbing -----------------------------------------------
++    def slim_weight_map(self):
++        """Map every checkpointed weight to the ``tf_slim`` name it had.
++
++        Any submodule exposing ``slim_weights()`` contributes, so a backbone
++        added later only has to implement that one method to become
++        checkpoint-compatible.
++        """
++        if not self.built and not self.weights:
++            raise RuntimeError(
++                "Call the model once (or build_for(...)) before asking for its "
++                "weight map: Keras creates the weights lazily."
++            )
++        out = {}
++        for module in self.submodules:
++            fn = getattr(module, "slim_weights", None)
++            if fn is None:
++                continue
++            for name, variable in fn().items():
++                if name in out and out[name] is not variable:
++                    raise ValueError(f"two layers claim the tf_slim name {name!r}")
++                out[name] = variable
++        return out
++
++    def unmapped_weights(self):
++        """Variables of this model that ``slim_weight_map()`` does not cover."""
++        mapped = {id(v) for v in self.slim_weight_map().values()}
++        return [v for v in self.weights if id(v) not in mapped]
++
++    def build_for(self, input_shape):
++        """Create the weights by running one zero batch of ``input_shape``."""
++        self(tf.zeros(input_shape, dtype=tf.float32))
++        return self
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/checkpoint.py b/deeplabcut/pose_estimation_tensorflow/nnets/checkpoint.py
+new file mode 100644
+index 00000000..a78ccc88
+--- /dev/null
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/checkpoint.py
+@@ -0,0 +1,155 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""Read and write TF1 (``tf_slim``) checkpoints from the Keras pose nets.
++
++Snapshots written by the ``tf_slim`` engine, and the ImageNet backbones
++DeepLabCut downloads, are name-based TF1 checkpoints.  The Keras pose nets keep
++the ``tf_slim`` name of every weight they own (see
++``BaseKerasPoseNet.slim_weight_map``), so conversion is a lookup in both
++directions and no re-training or graph surgery is involved:
++
++    load_tf1_checkpoint(model, "dlc-models/.../snapshot-10000")
++    save_tf1_checkpoint(model, "snapshot", global_step=10000)
++
++A checkpoint written here restores into the unmodified ``tf_slim`` graph with
++``tf.compat.v1.train.Saver().restore``, which is what keeps the two engines
++interchangeable while the migration is in progress.
++"""
++import os
++
++import numpy as np
++import tensorflow as tf
++
++#: Bookkeeping tensors a DeepLabCut snapshot carries that no layer owns.
++NON_WEIGHT_TENSORS = ("global_step", "save_counter", "_CHECKPOINTABLE_OBJECT_GRAPH")
++
++
++class CheckpointReport:
++    """What ``load_tf1_checkpoint`` did.
++
++    ``loaded`` are the ``tf_slim`` names assigned, ``missing`` the model
++    weights the checkpoint had nothing for, ``unused`` the checkpoint tensors
++    no weight claimed, and ``mismatched`` the ``(name, ckpt_shape,
++    model_shape)`` triples that could not be assigned.
++    """
++
++    def __init__(self, loaded, missing, unused, mismatched):
++        self.loaded = sorted(loaded)
++        self.missing = sorted(missing)
++        self.unused = sorted(unused)
++        self.mismatched = sorted(mismatched)
++
++    @property
++    def ok(self):
++        return not self.missing and not self.mismatched
++
++    def __repr__(self):
++        return (
++            f"<CheckpointReport loaded={len(self.loaded)} missing={len(self.missing)} "
++            f"unused={len(self.unused)} mismatched={len(self.mismatched)}>"
++        )
++
++
++def _weight_map(model, include_prefixes=None):
++    weights = model.slim_weight_map()
++    if include_prefixes is not None:
++        weights = {k: v for k, v in weights.items() if k.startswith(tuple(include_prefixes))}
++    return weights
++
++
++def load_tf1_checkpoint(model, ckpt_path, include_prefixes=None, allow_missing=False, verbose=False):
++    """Assign a TF1 checkpoint's tensors to a Keras pose net's weights.
++
++    ``include_prefixes`` restricts the load the way
++    ``slim.get_variables_to_restore(include=[...])`` does, which is how a bare
++    ImageNet backbone checkpoint is loaded into a full pose net.
++    """
++    reader = tf.train.load_checkpoint(ckpt_path)
++    available = reader.get_variable_to_shape_map()
++    weights = _weight_map(model, include_prefixes)
++
++    loaded, missing, mismatched = [], [], []
++    for name, variable in weights.items():
++        if name not in available:
++            missing.append(name)
++            continue
++        value = reader.get_tensor(name)
++        if tuple(value.shape) != tuple(variable.shape):
++            mismatched.append((name, tuple(value.shape), tuple(variable.shape)))
++            continue
++        variable.assign(value)
++        loaded.append(name)
++
++    unused = [
++        name
++        for name in available
++        if name not in weights and not name.startswith(NON_WEIGHT_TENSORS)
++    ]
++    report = CheckpointReport(loaded, missing, unused, mismatched)
++    if verbose:
++        print(f"[checkpoint] {ckpt_path}: {report}")
++    if not allow_missing and not report.ok:
++        raise ValueError(
++            f"{ckpt_path} does not match this model: {len(report.missing)} weights missing "
++            f"(e.g. {report.missing[:3]}), {len(report.mismatched)} shape mismatches "
++            f"(e.g. {report.mismatched[:3]})"
++        )
++    return report
++
++
++def tf1_weight_values(model):
++    """``{tf_slim variable name: numpy array}`` for every weight of the model."""
++    return {name: variable.numpy() for name, variable in model.slim_weight_map().items()}
++
++
++def save_tf1_checkpoint(model, prefix, global_step=None, extra=None, write_state=True):
++    """Write the model's weights as a name-based TF1 checkpoint.
++
++    Returns the checkpoint prefix actually written, i.e. ``prefix`` with
++    ``-<global_step>`` appended when a step is given, matching
++    ``tf.compat.v1.train.Saver.save``.
++    """
++    tensors = dict(tf1_weight_values(model))
++    if extra:
++        tensors.update(extra)
++    if global_step is not None:
++        tensors.setdefault("global_step", np.int64(global_step))
++        prefix = f"{prefix}-{int(global_step)}"
++
++    directory = os.path.dirname(os.path.abspath(prefix))
++    os.makedirs(directory, exist_ok=True)
++
++    names = sorted(tensors)
++    tf.raw_ops.SaveV2(
++        prefix=tf.constant(prefix),
++        tensor_names=tf.constant(names),
++        shape_and_slices=tf.constant([""] * len(names)),
++        tensors=[tf.convert_to_tensor(tensors[n]) for n in names],
++    )
++    if write_state:
++        base = os.path.basename(prefix)
++        with open(os.path.join(directory, "checkpoint"), "w") as handle:
++            handle.write(f'model_checkpoint_path: "{base}"\n')
++            handle.write(f'all_model_checkpoint_paths: "{base}"\n')
++    return prefix
++
++
++def compare_to_tf1_checkpoint(model, ckpt_path):
++    """Per-tensor max absolute difference between a model and a checkpoint."""
++    reader = tf.train.load_checkpoint(ckpt_path)
++    available = reader.get_variable_to_shape_map()
++    diffs = {}
++    for name, variable in model.slim_weight_map().items():
++        if name not in available:
++            diffs[name] = float("inf")
++            continue
++        diffs[name] = float(np.abs(reader.get_tensor(name) - variable.numpy()).max())
++    return diffs
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/factory.py b/deeplabcut/pose_estimation_tensorflow/nnets/factory.py
+index 61501353..da760b68 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/factory.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/factory.py
+@@ -8,14 +8,85 @@
+ #
+ # Licensed under GNU Lesser General Public License v3.0
+ #
++import os
+ import warnings
+ 
++#: The graph-mode ``tf_slim`` implementation.  Still the default.
++TF1_ENGINE = "tf1"
++#: The eager ``tf.keras`` implementation.
++KERAS_ENGINE = "keras"
++DEFAULT_ENGINE = TF1_ENGINE
++#: Environment variable consulted when ``pose_cfg.yaml`` says nothing.
++ENGINE_ENV_VAR = "DLC_TF_ENGINE"
++
++
++def resolve_engine(cfg=None):
++    """Pick the pose-net implementation to build.
++
++    ``pose_cfg.yaml``'s ``tf_engine`` key wins; otherwise the ``DLC_TF_ENGINE``
++    environment variable; otherwise :data:`DEFAULT_ENGINE`.
++    """
++    engine = None
++    if cfg is not None:
++        engine = cfg.get("tf_engine")
++    if not engine:
++        engine = os.environ.get(ENGINE_ENV_VAR)
++    if not engine:
++        engine = DEFAULT_ENGINE
++    engine = str(engine).strip().lower()
++    if engine not in (TF1_ENGINE, KERAS_ENGINE):
++        raise ValueError(
++            f"Unknown pose-net engine {engine!r}; expected {TF1_ENGINE!r} or {KERAS_ENGINE!r}"
++        )
++    return engine
++
++
++class _PrefixRegistry:
++    """Registry keyed by a substring of ``net_type``, as DeepLabCut has always done."""
++
++    def __init__(self, what):
++        self._what = what
++        self._entries = {}
++
++    def register(self, type_):
++        def wrapper(obj):
++            if type_ in self._entries:
++                warnings.warn(f"Overwriting existing {self._what} {type_}.", stacklevel=2)
++            self._entries[type_] = obj
++            return obj
++
++        return wrapper
++
++    def lookup(self, net_type):
++        key = _find_matching_key(self._entries, net_type)
++        if key is None:
++            return None
++        return self._entries[key]
++
++    def __contains__(self, net_type):
++        return self.lookup(net_type) is not None
++
++    def keys(self):
++        return self._entries.keys()
++
++
++def _find_matching_key(dict_, key):
++    try:
++        match = next(k for k in dict_ if k in key)
++    except StopIteration:
++        match = None
++    return match
++
+ 
+ class PoseNetFactory:
+     _nets = dict()
++    _keras_nets = _PrefixRegistry("Keras network")
+ 
+     @classmethod
+-    def register(cls, type_):
++    def register(cls, type_, engine=TF1_ENGINE):
++        if engine == KERAS_ENGINE:
++            return cls._keras_nets.register(type_)
++
+         def wrapper(net):
+             if type_ in cls._nets:
+                 warnings.warn(f"Overwriting existing network {type_}.", stacklevel=2)
+@@ -25,11 +96,21 @@ class PoseNetFactory:
+         return wrapper
+ 
+     @classmethod
+-    def create(cls, cfg):
++    def create(cls, cfg, engine=None):
+         if cfg.get("stride", 8) < 8:
+             net_type = "multi"
+         else:
+             net_type = cfg["net_type"]
++        if engine is None:
++            engine = resolve_engine(cfg)
++        if engine == KERAS_ENGINE:
++            net = cls._keras_nets.lookup(net_type)
++            if net is None:
++                raise ValueError(
++                    f"No Keras implementation for a network of type {net_type}; "
++                    f"available: {sorted(cls._keras_nets.keys())}"
++                )
++            return net(cfg)
+         key = cls._find_matching_key(cls._nets, net_type)
+         if key is None:
+             raise ValueError(f"Unsupported network of type {net_type}")
+@@ -38,8 +119,33 @@ class PoseNetFactory:
+ 
+     @staticmethod
+     def _find_matching_key(dict_, key):
+-        try:
+-            match = next(k for k in dict_ if k in key)
+-        except StopIteration:
+-            match = None
+-        return match
++        return _find_matching_key(dict_, key)
++
++
++class KerasBackboneFactory:
++    """Feature extractors the Keras pose nets can be built on.
++
++    A backbone is a ``tf.keras.Model`` constructed from ``cfg`` whose ``call``
++    returns ``(net, end_points)`` for raw, un-centred images, and whose layers
++    expose ``slim_weights()``.
++    """
++
++    _backbones = _PrefixRegistry("Keras backbone")
++
++    @classmethod
++    def register(cls, type_):
++        return cls._backbones.register(type_)
++
++    @classmethod
++    def create(cls, cfg):
++        backbone = cls._backbones.lookup(cfg["net_type"])
++        if backbone is None:
++            raise ValueError(
++                f"No Keras backbone for a network of type {cfg['net_type']}; "
++                f"available: {sorted(cls._backbones.keys())}"
++            )
++        return backbone(cfg)
++
++    @classmethod
++    def supports(cls, net_type):
++        return net_type in cls._backbones
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/layers.py b/deeplabcut/pose_estimation_tensorflow/nnets/layers.py
+index fc0d4d2c..2e1c6cc3 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/layers.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/layers.py
+@@ -8,22 +8,43 @@
+ #
+ # Licensed under GNU Lesser General Public License v3.0
+ #
++"""Prediction layers.
++
++Two implementations live here.
++
++``prediction_layer`` / ``prediction_layer_stage`` are the original ``tf_slim``
++graph-mode builders and remain the default.
++
++``SlimConv`` and the ``keras_*`` helpers are the eager TensorFlow 2 / Keras
++replacements.  They reproduce ``tf_slim``'s arithmetic bit for bit and carry
++the ``tf_slim`` variable scope of the layer they replace, so a checkpoint
++written by either implementation can be read by the other
++(see ``nnets/checkpoint.py``).
++
++Three ``tf_slim`` behaviours are easy to get wrong and are reproduced here
++explicitly:
++
++* ``slim.l2_regularizer(s)`` computes ``s * sum(w**2) / 2`` while
++  ``tf.keras.regularizers.l2(s)`` computes ``s * sum(w**2)``.  The Keras
++  layers therefore use ``l2(0.5 * weight_decay)``.
++* ``slim.conv2d`` and ``slim.conv2d_transpose`` create no bias when a
++  ``normalizer_fn`` is given.
++* ``slim.batch_norm`` defaults to ``scale=False`` (no ``gamma``),
++  ``decay=0.999`` and ``epsilon=1e-3``; ``resnet_arg_scope`` overrides those
++  to ``scale=True``, ``decay=0.997`` and ``epsilon=1e-5``.
++"""
+ import tensorflow as tf
+ import tf_slim as slim
+ 
+-# FIXME Fix wrong scope with Keras layers
+-# def prediction_layer(cfg, input, name, num_outputs):
+-#     with tf.compat.v1.variable_scope(name):
+-#         layer = tf.keras.layers.Conv2DTranspose(
+-#             filters=num_outputs,
+-#             kernel_size=(3, 3),
+-#             strides=2,
+-#             padding="same",
+-#             kernel_regularizer=tf.keras.regularizers.l2(0.5 * (cfg['weight_decay'])),
+-#             name=name,
+-#             dtype=input.dtype.base_dtype,
+-#         )
+-#         return layer(input)
++# tf_slim's slim.batch_norm defaults.
++SLIM_BN_DECAY = 0.999
++SLIM_BN_EPSILON = 1e-3
++SLIM_BN_SCALE = False
++
++# tf_slim's resnet_v1.resnet_arg_scope() overrides for the same layer.
++RESNET_BN_DECAY = 0.997
++RESNET_BN_EPSILON = 1e-5
++RESNET_BN_SCALE = True
+ 
+ 
+ def prediction_layer(cfg, input, name, num_outputs):
+@@ -40,20 +61,6 @@ def prediction_layer(cfg, input, name, num_outputs):
+ 
+ 
+ ### New DLCNet Addition: multi-stage decoder
+-# def prediction_layer_stage(cfg, input, name, num_outputs):
+-#     with tf.compat.v1.variable_scope(name):
+-#         layer = tf.keras.layers.Conv2D(
+-#             filters=num_outputs,
+-#             kernel_size=(3, 3),
+-#             strides=1,
+-#             padding="same",
+-#             kernel_regularizer=tf.keras.regularizers.l2(0.5 * (cfg['weight_decay'])),
+-#             name=name,
+-#             dtype=input.dtype.base_dtype,
+-#         )
+-#         return layer(input)
+-
+-
+ def prediction_layer_stage(cfg, input, name, num_outputs):
+     with slim.arg_scope(
+         [slim.conv2d, slim.conv2d_transpose],
+@@ -70,3 +77,149 @@ def prediction_layer_stage(cfg, input, name, num_outputs):
+                 stride=1,
+             )
+             return pred
++
++
++# ---------------------------------------------------------------------------
++# TensorFlow 2 / Keras replacements
++# ---------------------------------------------------------------------------
++
++
++def slim_l2_regularizer(weight_decay):
++    """The Keras regularizer that equals ``slim.l2_regularizer(weight_decay)``."""
++    if not weight_decay:
++        return None
++    return tf.keras.regularizers.l2(0.5 * weight_decay)
++
++
++def fixed_padding(inputs, kernel_size, rate=1):
++    """Zero-pad exactly as ``tf_slim.nets.resnet_utils.conv2d_same`` does."""
++    kernel_effective = kernel_size + (kernel_size - 1) * (rate - 1)
++    pad_total = kernel_effective - 1
++    pad_beg = pad_total // 2
++    pad_end = pad_total - pad_beg
++    return tf.pad(inputs, [[0, 0], [pad_beg, pad_end], [pad_beg, pad_end], [0, 0]])
++
++
++def resize_bilinear_v1(images, size):
++    """``tf.compat.v1.image.resize_images`` with its TF1 defaults.
++
++    ``tf.image.resize`` uses ``half_pixel_centers=True`` and is therefore not
++    a drop-in replacement for the TF1 call ``nnets/multi.py`` makes.
++    """
++    return tf.raw_ops.ResizeBilinear(
++        images=images,
++        size=size,
++        align_corners=False,
++        half_pixel_centers=False,
++    )
++
++
++class SlimConv(tf.keras.layers.Layer):
++    """A ``slim.conv2d`` / ``slim.conv2d_transpose``, optionally with batch norm.
++
++    ``slim_scope`` is the ``tf_slim`` variable scope this layer stands in for,
++    e.g. ``"resnet_v1_50/block1/unit_1/bottleneck_v1/conv1"``.  It is what
++    ``slim_weights()`` reports and what makes checkpoints interchangeable.
++    """
++
++    def __init__(
++        self,
++        slim_scope,
++        filters,
++        kernel_size,
++        strides=1,
++        rate=1,
++        transpose=False,
++        padding="same",
++        explicit_pad=False,
++        use_bn=False,
++        bn_scale=SLIM_BN_SCALE,
++        bn_decay=SLIM_BN_DECAY,
++        bn_epsilon=SLIM_BN_EPSILON,
++        activation=None,
++        weight_decay=None,
++        kernel_initializer="glorot_uniform",
++        **kwargs,
++    ):
++        super().__init__(name=slim_scope.replace("/", "."), **kwargs)
++        self.slim_scope = slim_scope
++        self.kernel_size = kernel_size
++        self.rate = rate
++        self.explicit_pad = explicit_pad
++        self.activation = activation
++        conv_cls = tf.keras.layers.Conv2DTranspose if transpose else tf.keras.layers.Conv2D
++        conv_kwargs = dict(
++            filters=filters,
++            kernel_size=kernel_size,
++            strides=strides,
++            padding="valid" if explicit_pad else padding,
++            use_bias=not use_bn,
++            kernel_initializer=kernel_initializer,
++            kernel_regularizer=slim_l2_regularizer(weight_decay),
++        )
++        if not transpose:
++            conv_kwargs["dilation_rate"] = rate
++        self.conv = conv_cls(**conv_kwargs)
++        self.bn = (
++            tf.keras.layers.BatchNormalization(
++                momentum=bn_decay,
++                epsilon=bn_epsilon,
++                scale=bn_scale,
++                center=True,
++            )
++            if use_bn
++            else None
++        )
++
++    def call(self, inputs, training=False):
++        x = inputs
++        if self.explicit_pad:
++            x = fixed_padding(x, self.kernel_size, self.rate)
++        x = self.conv(x)
++        if self.bn is not None:
++            x = self.bn(x, training=training)
++        if self.activation is not None:
++            x = self.activation(x)
++        return x
++
++    def slim_weights(self):
++        """``{tf_slim variable name: tf.Variable}`` for this layer."""
++        out = {f"{self.slim_scope}/weights": self.conv.kernel}
++        if self.conv.use_bias:
++            out[f"{self.slim_scope}/biases"] = self.conv.bias
++        if self.bn is not None:
++            prefix = f"{self.slim_scope}/BatchNorm"
++            if self.bn.scale:
++                out[f"{prefix}/gamma"] = self.bn.gamma
++            if self.bn.center:
++                out[f"{prefix}/beta"] = self.bn.beta
++            out[f"{prefix}/moving_mean"] = self.bn.moving_mean
++            out[f"{prefix}/moving_variance"] = self.bn.moving_variance
++        return out
++
++
++def keras_prediction_layer(cfg, slim_scope, num_outputs):
++    """Keras twin of :func:`prediction_layer` (a stride-2 transposed conv)."""
++    return SlimConv(
++        slim_scope,
++        num_outputs,
++        kernel_size=3,
++        strides=2,
++        transpose=True,
++        padding="same",
++        activation=None,
++        weight_decay=cfg["weight_decay"],
++    )
++
++
++def keras_prediction_layer_stage(cfg, slim_scope, num_outputs):
++    """Keras twin of :func:`prediction_layer_stage` (a stride-1 conv)."""
++    return SlimConv(
++        slim_scope,
++        num_outputs,
++        kernel_size=3,
++        strides=1,
++        padding="same",
++        activation=None,
++        weight_decay=cfg["weight_decay"],
++    )
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/multi.py b/deeplabcut/pose_estimation_tensorflow/nnets/multi.py
+index 47fca717..83a5ef66 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/multi.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/multi.py
+@@ -19,9 +19,9 @@ import deeplabcut.pose_estimation_tensorflow.backbones.efficientnet_builder as e
+ from deeplabcut.pose_estimation_tensorflow.backbones import mobilenet, mobilenet_v2
+ from deeplabcut.pose_estimation_tensorflow.nnets import conv_blocks
+ 
+-from .base import BasePoseNet
+-from .factory import PoseNetFactory
+-from .layers import prediction_layer_stage
++from .base import BaseKerasPoseNet, BasePoseNet
++from .factory import KERAS_ENGINE, KerasBackboneFactory, PoseNetFactory
++from .layers import SlimConv, prediction_layer_stage, resize_bilinear_v1
+ from .utils import wrapper
+ 
+ # Change the stride from 2 to 1 to get 16x downscaling instead of 32x.
+@@ -405,3 +405,255 @@ class PoseMultiNet(BasePoseNet):
+     def get_net(self, inputs, is_training=False):
+         net, end_points = self.extract_features(inputs)
+         return self.prediction_layers(net, end_points, tf.shape(input=inputs), is_training=is_training)
++
++
++# ---------------------------------------------------------------------------
++# TensorFlow 2 / Keras implementation
++# ---------------------------------------------------------------------------
++
++#: Depth and kernel of the five multi_fusion decoder convolutions, in build
++#: order, as ``(slim scope, filters, kernel, stride)``.
++DECODER_SPEC = (
++    ("decoder_filters/decoder_parallel_1", 512, 3, 2),
++    ("decoder_filters/decoder_parallel_2", 128, 1, 1),
++    ("decoder_filters/decoder_parallel_3", 256, 3, 2),
++    ("decoder_filters/decoder_parallel_4", 256, 3, 2),
++    ("decoder_filters/decoder_parallel_5", 128, 1, 1),
++)
++
++
++def _upsample_layer(cfg, slim_scope, filters):
++    """A conv2d_transpose from the ``upsampled_features`` arg_scope.
++
++    That arg_scope leaves ``activation_fn`` at slim's default, so unlike the
++    prediction layers these carry a ReLU.
++    """
++    return SlimConv(
++        slim_scope,
++        filters,
++        kernel_size=3,
++        strides=2,
++        transpose=True,
++        padding="same",
++        activation=tf.nn.relu,
++        weight_decay=cfg["weight_decay"],
++    )
++
++
++@PoseNetFactory.register("multi", engine=KERAS_ENGINE)
++class PoseMultiNetKeras(BaseKerasPoseNet):
++    """Keras twin of :class:`PoseMultiNet` (MuNet / DLCRNet and dual fusion).
++
++    Reproduces the patched behaviour of the ``tf_slim`` net: the five
++    ``decoder_parallel_*`` batch norms use their moving averages unless
++    ``is_training`` is set, so a prediction no longer depends on which other
++    frames share its batch.
++    """
++
++    def __init__(self, cfg):
++        super().__init__(cfg)
++        multi_stage = cfg.get("multi_stage", False)
++        # Multi stage is currently only implemented for resnets
++        cfg["multi_stage"] = multi_stage and "resnet" in cfg["net_type"]
++        self.multi_stage = cfg["multi_stage"]
++        self.net_type = cfg["net_type"]
++        self.backbone = KerasBackboneFactory.create(cfg)
++        n_joints = cfg["num_joints"]
++        n_parts = n_joints + cfg.get("num_idchannel", 0)
++        self.is_multi_animal = "multi-animal" in cfg["dataset_type"]
++        self.with_paf = bool(cfg["partaffinityfield_predict"]) and self.is_multi_animal
++
++        if self.multi_stage:
++            num_layers = re.findall("resnet_([0-9]*)", self.net_type)[0]
++            layer_name = f"resnet_v1_{num_layers}" + "/block{}/unit_{}/bottleneck_v1"
++            self.mid_pt_block1 = layer_name.format(1, 3)
++            self.mid_pt_block2 = layer_name.format(2, 3)
++            self.decoder = [
++                SlimConv(
++                    scope,
++                    filters,
++                    kernel,
++                    strides=stride,
++                    padding="same",
++                    use_bn=True,
++                    activation=tf.nn.relu,
++                    weight_decay=cfg["weight_decay"],
++                )
++                for scope, filters, kernel, stride in DECODER_SPEC
++            ]
++            self.upsample_block3 = None
++            self.upsample_block4 = None
++            if cfg["stride"] in (4, 2):
++                self.upsample_block3 = _upsample_layer(cfg, "upsampled_features/block3", cfg.get("bank3", 128))
++            if cfg["stride"] == 2:
++                self.upsample_block4 = _upsample_layer(cfg, "upsampled_features/block4", cfg.get("bank5", 128))
++
++            self.stage1_hm = self._add_head("part_pred_s1", "pose/part_pred_s1/Conv2d_transpose", n_parts)
++            if cfg["location_refinement"]:
++                self._add_head("locref", "pose/locref_pred/Conv2d_transpose", n_joints * 2)
++            if cfg["pairwise_predict"] and not self.is_multi_animal:
++                self._add_head(
++                    "pairwise_pred",
++                    "pose/pairwise_pred/Conv2d_transpose",
++                    n_joints * (n_joints - 1) * 2,
++                )
++            if self.with_paf:
++                # slim auto-names this one, since multi.py passes no scope
++                self.paf_feature = SlimConv(
++                    "pose/Conv2d_transpose",
++                    cfg.get("bank3", 128),
++                    kernel_size=3,
++                    strides=2,
++                    transpose=True,
++                    padding="same",
++                    activation=tf.nn.relu,
++                    weight_decay=None,  # this call is outside every arg_scope
++                )
++                self.stage1_paf = self._add_head(
++                    "pairwise_pred_s1", "pose/pairwise_pred_s1/Conv2d_transpose", cfg["num_limbs"] * 2
++                )
++                self.stage_paf = [
++                    self._add_head(f"pairwise_pred_s{i}", f"pose/pairwise_pred_s{i}/Conv", cfg["num_limbs"] * 2, stage=True)
++                    for i in range(2, 5)
++                ]
++                self.stage_hm = [
++                    self._add_head(f"part_pred_s{i}", f"pose/part_pred_s{i}/Conv", n_parts, stage=True)
++                    for i in range(2, 5)
++                ]
++                self._add_head("part_pred", "pose/part_pred/Conv", n_parts, stage=True)
++                self._add_head("pairwise_pred", "pose/pairwise_pred/Conv", cfg["num_limbs"] * 2, stage=True)
++            if cfg["intermediate_supervision"]:
++                self.interm_end_point = layer_name.format(3, cfg["intermediate_supervision_layer"])
++                self._add_head("part_pred_interm", "pose/intermediate_supervision/Conv2d_transpose", n_parts)
++        else:  # dual fusion net (for stride 4 experiments)
++            self.mid_pt = self._dual_fusion_end_point()
++            # normalizer_fn=None here, so this conv2d has biases and a ReLU
++            self.decoder_parallel_1 = SlimConv(
++                "decoder_filters/decoder_parallel_1",
++                cfg.get("bank3", 128),
++                kernel_size=1,
++                strides=1,
++                padding="same",
++                activation=tf.nn.relu,
++                weight_decay=cfg["weight_decay"],
++            )
++            self.upsample_block4 = _upsample_layer(cfg, "upsampled_features/block4", cfg.get("bank5", 128))
++            self._add_head("part_pred", "pose/part_pred/block4", n_parts)
++            if cfg["location_refinement"]:
++                self._add_head("locref", "pose/locref_pred/block4", n_joints * 2)
++            if cfg["pairwise_predict"] and not self.is_multi_animal:
++                self._add_head("pairwise_pred", "pose/pairwise_pred/block4", n_joints * (n_joints - 1) * 2)
++            if self.with_paf:
++                self._add_head("pairwise_pred", "pose/pairwise_pred/block4", cfg["num_limbs"] * 2)
++            if cfg["intermediate_supervision"] and "efficientnet" not in self.net_type:
++                self.interm_end_point = self._dual_fusion_interm_end_point()
++                if self.interm_end_point is not None:
++                    self._add_head(
++                        "part_pred_interm", "pose/intermediate_supervision/Conv2d_transpose", n_parts
++                    )
++
++    # -- end point names ----------------------------------------------------
++    def _dual_fusion_end_point(self):
++        net_type = self.net_type
++        if "resnet" in net_type:
++            num_layers = re.findall("resnet_([0-9]*)", net_type)[0]
++            return f"resnet_v1_{num_layers}/block2/unit_3/bottleneck_v1"
++        if "mobilenet" in net_type:
++            return "layer_7"
++        if "efficientnet" in net_type:
++            return f"block_{parallel_layers[net_type.split('-')[1]]}"
++        raise ValueError(f"Unknown network of type {net_type}")
++
++    def _dual_fusion_interm_end_point(self):
++        net_type = self.net_type
++        layer = self.cfg["intermediate_supervision_layer"]
++        if "mobilenet" in net_type:
++            return f"layer_{layer}"
++        if "resnet" in net_type:
++            num_layers = re.findall("resnet_([0-9]*)", net_type)[0]
++            return f"resnet_v1_{num_layers}/block3/unit_{layer}/bottleneck_v1"
++        return None
++
++    # -- forward ------------------------------------------------------------
++    def extract_features(self, inputs, is_training=False):
++        # As in PoseMultiNet: the resnet branch is built with is_training=False.
++        # A backbone that needs the flag (mobilenet) reads it here.
++        if "resnet" in self.net_type:
++            return self.backbone(inputs, training=False)
++        return self.backbone(inputs, training=is_training)
++
++    def get_net(self, inputs, is_training=False):
++        features, end_points = self.extract_features(inputs, is_training=is_training)
++        return self.prediction_layers(
++            features, end_points, tf.shape(input=inputs), is_training=is_training
++        )
++
++    def call(self, inputs, training=False):
++        return self.get_net(inputs, is_training=training)
++
++    def prediction_layers(self, features, end_points, input_shape=None, is_training=False):
++        if input_shape is None:
++            raise ValueError("PoseMultiNetKeras.prediction_layers needs the input shape")
++        final_dims = tf.math.ceil(tf.divide(input_shape[1:3], tf.convert_to_tensor(16)))
++        if self.multi_stage:
++            interim_dims_s8 = tf.cast(tf.scalar_mul(2, final_dims), tf.int32)
++            interim_dims_s4 = tf.cast(tf.scalar_mul(2, interim_dims_s8), tf.int32)
++
++            bank_1 = end_points[self.mid_pt_block1]
++            bank_2 = end_points[self.mid_pt_block2]
++            # tf.compat.v1.image.resize_images, i.e. half_pixel_centers=False
++            bank_2_s8 = resize_bilinear_v1(bank_2, interim_dims_s8)
++            bank_1_s4 = resize_bilinear_v1(bank_1, interim_dims_s4)
++
++            dp1, dp2, dp3, dp4, dp5 = self.decoder
++            bank_2_s16 = dp2(dp1(bank_2_s8, training=is_training), training=is_training)
++            bank_1_s8 = dp3(bank_1_s4, training=is_training)
++            bank_1_s16 = dp5(dp4(bank_1_s8, training=is_training), training=is_training)
++
++            net = tf.concat([bank_1_s16, bank_2_s16, features], 3)
++            if self.upsample_block3 is not None:
++                net = self.upsample_block3(net, training=is_training)
++            if self.upsample_block4 is not None:
++                net = self.upsample_block4(net, training=is_training)
++
++            out = {}
++            stage1_hm_out = self.stage1_hm(net, training=is_training)
++            if "locref" in self._heads:
++                out["locref"] = self._heads["locref"](net, training=is_training)
++            if "pairwise_pred" in self._heads and not self.with_paf:
++                out["pairwise_pred"] = self._heads["pairwise_pred"](net, training=is_training)
++            if self.with_paf:
++                feature = self.paf_feature(net, training=is_training)
++                stage1_paf_out = self.stage1_paf(net, training=is_training)
++                stage_input = tf.concat([stage1_hm_out, stage1_paf_out, feature], 3)
++                stage_hm_output = stage1_hm_out
++                for i, (paf_layer, hm_layer) in enumerate(zip(self.stage_paf, self.stage_hm), start=2):
++                    pre_stage_hm_output = stage_hm_output
++                    stage_paf_output = paf_layer(stage_input, training=is_training)
++                    stage_hm_output = hm_layer(stage_input, training=is_training)
++                    if i > 2:
++                        stage_hm_output = stage_hm_output + pre_stage_hm_output
++                    stage_input = tf.concat([stage_hm_output, stage_paf_output, feature], 3)
++                out["part_pred"] = self._heads["part_pred"](stage_input, training=is_training)
++                out["pairwise_pred"] = self._heads["pairwise_pred"](stage_input, training=is_training)
++            if "part_pred_interm" in self._heads:
++                out["part_pred_interm"] = self._heads["part_pred_interm"](
++                    end_points[self.interm_end_point], training=is_training
++                )
++        else:
++            interim_dims = tf.cast(tf.scalar_mul(2, final_dims), tf.int32)
++            # the dual-fusion branch uses the v2 resize, unlike multi_stage
++            bank_3 = tf.image.resize(end_points[self.mid_pt], interim_dims)
++            bank_3 = self.decoder_parallel_1(bank_3, training=is_training)
++            upsampled_features = self.upsample_block4(features, training=is_training)
++            net = tf.concat([bank_3, upsampled_features], 3)
++            out = {}
++            for key in ("part_pred", "locref", "pairwise_pred"):
++                if key in self._heads:
++                    out[key] = self._heads[key](net, training=is_training)
++            if "part_pred_interm" in self._heads:
++                out["part_pred_interm"] = self._heads["part_pred_interm"](
++                    end_points[self.interm_end_point], training=is_training
++                )
++        out["features"] = features
++        return out
+diff --git a/deeplabcut/pose_estimation_tensorflow/nnets/resnet.py b/deeplabcut/pose_estimation_tensorflow/nnets/resnet.py
+index a2a579f5..ab265c90 100644
+--- a/deeplabcut/pose_estimation_tensorflow/nnets/resnet.py
++++ b/deeplabcut/pose_estimation_tensorflow/nnets/resnet.py
+@@ -18,9 +18,15 @@ import tensorflow as tf
+ import tf_slim as slim
+ from tf_slim.nets import resnet_v1
+ 
+-from .base import BasePoseNet
+-from .factory import PoseNetFactory
+-from .layers import prediction_layer
++from .base import BaseKerasPoseNet, BasePoseNet
++from .factory import KERAS_ENGINE, KerasBackboneFactory, PoseNetFactory
++from .layers import (
++    RESNET_BN_DECAY,
++    RESNET_BN_EPSILON,
++    RESNET_BN_SCALE,
++    SlimConv,
++    prediction_layer,
++)
+ 
+ net_funcs = {
+     "resnet_50": resnet_v1.resnet_v1_50,
+@@ -76,3 +82,187 @@ class PoseResnet(BasePoseNet):
+     def get_net(self, inputs, is_training=False):
+         net, end_points = self.extract_features(inputs)
+         return self.prediction_layers(net, end_points)
++
++
++# ---------------------------------------------------------------------------
++# TensorFlow 2 / Keras implementation
++# ---------------------------------------------------------------------------
++
++#: ``resnet_arg_scope()`` is called with no arguments, so the backbone's weight
++#: decay is 1e-4 regardless of ``pose_cfg.yaml``'s ``weight_decay``.
++RESNET_ARG_SCOPE_WEIGHT_DECAY = 0.0001
++
++#: ``slim.variance_scaling_initializer()``, the ``resnet_arg_scope`` default.
++RESNET_KERNEL_INIT = dict(scale=2.0, mode="fan_in", distribution="truncated_normal")
++
++#: ``(base_depth, num_units, stride)`` per block, from ``resnet_v1.resnet_v1_50``
++#: and friends.  ``resnet_v1_block`` puts the stride on the LAST unit of a
++#: block; ``tf.keras.applications.ResNet50`` puts it on the first, which is why
++#: that model cannot be used here.
++RESNET_BLOCKS = {
++    "resnet_50": [(64, 3, 2), (128, 4, 2), (256, 6, 2), (512, 3, 1)],
++    "resnet_101": [(64, 3, 2), (128, 4, 2), (256, 23, 2), (512, 3, 1)],
++    "resnet_152": [(64, 3, 2), (128, 8, 2), (256, 36, 2), (512, 3, 1)],
++}
++
++
++def _resnet_conv(slim_scope, filters, kernel_size, strides=1, rate=1, activation=tf.nn.relu, explicit_pad=False):
++    return SlimConv(
++        slim_scope,
++        filters,
++        kernel_size,
++        strides=strides,
++        rate=rate,
++        explicit_pad=explicit_pad,
++        use_bn=True,
++        bn_scale=RESNET_BN_SCALE,
++        bn_decay=RESNET_BN_DECAY,
++        bn_epsilon=RESNET_BN_EPSILON,
++        activation=activation,
++        weight_decay=RESNET_ARG_SCOPE_WEIGHT_DECAY,
++        kernel_initializer=tf.keras.initializers.VarianceScaling(**RESNET_KERNEL_INIT),
++    )
++
++
++class BottleneckV1(tf.keras.layers.Layer):
++    """One ``resnet_v1.bottleneck`` unit."""
++
++    def __init__(self, slim_scope, depth, depth_bottleneck, stride, rate, depth_in, **kwargs):
++        super().__init__(name=slim_scope.replace("/", "."), **kwargs)
++        self.slim_scope = slim_scope
++        self.stride = stride
++        # slim only builds a projection shortcut when the depth changes;
++        # otherwise it subsamples with a 1x1 max pool (SAME, per resnet_arg_scope).
++        self.shortcut = (
++            None if depth == depth_in else _resnet_conv(f"{slim_scope}/shortcut", depth, 1, strides=stride, activation=None)
++        )
++        self.conv1 = _resnet_conv(f"{slim_scope}/conv1", depth_bottleneck, 1)
++        # conv2 is resnet_utils.conv2d_same: explicit pad + VALID once stride > 1
++        self.conv2 = _resnet_conv(
++            f"{slim_scope}/conv2",
++            depth_bottleneck,
++            3,
++            strides=stride,
++            rate=rate,
++            explicit_pad=stride > 1,
++        )
++        self.conv3 = _resnet_conv(f"{slim_scope}/conv3", depth, 1, activation=None)
++
++    def call(self, inputs, training=False):
++        if self.shortcut is not None:
++            shortcut = self.shortcut(inputs, training=training)
++        elif self.stride == 1:
++            shortcut = inputs
++        else:
++            shortcut = tf.nn.max_pool2d(inputs, 1, strides=self.stride, padding="SAME")
++        residual = self.conv1(inputs, training=training)
++        residual = self.conv2(residual, training=training)
++        residual = self.conv3(residual, training=training)
++        return tf.nn.relu(shortcut + residual)
++
++
++@KerasBackboneFactory.register("resnet")
++class SlimResNetV1(tf.keras.Model):
++    """``resnet_v1_{50,101,152}`` with ``tf_slim``'s exact layer semantics.
++
++    Takes raw images and subtracts ``cfg["mean_pixel"]`` itself, mirroring
++    ``PoseResnet.extract_features``.  Returns ``(net, end_points)``.
++    """
++
++    def __init__(self, cfg, output_stride=16, **kwargs):
++        super().__init__(**kwargs)
++        net_type = cfg["net_type"]
++        num_layers = re.findall("resnet_([0-9]*)", net_type)[0]
++        self.scope = f"resnet_v1_{num_layers}"
++        self.mean_pixel = list(cfg["mean_pixel"])
++        self.output_stride = output_stride
++        self.conv1 = _resnet_conv(f"{self.scope}/conv1", 64, 7, strides=2, explicit_pad=True)
++        # resnet_arg_scope() overrides slim's VALID default for max_pool2d.
++        self.pool1 = tf.keras.layers.MaxPool2D(3, strides=2, padding="same")
++
++        # stack_blocks_dense's stride/rate bookkeeping, done once at build time
++        current_stride, rate = 1, 1
++        target_stride = output_stride // 4
++        self.units = []
++        self.unit_names = []
++        depth_in = 64
++        for block_index, (base_depth, num_units, block_stride) in enumerate(
++            RESNET_BLOCKS[f"resnet_{num_layers}"], start=1
++        ):
++            for unit_index in range(1, num_units + 1):
++                unit_stride = block_stride if unit_index == num_units else 1
++                if current_stride == target_stride:
++                    effective_stride, effective_rate = 1, rate
++                    rate *= unit_stride
++                else:
++                    effective_stride, effective_rate = unit_stride, 1
++                    current_stride *= unit_stride
++                slim_scope = f"{self.scope}/block{block_index}/unit_{unit_index}/bottleneck_v1"
++                self.units.append(
++                    BottleneckV1(
++                        slim_scope,
++                        base_depth * 4,
++                        base_depth,
++                        effective_stride,
++                        effective_rate,
++                        depth_in,
++                    )
++                )
++                self.unit_names.append((slim_scope, block_index, unit_index == num_units))
++                depth_in = base_depth * 4
++
++    def call(self, inputs, training=False):
++        x = tf.cast(inputs, tf.float32) - tf.constant(
++            self.mean_pixel, dtype=tf.float32, shape=[1, 1, 1, 3]
++        )
++        x = self.conv1(x, training=training)
++        x = self.pool1(x)
++        end_points = {}
++        for unit, (slim_scope, block_index, is_last) in zip(self.units, self.unit_names):
++            x = unit(x, training=training)
++            end_points[slim_scope] = x
++            if is_last:
++                end_points[f"{self.scope}/block{block_index}"] = x
++        return x, end_points
++
++
++@PoseNetFactory.register("resnet", engine=KERAS_ENGINE)
++class PoseResnetKeras(BaseKerasPoseNet):
++    """Keras twin of :class:`PoseResnet`."""
++
++    def __init__(self, cfg):
++        super().__init__(cfg)
++        self.backbone = KerasBackboneFactory.create(cfg)
++        n_joints = cfg["num_joints"]
++        self._add_head("part_pred", "pose/part_pred/block4", n_joints + cfg.get("num_idchannel", 0))
++        if cfg["location_refinement"]:
++            self._add_head("locref", "pose/locref_pred/block4", n_joints * 2)
++        if cfg["pairwise_predict"] and "multi-animal" not in cfg["dataset_type"]:
++            self._add_head("pairwise_pred", "pose/pairwise_pred/block4", n_joints * (n_joints - 1) * 2)
++        if cfg["partaffinityfield_predict"] and "multi-animal" in cfg["dataset_type"]:
++            self._add_head("pairwise_pred", "pose/pairwise_pred/block4", cfg["num_limbs"] * 2)
++        if cfg["intermediate_supervision"]:
++            num_layers = re.findall("resnet_([0-9]*)", cfg["net_type"])[0]
++            self.interm_end_point = (
++                f"resnet_v1_{num_layers}/block3/unit_{cfg['intermediate_supervision_layer']}/bottleneck_v1"
++            )
++            self._add_head(
++                "part_pred_interm",
++                "pose/intermediate_supervision/block4",
++                n_joints + cfg.get("num_idchannel", 0),
++            )
++
++    def extract_features(self, inputs, is_training=False):
++        # PoseResnet passes is_training=False to resnet_v1 unconditionally, so
++        # the backbone's batch norm always uses its moving statistics and never
++        # updates them.  Reproduced here on purpose.
++        return self.backbone(inputs, training=False)
++
++    def prediction_layers(self, features, end_points, is_training=False):
++        out = {"features": features}
++        for key, layer in self._heads.items():
++            if key == "part_pred_interm":
++                out[key] = layer(end_points[self.interm_end_point], training=is_training)
++            else:
++                out[key] = layer(features, training=is_training)
++        return out
+diff --git a/tests/test_nnets_keras.py b/tests/test_nnets_keras.py
+new file mode 100644
+index 00000000..92726926
+--- /dev/null
++++ b/tests/test_nnets_keras.py
+@@ -0,0 +1,334 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""Tests for the eager TensorFlow 2 pose nets in ``nnets/``.
++
++These never build a TF1 graph.  The comparison against the ``tf_slim``
++implementation lives in ``test_nnets_keras_equivalence.py``, which has to run
++the two engines in separate processes.
++"""
++import numpy as np
++import pytest
++
++tf = pytest.importorskip("tensorflow")
++
++from deeplabcut.pose_estimation_tensorflow.nnets import (  # noqa: E402
++    KERAS_ENGINE,
++    TF1_ENGINE,
++    PoseNetFactory,
++    ensure_eager_execution,
++    load_tf1_checkpoint,
++    save_tf1_checkpoint,
++)
++from deeplabcut.pose_estimation_tensorflow.nnets.factory import (  # noqa: E402
++    ENGINE_ENV_VAR,
++    resolve_engine,
++)
++
++
++@pytest.fixture(scope="module", autouse=True)
++def eager():
++    """Turn eager on for this module only.
++
++    ``core/train.py`` disables it process-wide at import, and the TF1 tests
++    that run after this file need it left that way, so the flag is restored.
++    """
++    was_eager = tf.executing_eagerly()
++    try:
++        ensure_eager_execution()
++    except RuntimeError as err:  # a TF1 graph was built earlier in this process
++        pytest.skip(str(err))
++    yield
++    if not was_eager:
++        tf.compat.v1.disable_eager_execution()
++
++
++def pose_cfg(**kwargs):
++    cfg = {
++        "stride": 8.0,
++        "weigh_part_predictions": False,
++        "mean_pixel": [123.68, 116.779, 103.939],
++        "location_refinement": True,
++        "locref_stdev": 7.2801,
++        "locref_loss_weight": 1.0,
++        "locref_huber_loss": True,
++        "intermediate_supervision": False,
++        "intermediate_supervision_layer": 3,
++        "weight_decay": 0.0001,
++        "batch_size": 1,
++        "dataset_type": "imgaug",
++        "pairwise_huber_loss": True,
++        "pairwise_predict": False,
++        "partaffinityfield_predict": False,
++        "num_joints": 4,
++        "num_limbs": 0,
++        "net_type": "resnet_50",
++        "multi_stage": False,
++        "pairwise_loss_weight": 1.0,
++    }
++    cfg.update(kwargs)
++    return cfg
++
++
++def multi_animal_cfg(**kwargs):
++    return pose_cfg(
++        num_joints=6,
++        num_limbs=5,
++        dataset_type="multi-animal-imgaug",
++        partaffinityfield_predict=True,
++        pairwise_predict=True,
++        **kwargs,
++    )
++
++
++#: ``(name, cfg, number of tf_slim variables the tf_slim net creates)``.
++CONFIGS = [
++    ("resnet_50", pose_cfg(), 269),
++    ("resnet_50_multi_animal", multi_animal_cfg(), 271),
++    ("resnet_50_intermediate_supervision", pose_cfg(intermediate_supervision=True), 271),
++    ("munet_stride4", multi_animal_cfg(stride=4, multi_stage=True), 311),
++    ("munet_stride2", multi_animal_cfg(stride=2, multi_stage=True), 313),
++    ("dual_fusion_stride4", multi_animal_cfg(stride=4), 275),
++]
++
++
++def build(cfg, size=(200, 168), batch_size=None):
++    if batch_size is not None:
++        cfg = dict(cfg, batch_size=batch_size)
++    model = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++    images = np.random.RandomState(0).uniform(
++        0, 255, (cfg["batch_size"], size[0], size[1], 3)
++    )
++    out = model(tf.constant(images, dtype=tf.float32))
++    return model, tf.constant(images, dtype=tf.float32), out
++
++
++# ---------------------------------------------------------------------------
++# engine selection
++# ---------------------------------------------------------------------------
++def test_tf1_is_the_default_engine(monkeypatch):
++    monkeypatch.delenv(ENGINE_ENV_VAR, raising=False)
++    assert resolve_engine(pose_cfg()) == TF1_ENGINE
++
++
++def test_engine_from_environment(monkeypatch):
++    monkeypatch.setenv(ENGINE_ENV_VAR, "keras")
++    assert resolve_engine(pose_cfg()) == KERAS_ENGINE
++
++
++def test_engine_from_config_wins_over_environment(monkeypatch):
++    monkeypatch.setenv(ENGINE_ENV_VAR, "keras")
++    assert resolve_engine(pose_cfg(tf_engine="tf1")) == TF1_ENGINE
++
++
++def test_unknown_engine_is_rejected():
++    with pytest.raises(ValueError):
++        resolve_engine(pose_cfg(tf_engine="torch"))
++
++
++def test_keras_engine_selects_a_keras_model():
++    model = PoseNetFactory.create(pose_cfg(tf_engine="keras"))
++    assert isinstance(model, tf.keras.Model)
++
++
++# ---------------------------------------------------------------------------
++# structure
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("name,cfg,n_slim_variables", CONFIGS, ids=[c[0] for c in CONFIGS])
++def test_every_weight_carries_a_tf_slim_name(name, cfg, n_slim_variables):
++    model, _, _ = build(cfg)
++    weight_map = model.slim_weight_map()
++    assert model.unmapped_weights() == []
++    assert len(weight_map) == len(model.weights) == n_slim_variables
++
++
++@pytest.mark.parametrize("name,cfg,n_slim_variables", CONFIGS, ids=[c[0] for c in CONFIGS])
++def test_heads_are_the_documented_contract(name, cfg, n_slim_variables):
++    model, images, out = build(cfg)
++    assert "features" in out
++    if cfg["location_refinement"]:
++        assert out["locref"].shape[-1] == cfg["num_joints"] * 2
++    # get_net is the contract the rest of the engine calls
++    again = model.get_net(images, is_training=False)
++    assert set(again) == set(out)
++
++
++def test_no_variable_is_claimed_twice():
++    model, _, _ = build(multi_animal_cfg(stride=4, multi_stage=True))
++    weight_map = model.slim_weight_map()
++    assert len({id(v) for v in weight_map.values()}) == len(weight_map)
++
++
++@pytest.mark.parametrize("stride,cfg", [
++    (8, pose_cfg()),
++    (4, multi_animal_cfg(stride=4, multi_stage=True)),
++    (2, multi_animal_cfg(stride=2, multi_stage=True)),
++])
++@pytest.mark.parametrize("size", [160, 170, 194, 200, 208, 201])
++def test_output_size_is_ceil_over_16_times_16_over_stride(stride, cfg, size):
++    _, _, out = build(cfg, size=(size, size))
++    key = "part_pred" if "part_pred" in out else "locref"
++    expected = int(np.ceil(size / 16)) * (16 // stride)
++    assert tuple(out[key].shape[1:3]) == (expected, expected)
++
++
++def test_scoremap_size_matches_the_network():
++    """The dataset's score map size must be the size the network emits.
++
++    ``calc_target_and_scoremap_sizes`` is called on a stub so no project data
++    is needed; only ``cfg``, ``default_size`` and the two helpers it uses.
++    """
++    from deeplabcut.pose_estimation_tensorflow.datasets.pose_multianimal_imgaug import (
++        MAImgaugPoseDataset,
++    )
++
++    class Stub:
++        def __init__(self, cfg, size):
++            self.cfg = cfg
++            self.default_size = np.array(size)
++
++        def sample_scale(self):
++            return 1.0
++
++        def is_valid_size(self, target_size):
++            return True
++
++    for stride, cfg in (
++        (8, pose_cfg()),
++        (4, multi_animal_cfg(stride=4, multi_stage=True)),
++        (2, multi_animal_cfg(stride=2, multi_stage=True)),
++    ):
++        model = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++        for size in (160, 170, 194, 200, 208, 226, 240):
++            out = model(tf.zeros((1, size, size, 3)))
++            key = "part_pred" if "part_pred" in out else "locref"
++            _, sm_size = MAImgaugPoseDataset.calc_target_and_scoremap_sizes(
++                Stub(dict(cfg, stride=stride), (size, size))
++            )
++            assert tuple(out[key].shape[1:3]) == tuple(sm_size), (stride, size)
++
++
++# ---------------------------------------------------------------------------
++# checkpoints
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("name,cfg,n_slim_variables", CONFIGS, ids=[c[0] for c in CONFIGS])
++def test_checkpoint_round_trip(tmp_path, name, cfg, n_slim_variables):
++    model, images, out = build(cfg)
++    prefix = save_tf1_checkpoint(model, str(tmp_path / "snapshot"), global_step=42)
++    assert prefix.endswith("snapshot-42")
++
++    other = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++    other(images)
++    report = load_tf1_checkpoint(other, prefix)
++    assert report.ok
++    assert len(report.loaded) == n_slim_variables
++    assert report.missing == []
++    assert report.unused == []
++
++    got = other(images)
++    for key in out:
++        np.testing.assert_allclose(out[key].numpy(), got[key].numpy(), rtol=0, atol=0)
++
++
++def test_load_rejects_a_checkpoint_that_does_not_fit(tmp_path):
++    model, _, _ = build(pose_cfg())
++    prefix = save_tf1_checkpoint(model, str(tmp_path / "snapshot"), global_step=1)
++    other, _, _ = build(pose_cfg(num_joints=9))
++    with pytest.raises(ValueError):
++        load_tf1_checkpoint(other, prefix)
++    report = load_tf1_checkpoint(other, prefix, allow_missing=True)
++    assert report.mismatched  # the heads have a different number of channels
++
++
++# ---------------------------------------------------------------------------
++# batch norm
++# ---------------------------------------------------------------------------
++def test_resnet_backbone_batch_norm_is_batch_independent():
++    cfg = pose_cfg(batch_size=2)
++    model = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++    rng = np.random.RandomState(0)
++    a = rng.uniform(0, 255, (200, 168, 3))
++    b1 = rng.uniform(0, 255, (200, 168, 3))
++    b2 = rng.uniform(0, 255, (200, 168, 3)) * 0.2 + 40.0
++    first = model(tf.constant(np.stack([a, b1]), tf.float32))["part_pred"].numpy()
++    second = model(tf.constant(np.stack([a, b2]), tf.float32))["part_pred"].numpy()
++    np.testing.assert_array_equal(first[0], second[0])
++
++
++def test_munet_decoder_uses_moving_averages_at_inference():
++    """Patch 0013's behaviour: no batch-composition dependence at inference."""
++    cfg = multi_animal_cfg(stride=4, multi_stage=True, batch_size=2)
++    model = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++    rng = np.random.RandomState(0)
++    a = rng.uniform(0, 255, (200, 168, 3))
++    b1 = rng.uniform(0, 255, (200, 168, 3))
++    b2 = rng.uniform(0, 255, (200, 168, 3)) * 0.2 + 40.0
++    model(tf.constant(np.stack([a, b1]), tf.float32))
++    # give the decoder batch norms statistics that differ from a batch's own
++    for name, variable in model.slim_weight_map().items():
++        if "decoder_filters" in name and name.endswith("moving_mean"):
++            variable.assign(np.full(variable.shape, 0.3, dtype="float32"))
++        elif "decoder_filters" in name and name.endswith("moving_variance"):
++            variable.assign(np.full(variable.shape, 2.0, dtype="float32"))
++
++    infer1 = model(tf.constant(np.stack([a, b1]), tf.float32), training=False)["part_pred"].numpy()
++    infer2 = model(tf.constant(np.stack([a, b2]), tf.float32), training=False)["part_pred"].numpy()
++    np.testing.assert_array_equal(infer1[0], infer2[0])
++
++    train1 = model(tf.constant(np.stack([a, b1]), tf.float32), training=True)["part_pred"].numpy()
++    assert np.abs(infer1 - train1).max() > 1e-3, "training mode should use the batch statistics"
++
++
++def test_munet_decoder_updates_its_moving_averages_only_in_training_mode():
++    cfg = multi_animal_cfg(stride=4, multi_stage=True)
++    model, images, _ = build(cfg)
++    means = [
++        v for k, v in model.slim_weight_map().items()
++        if "decoder_filters" in k and k.endswith("moving_mean")
++    ]
++    before = [v.numpy().copy() for v in means]
++    model(images, training=False)
++    for variable, value in zip(means, before):
++        np.testing.assert_array_equal(variable.numpy(), value)
++    model(images, training=True)
++    assert any(not np.array_equal(v.numpy(), value) for v, value in zip(means, before))
++
++
++# ---------------------------------------------------------------------------
++# training
++# ---------------------------------------------------------------------------
++def test_gradients_reach_every_trainable_weight():
++    cfg = multi_animal_cfg(stride=4, multi_stage=True)
++    model, images, out = build(cfg)
++    with tf.GradientTape() as tape:
++        heads = model(images, training=True)
++        loss = sum(tf.reduce_mean(tf.square(heads[k])) for k in ("part_pred", "locref", "pairwise_pred"))
++    grads = tape.gradient(loss, model.trainable_variables)
++    assert all(g is not None for g in grads)
++
++
++def test_a_few_sgd_steps_lower_the_loss():
++    cfg = pose_cfg()
++    model, images, out = build(cfg)
++    rng = np.random.RandomState(7)
++    target = tf.constant(rng.randint(0, 2, out["part_pred"].shape).astype("float32"))
++    # Adam, not SGD: this model is randomly initialised rather than restored
++    # from ImageNet, so the raw gradient magnitudes are meaningless.
++    optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=1e-3)
++    losses = []
++    for _ in range(8):
++        with tf.GradientTape() as tape:
++            heads = model(images, training=True)
++            loss = tf.reduce_mean(
++                tf.nn.sigmoid_cross_entropy_with_logits(labels=target, logits=heads["part_pred"])
++            )
++        optimizer.apply_gradients(zip(tape.gradient(loss, model.trainable_variables), model.trainable_variables))
++        losses.append(float(loss))
++    assert losses[-1] < losses[0]
+diff --git a/tests/test_nnets_keras_equivalence.py b/tests/test_nnets_keras_equivalence.py
+new file mode 100644
+index 00000000..b7db933d
+--- /dev/null
++++ b/tests/test_nnets_keras_equivalence.py
+@@ -0,0 +1,312 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""The Keras pose nets must agree with the ``tf_slim`` ones tensor for tensor.
++
++``core/train.py`` calls ``tf.compat.v1.disable_eager_execution()`` at import,
++so the two engines cannot share a process.  Each side therefore runs in its own
++subprocess: ``slim`` writes a snapshot plus its outputs, ``keras`` loads that
++snapshot and compares.  Run this file directly to see the numbers:
++
++    python tests/test_nnets_keras_equivalence.py slim /tmp/out r50
++    python tests/test_nnets_keras_equivalence.py keras /tmp/out r50
++"""
++import json
++import os
++import subprocess
++import sys
++
++import pytest
++
++pytest.importorskip("tensorflow")
++pytest.importorskip("tf_slim")
++
++#: max |delta| accepted between the two engines, in the units of each tensor.
++#:
++#: The nets here are randomly initialised -- no project and no ImageNet
++#: download -- so their batch norms normalise with a moving_variance of 1 while
++#: the activations they see are far larger, and the values coming out of a
++#: 53-layer stack are enormous.  float32 keeps ~1e-7 of relative precision, so a
++#: relative bound is the meaningful one at that magnitude and the absolute bound
++#: is what applies to a normally-scaled tensor.  With real ImageNet weights
++#: restored, every tensor of every configuration agrees to 9.4e-06 absolute.
++ATOL = 2e-4
++#: max relative |delta| (against the largest reference value) accepted instead.
++RTOL = 1e-5
++#: see _slim_worker: keeps a randomly initialised net numerically sane.
++WEIGHT_SCALE = 0.05
++#: so the random weights, and therefore the score map, are the same every run.
++SEED = 20260905
++#: max |delta| accepted on a predicted keypoint, in pixels.
++POSE_ATOL = 1e-3
++
++
++def _pose_cfg(**kwargs):
++    cfg = {
++        "stride": 8.0,
++        "weigh_part_predictions": False,
++        "mean_pixel": [123.68, 116.779, 103.939],
++        "location_refinement": True,
++        "locref_stdev": 7.2801,
++        "locref_loss_weight": 1.0,
++        "locref_huber_loss": True,
++        "intermediate_supervision": False,
++        "intermediate_supervision_layer": 3,
++        "weight_decay": 0.0001,
++        "batch_size": 1,
++        "dataset_type": "imgaug",
++        "pairwise_huber_loss": True,
++        "pairwise_predict": False,
++        "partaffinityfield_predict": False,
++        "num_joints": 4,
++        "num_limbs": 0,
++        "net_type": "resnet_50",
++        "multi_stage": False,
++        "pairwise_loss_weight": 1.0,
++        "nmsradius": 5,
++        "minconfidence": 0.01,
++        "sigma": 1,
++        "locref_smooth": False,
++    }
++    cfg.update(kwargs)
++    return cfg
++
++
++def _multi_animal(**kwargs):
++    return _pose_cfg(
++        num_joints=6,
++        num_limbs=5,
++        dataset_type="multi-animal-imgaug",
++        partaffinityfield_predict=True,
++        pairwise_predict=True,
++        **kwargs,
++    )
++
++
++#: ``name -> (cfg, [(height, width), ...])``
++CASES = {
++    "resnet50": (_pose_cfg(), [(200, 168), (201, 169), (99, 101)]),
++    "resnet50_paf": (_multi_animal(), [(200, 168), (161, 129)]),
++    "resnet50_batch4": (_pose_cfg(batch_size=4), [(200, 168)]),
++    "munet_stride4": (_multi_animal(stride=4, multi_stage=True), [(200, 168), (201, 169)]),
++    "dual_fusion_stride4": (_multi_animal(stride=4), [(200, 168)]),
++}
++
++
++def _images(cfg, size):
++    import numpy as np
++
++    rng = np.random.RandomState(abs(hash((size, cfg["batch_size"], cfg["num_joints"]))) % (2**31 - 1))
++    return rng.uniform(0, 255, (cfg["batch_size"], size[0], size[1], 3))
++
++
++# ---------------------------------------------------------------------------
++# workers
++# ---------------------------------------------------------------------------
++def _slim_worker(outdir, case):
++    import numpy as np
++    import tensorflow as tf
++
++    from deeplabcut.pose_estimation_tensorflow.nnets.factory import PoseNetFactory
++
++    cfg, sizes = CASES[case]
++    os.makedirs(outdir, exist_ok=True)
++    graph = tf.Graph()
++    with graph.as_default():
++        tf.compat.v1.set_random_seed(SEED)
++        inputs = tf.compat.v1.placeholder(tf.float32, [cfg["batch_size"], None, None, 3])
++        heads = PoseNetFactory.create(cfg).get_net(inputs, is_training=False)
++        session = tf.compat.v1.Session(graph=graph)
++        session.run(tf.compat.v1.global_variables_initializer())
++        # No project and no ImageNet download here, so the weights are random.
++        # Left as initialised, every batch norm would normalise by a
++        # moving_variance of 1 while seeing far larger activations, and 53
++        # stacked layers would blow the outputs up to ~1e5, where float32 noise
++        # swamps an absolute comparison and the score map saturates.  Shrinking
++        # the kernels keeps the residual branches small, so the net stays
++        # well-conditioned and the comparison is meaningful in absolute terms.
++        session.run([
++            tf.compat.v1.assign(v, v * WEIGHT_SCALE)
++            for v in tf.compat.v1.global_variables()
++            if v.op.name.endswith("/weights")
++        ])
++        # ... and then rescale the last kernel of each head so its logits have
++        # unit spread.  Without that the score map is flat to within float32
++        # noise and argmax_pose_predict picks between ties, which says nothing
++        # about the two engines.  The biases are still zero, so this scales a
++        # head's output exactly linearly.
++        probe = _images(cfg, sizes[0])
++        for head, key in (("part_pred", "part_pred"), ("locref_pred", "locref")):
++            if key not in heads:
++                continue
++            spread = float(session.run(heads[key], feed_dict={inputs: probe}).std())
++            if not spread:
++                continue
++            final = [
++                v
++                for v in tf.compat.v1.global_variables()
++                if v.op.name.startswith(f"pose/{head}/") and v.op.name.endswith("/weights")
++            ]
++            session.run([tf.compat.v1.assign(v, v / spread) for v in final])
++        ckpt = tf.compat.v1.train.Saver().save(session, os.path.join(outdir, "snapshot"), global_step=7)
++        keys = sorted(k for k in heads if k != "features")
++        for size in sizes:
++            images = _images(cfg, size)
++            np.save(os.path.join(outdir, f"in_{size[0]}x{size[1]}.npy"), images)
++            result = session.run({k: heads[k] for k in keys}, feed_dict={inputs: images})
++            np.savez(os.path.join(outdir, f"out_{size[0]}x{size[1]}.npz"), **result)
++        variables = {v.op.name: [int(d) for d in v.shape] for v in tf.compat.v1.global_variables()}
++        session.close()
++    json.dump(
++        {"ckpt": ckpt, "keys": keys, "variables": variables},
++        open(os.path.join(outdir, "slim.json"), "w"),
++        indent=1,
++        sort_keys=True,
++    )
++
++
++def _keras_worker(outdir, case):
++    import numpy as np
++    import tensorflow as tf
++
++    from deeplabcut.pose_estimation_tensorflow.nnets import (
++        PoseNetFactory,
++        ensure_eager_execution,
++        load_tf1_checkpoint,
++    )
++    from deeplabcut.pose_estimation_tensorflow.nnets.factory import KERAS_ENGINE
++
++    ensure_eager_execution()
++    cfg, sizes = CASES[case]
++    reference = json.load(open(os.path.join(outdir, "slim.json")))
++
++    model = PoseNetFactory.create(cfg, engine=KERAS_ENGINE)
++    first = np.load(os.path.join(outdir, f"in_{sizes[0][0]}x{sizes[0][1]}.npy"))
++    model(tf.constant(first, dtype=tf.float32))
++
++    weight_map = model.slim_weight_map()
++    verdict = {
++        "n_slim_variables": len(reference["variables"]),
++        "n_mapped": len(weight_map),
++        "n_unmapped_keras_weights": len(model.unmapped_weights()),
++        "names_only_in_slim": sorted(set(reference["variables"]) - set(weight_map)),
++        "names_only_in_keras": sorted(set(weight_map) - set(reference["variables"])),
++        "shape_mismatches": sorted(
++            name
++            for name in set(weight_map) & set(reference["variables"])
++            if list(weight_map[name].shape) != reference["variables"][name]
++        ),
++        "sizes": {},
++    }
++    report = load_tf1_checkpoint(model, reference["ckpt"], allow_missing=True)
++    verdict["n_loaded"] = len(report.loaded)
++    verdict["n_checkpoint_tensors_unused"] = len(report.unused)
++
++    poses = []
++    for size in sizes:
++        images = np.load(os.path.join(outdir, f"in_{size[0]}x{size[1]}.npy"))
++        tensor = tf.constant(images, dtype=tf.float32)
++        got = model(tensor)
++        ref = dict(np.load(os.path.join(outdir, f"out_{size[0]}x{size[1]}.npz")))
++        errors = {}
++        for key in sorted(ref):
++            a, b = ref[key], got[key].numpy()
++            if a.shape != b.shape:
++                errors[key] = f"shape {a.shape} != {b.shape}"
++            else:
++                delta = float(np.abs(a - b).max())
++                errors[key] = [delta, delta / (float(np.abs(a).max()) + 1e-30)]
++        verdict["sizes"][f"{size[0]}x{size[1]}"] = errors
++        if cfg["batch_size"] == 1 and "locref" in ref:
++            poses.append(
++                (
++                    f"{size[0]}x{size[1]}",
++                    1.0 / (1.0 + np.exp(-ref["part_pred"])),
++                    ref["locref"],
++                    tf.sigmoid(got["part_pred"]).numpy(),
++                    got["locref"].numpy(),
++                )
++            )
++
++    # numpy only from here, so it is safe to pull in the rest of the engine
++    from deeplabcut.pose_estimation_tensorflow.core import predict as dlc_predict
++
++    verdict["pose"] = {}
++    for name, ref_scmap, ref_locref, got_scmap, got_locref in poses:
++        first_pose = dlc_predict.argmax_pose_predict(
++            *dlc_predict.extract_cnn_output([ref_scmap, ref_locref], cfg), cfg["stride"]
++        )
++        second_pose = dlc_predict.argmax_pose_predict(
++            *dlc_predict.extract_cnn_output([got_scmap, got_locref], cfg), cfg["stride"]
++        )
++        margins = []
++        for joint in range(ref_scmap.shape[-1]):
++            ordered = np.sort(ref_scmap[0, :, :, joint].ravel())[::-1]
++            margins.append(float(ordered[0] - ordered[1]))
++        verdict["pose"][name] = {
++            "max_delta_xy_px": float(np.abs(first_pose[:, :2] - second_pose[:, :2]).max()),
++            "max_delta_likelihood": float(np.abs(first_pose[:, 2] - second_pose[:, 2]).max()),
++            "n_joints": int(first_pose.shape[0]),
++            "smallest_peak_margin": min(margins),
++        }
++    json.dump(verdict, open(os.path.join(outdir, "verdict.json"), "w"), indent=1, sort_keys=True)
++
++
++# ---------------------------------------------------------------------------
++# the test
++# ---------------------------------------------------------------------------
++def _run(mode, outdir, case):
++    env = dict(os.environ, TF_CPP_MIN_LOG_LEVEL="3")
++    completed = subprocess.run(
++        [sys.executable, os.path.abspath(__file__), mode, outdir, case],
++        env=env,
++        capture_output=True,
++        text=True,
++    )
++    if completed.returncode:
++        raise AssertionError(f"{mode} worker for {case} failed:\n{completed.stdout}\n{completed.stderr}")
++
++
++@pytest.mark.parametrize("case", sorted(CASES))
++def test_keras_matches_tf_slim(tmp_path, case):
++    outdir = str(tmp_path / case)
++    _run("slim", outdir, case)
++    _run("keras", outdir, case)
++    verdict = json.load(open(os.path.join(outdir, "verdict.json")))
++
++    assert verdict["names_only_in_slim"] == []
++    assert verdict["names_only_in_keras"] == []
++    assert verdict["shape_mismatches"] == []
++    assert verdict["n_unmapped_keras_weights"] == 0
++    assert verdict["n_mapped"] == verdict["n_slim_variables"]
++    assert verdict["n_loaded"] == verdict["n_slim_variables"]
++    assert verdict["n_checkpoint_tensors_unused"] == 0
++
++    for size, errors in verdict["sizes"].items():
++        for key, error in errors.items():
++            assert isinstance(error, list), f"{case} {size} {key}: {error}"
++            absolute, relative = error
++            assert absolute < ATOL or relative < RTOL, (
++                f"{case} {size} {key}: max |delta| = {absolute} ({relative} relative)"
++            )
++
++    for size, pose in verdict["pose"].items():
++        # A peak is only well defined if it stands clear of the runner-up by more
++        # than the two engines disagree; otherwise argmax is a coin flip and
++        # comparing the keypoints would say nothing.
++        assert pose["smallest_peak_margin"] > 10 * max(pose["max_delta_likelihood"], 1e-9), (
++            f"{case} {size}: degenerate score map {pose}"
++        )
++        assert pose["max_delta_xy_px"] < POSE_ATOL, f"{case} {size}: {pose}"
++
++
++if __name__ == "__main__":
++    mode, outdir, case = sys.argv[1], sys.argv[2], sys.argv[3]
++    {"slim": _slim_worker, "keras": _keras_worker}[mode](outdir, case)

@@ -1,0 +1,661 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 5 Sep 2026 15:16:35 -0400
+Subject: [PATCH] Cover the vendored augmentation module's geometry
+
+Patch 0010 replaced albumentations with a vendored augmentation module and
+shipped no tests of its own. The three upstream test modules that touch it live
+only in the git tree, and their coverage of it is thin: disabling
+`Resize.apply_to_keypoints`, `Resize.apply_to_bboxes` or `Normalize.apply`
+entirely leaves all 29 of them green. The geometry -- the arithmetic that
+decides where a keypoint or a box lands in a training batch -- was untested,
+and an error there does not raise, it silently degrades every model trained
+afterwards.
+
+`tests/test_augmentation_geometry.py` pins that arithmetic against
+albumentations 1.4.1, the version the port was written against, driven through
+`Compose` the way `data/utils.py::apply_transform` drives it: image, keypoints,
+bounding boxes and label fields together. Every expected value was measured on
+that reference rather than recomputed from the formulas under test.
+
+Covered: `resize` in both `keep_ratio` settings, `longest_max_size`, `hflip`
+with and without symmetries, `auto_padding` in every position and both border
+modes and both the minimum-size and divisor forms, `affine` rotation about
+`((w - 1) / 2, (h - 1) / 2)` and its sign, scaling, pixel translation and the
+enclosing box of the rotated corners, the `crop_sampling` origin formula and
+its NaN masking for all four sampling methods, `covering`'s half-open holes,
+`elastic_transform`'s keypoint displacement, `normalize_images`,
+`scale_to_unit_range`, `hist_eq`, `grayscale`, the `label_fields` bookkeeping
+that keeps surviving boxes aligned with their labels, and the empty-keypoint,
+empty-box and both-empty cases.
+
+Thirty-four source mutations were used to check the tests can fail -- among
+them returning keypoints unscaled from `Resize`, mirroring keypoints about
+`width` instead of `width - 1`, transposing the padding offsets, rotating about
+`(w / 2, h / 2)`, negating the rotation angle, dropping the `+ 1` from the crop
+origin, closing the far edge of a dropout hole, skipping the mean subtraction in
+`Normalize`, and keeping the labels of dropped boxes. All thirty-four are
+killed.
+
+Seven behaviours that albumentations 1.4.1 had and the vendored module does not
+are recorded as strict xfails, so repairing one turns into an XPASS and forces
+the marker to be removed rather than letting the deviation survive another
+review:
+
+* a crop larger than the image returns a wrong-sized array instead of raising;
+* `Compose(seed=...)` re-seeds on every call, collapsing an epoch of
+  augmentations to a single one;
+* an `affine` config block missing `rotation`, `scaling` or `translation`
+  raises `TypeError` instead of defaulting that parameter to the identity;
+* `MotionBlur` draws its kernel size from {3,4,5,6,7} and rounds even values up,
+  so P(3) is 0.20 rather than the reference's 1/3, and the mean kernel grows
+  from 4.99 to 5.40;
+* `GaussNoise` draws sigma uniformly rather than as the root of a uniform
+  variance, so under the shipped `gaussian_noise: 12.75` the mean sigma falls
+  from 8.5 to 6.375 -- the same support, about 24% less noise.
+---
+ tests/test_augmentation_geometry.py | 595 ++++++++++++++++++++++++++++
+ 1 file changed, 595 insertions(+)
+ create mode 100644 tests/test_augmentation_geometry.py
+
+diff --git a/tests/test_augmentation_geometry.py b/tests/test_augmentation_geometry.py
+new file mode 100644
+index 0000000..96407ea
+--- /dev/null
++++ b/tests/test_augmentation_geometry.py
+@@ -0,0 +1,595 @@
++#
++# DeepLabCut Toolbox (deeplabcut.org)
++# © A. & M.W. Mathis Labs
++# https://github.com/DeepLabCut/DeepLabCut
++#
++# Please see AUTHORS for contributors.
++# https://github.com/DeepLabCut/DeepLabCut/blob/main/AUTHORS
++#
++# Licensed under GNU Lesser General Public License v3.0
++#
++"""Geometry contract for the vendored augmentation module.
++
++Every expected value below was measured on albumentations 1.4.1 -- the version the
++PyTorch data pipeline depended on before it was vendored -- driven through
++``Compose`` the way ``deeplabcut.pose_estimation_pytorch.data.utils.apply_transform``
++drives it: image, keypoints, bounding boxes and label fields together.
++
++These are the numbers that decide where a keypoint lands in a training batch. An
++error here does not raise, it silently degrades every model trained afterwards, so
++the values are written out literally rather than recomputed from the same formulas
++the implementation uses.
++"""
++from __future__ import annotations
++
++import cv2
++import numpy as np
++import pytest
++
++from deeplabcut.pose_estimation_pytorch.data import augmentation as aug
++from deeplabcut.pose_estimation_pytorch.data import transforms as T
++
++
++# --------------------------------------------------------------------------------
++# helpers
++# --------------------------------------------------------------------------------
++def run(pipeline, image, keypoints, bboxes):
++    """Drive a pipeline exactly as ``utils.apply_transform`` does."""
++    keypoints = np.asarray(keypoints, dtype=float).reshape(-1, 3)
++    bboxes = np.asarray(bboxes, dtype=float).reshape(-1, 4)
++    out = pipeline(
++        image=image,
++        keypoints=keypoints,
++        class_labels=list(range(len(keypoints))),
++        bboxes=bboxes,
++        bbox_labels=np.arange(len(bboxes)),
++    )
++    return (
++        np.asarray(out["image"]),
++        np.asarray(out["keypoints"], dtype=float).reshape(-1, 3),
++        np.asarray(out["bboxes"], dtype=float).reshape(-1, 4),
++        list(out["bbox_labels"]),
++    )
++
++
++def build(cfg):
++    return T.build_transforms(cfg)
++
++
++IMAGE_H, IMAGE_W = 40, 60
++# three keypoints: an interior one, the top-left corner and the bottom-right corner
++KEYPOINTS = [(10.0, 20.0, 2.0), (0.0, 0.0, 2.0), (59.0, 39.0, 2.0)]
++BBOXES = [(10.0, 20.0, 20.0, 10.0)]  # COCO x, y, w, h -> corners (10, 20, 30, 30)
++
++
++@pytest.fixture
++def image():
++    # a gradient, so a wrongly placed crop or pad is visible in the pixels too
++    y, x = np.mgrid[:IMAGE_H, :IMAGE_W]
++    return np.stack([(x * 4) % 256, (y * 6) % 256, ((x + y) * 3) % 256], axis=-1).astype(np.uint8)
++
++
++# --------------------------------------------------------------------------------
++# Resize
++# --------------------------------------------------------------------------------
++def test_resize_isotropic_moves_keypoints_and_boxes(image):
++    """Resize(20, 30) halves both axes of a 40x60 image."""
++    img, kpts, boxes, _ = run(
++        build({"resize": {"height": 20, "width": 30, "keep_ratio": False}}), image, KEYPOINTS, BBOXES
++    )
++    assert img.shape == (20, 30, 3)
++    np.testing.assert_allclose(kpts[:, :2], [[5.0, 10.0], [0.0, 0.0], [29.5, 19.5]])
++    np.testing.assert_allclose(boxes, [[5.0, 10.0, 10.0, 5.0]])
++    # the visibility column is carried through untouched
++    np.testing.assert_array_equal(kpts[:, 2], [2.0, 2.0, 2.0])
++
++
++def test_resize_anisotropic_uses_a_separate_scale_per_axis(image):
++    """Resize(10, 30) on 40x60 scales x by 1/2 and y by 1/4; the two must not be swapped."""
++    img, kpts, boxes, _ = run(
++        build({"resize": {"height": 10, "width": 30, "keep_ratio": False}}), image, KEYPOINTS, BBOXES
++    )
++    assert img.shape == (10, 30, 3)
++    np.testing.assert_allclose(kpts[:, :2], [[5.0, 5.0], [0.0, 0.0], [29.5, 9.75]])
++    np.testing.assert_allclose(boxes, [[5.0, 5.0, 10.0, 2.5]])
++
++
++def test_resize_keep_ratio_pads_at_the_top_left(image):
++    """keep_ratio scales by min(H/h, W/w) and pads the remainder at the top left.
++
++    Padding anywhere else would move every annotation by half the padding.
++    """
++    img, kpts, boxes, _ = run(
++        build({"resize": {"height": 40, "width": 40, "keep_ratio": True}}), image, KEYPOINTS, BBOXES
++    )
++    assert img.shape == (40, 40, 3)
++    scale = 40 / 60
++    np.testing.assert_allclose(kpts[:, :2], np.array([[10.0, 20.0], [0.0, 0.0], [59.0, 39.0]]) * scale)
++    # the scaled image occupies rows 0..26 and columns 0..39; the rest is zero padding
++    assert img[:27, :40].any()
++    np.testing.assert_array_equal(img[27:, :], 0)
++
++
++# --------------------------------------------------------------------------------
++# LongestMaxSize
++# --------------------------------------------------------------------------------
++def test_longest_max_size_geometry(image):
++    img, kpts, boxes, _ = run(build({"longest_max_size": 30}), image, KEYPOINTS, BBOXES)
++    assert img.shape == (20, 30, 3)
++    np.testing.assert_allclose(kpts[:, :2], [[5.0, 10.0], [0.0, 0.0], [29.5, 19.5]])
++    np.testing.assert_allclose(boxes, [[5.0, 10.0, 10.0, 5.0]])
++
++
++# --------------------------------------------------------------------------------
++# HorizontalFlip
++# --------------------------------------------------------------------------------
++def test_hflip_keypoints_use_width_minus_one_and_boxes_use_width(image):
++    """Keypoints mirror about ``width - 1``, boxes about ``width``.
++
++    The two conventions really do differ by one pixel; using the same one for both
++    shifts every flipped keypoint or box by exactly 1 px.
++    """
++    img, kpts, boxes, _ = run(build({"hflip": 1.0}), image, KEYPOINTS, BBOXES)
++    assert img.shape == (40, 60, 3)
++    np.testing.assert_allclose(kpts[:, :2], [[49.0, 20.0], [59.0, 0.0], [0.0, 39.0]])
++    np.testing.assert_allclose(boxes, [[30.0, 20.0, 20.0, 10.0]])
++    np.testing.assert_array_equal(img, image[:, ::-1])
++
++
++def test_hflip_swaps_symmetric_keypoints(image):
++    """With symmetries, index i takes the flipped position of its partner j."""
++    kp = [(10.0, 1.0, 2.0), (20.0, 2.0, 2.0), (30.0, 3.0, 2.0)]
++    _, kpts, _, _ = run(
++        build({"hflip": {"p": 1.0, "symmetries": [[0, 1]]}}), image, kp, BBOXES
++    )
++    # keypoint 0 now holds the mirrored keypoint 1 and vice versa; 2 is unpaired
++    np.testing.assert_allclose(kpts[:, :2], [[59 - 20.0, 2.0], [59 - 10.0, 1.0], [59 - 30.0, 3.0]])
++
++
++# --------------------------------------------------------------------------------
++# PadIfNeeded
++# --------------------------------------------------------------------------------
++PAD_EXPECTED = {
++    # position: (keypoints, boxes)
++    "center": ([[28.0, 32.0], [18.0, 12.0], [77.0, 51.0]], [[28.0, 32.0, 20.0, 10.0]]),
++    "top_left": ([[10.0, 20.0], [0.0, 0.0], [59.0, 39.0]], [[10.0, 20.0, 20.0, 10.0]]),
++    "top_right": ([[46.0, 20.0], [36.0, 0.0], [95.0, 39.0]], [[46.0, 20.0, 20.0, 10.0]]),
++    "bottom_left": ([[10.0, 44.0], [0.0, 24.0], [59.0, 63.0]], [[10.0, 44.0, 20.0, 10.0]]),
++    "bottom_right": ([[46.0, 44.0], [36.0, 24.0], [95.0, 63.0]], [[46.0, 44.0, 20.0, 10.0]]),
++}
++
++
++@pytest.mark.parametrize("position", sorted(PAD_EXPECTED))
++@pytest.mark.parametrize("border_mode", ["constant", "reflect_101"])
++def test_auto_padding_shifts_annotations_by_the_top_left_padding(image, position, border_mode):
++    """40x60 padded to 64x96: 24 rows and 36 columns are added.
++
++    Annotations move by the *top left* padding only, never by half of it and never
++    with x and y transposed.
++    """
++    cfg = {
++        "auto_padding": {
++            "min_height": 64,
++            "min_width": 96,
++            "pad_height_divisor": None,
++            "pad_width_divisor": None,
++            "position": position,
++            "border_mode": border_mode,
++        }
++    }
++    img, kpts, boxes, _ = run(build(cfg), image, KEYPOINTS, BBOXES)
++    expected_kpts, expected_boxes = PAD_EXPECTED[position]
++    assert img.shape == (64, 96, 3)
++    np.testing.assert_allclose(kpts[:, :2], expected_kpts)
++    np.testing.assert_allclose(boxes, expected_boxes)
++
++
++def test_auto_padding_divisor_pads_up_to_the_next_multiple(image):
++    cfg = {
++        "auto_padding": {
++            "pad_height_divisor": 32,
++            "pad_width_divisor": 32,
++            "position": "center",
++            "border_mode": "constant",
++        }
++    }
++    img, kpts, boxes, _ = run(build(cfg), image, KEYPOINTS, BBOXES)
++    assert img.shape == (64, 64, 3)  # 40 -> 64 (pad 24), 60 -> 64 (pad 4)
++    # centred padding puts 12 rows above and 2 columns to the left
++    np.testing.assert_allclose(kpts[:, :2], [[12.0, 32.0], [2.0, 12.0], [61.0, 51.0]])
++    np.testing.assert_allclose(boxes, [[12.0, 32.0, 20.0, 10.0]])
++
++
++def test_auto_padding_centre_rounds_the_odd_pixel_to_the_bottom_right(image):
++    """40x60 padded to 65x97 leaves 25 rows and 37 columns: the extra pixel goes below/right.
++
++    Centring the other way round shifts every annotation by one pixel.
++    """
++    cfg = {
++        "auto_padding": {
++            "min_height": 65,
++            "min_width": 97,
++            "pad_height_divisor": None,
++            "pad_width_divisor": None,
++            "position": "center",
++            "border_mode": "constant",
++        }
++    }
++    img, kpts, boxes, _ = run(build(cfg), image, KEYPOINTS, BBOXES)
++    assert img.shape == (65, 97, 3)
++    np.testing.assert_allclose(kpts[:, :2], [[28.0, 32.0], [18.0, 12.0], [77.0, 51.0]])
++    np.testing.assert_allclose(boxes, [[28.0, 32.0, 20.0, 10.0]], atol=1e-9)
++
++
++def test_auto_padding_divisor_leaves_an_exact_multiple_alone():
++    """A size already divisible by the divisor must not gain a whole extra block."""
++    exact = np.zeros((64, 96, 3), np.uint8)
++    cfg = {
++        "auto_padding": {
++            "pad_height_divisor": 32,
++            "pad_width_divisor": 32,
++            "position": "center",
++            "border_mode": "constant",
++        }
++    }
++    img, kpts, _, _ = run(build(cfg), exact, KEYPOINTS, BBOXES)
++    assert img.shape == (64, 96, 3)
++    np.testing.assert_allclose(kpts[:, :2], [[10.0, 20.0], [0.0, 0.0], [59.0, 39.0]])
++
++
++# --------------------------------------------------------------------------------
++# Affine
++# --------------------------------------------------------------------------------
++AFFINE_IMAGE_H, AFFINE_IMAGE_W = 41, 61
++AFFINE_KP = [(10.0, 5.0, 2.0), (30.0, 20.0, 2.0)]  # the second one is the rotation centre
++AFFINE_BB = [(10.0, 5.0, 20.0, 10.0)]
++
++
++def affine_pipeline(rotate, scale, translate):
++    """A one-transform pipeline with the affine parameters pinned to a single value."""
++    pipeline = T.build_transforms(
++        {"affine": {"p": 1.0, "rotation": 0, "scaling": [scale, scale], "translation": 0}}
++    )
++    transform = pipeline.transforms[0]
++    transform.rotate = (rotate, rotate)
++    transform.scale = (scale, scale)
++    transform.translate_px = (translate, translate)
++    transform.p = 1.0
++    return pipeline
++
++
++@pytest.fixture
++def affine_image():
++    y, x = np.mgrid[:AFFINE_IMAGE_H, :AFFINE_IMAGE_W]
++    return np.stack([(x * 4) % 256, (y * 6) % 256, ((x + y) * 3) % 256], axis=-1).astype(np.uint8)
++
++
++def test_affine_rotates_about_the_pixel_centre(affine_image):
++    """90 degrees about ((w - 1) / 2, (h - 1) / 2) = (30, 20).
++
++    Rotating about (w / 2, h / 2) instead, or about the wrong sign of the angle,
++    moves every keypoint; the centre keypoint is the fixed point that pins it down.
++    """
++    _, kpts, boxes, _ = run(affine_pipeline(90, 1.0, 0), affine_image, AFFINE_KP, AFFINE_BB)
++    np.testing.assert_allclose(kpts[:, :2], [[15.0, 40.0], [30.0, 20.0]], atol=1e-9)
++    np.testing.assert_allclose(boxes, [[15.0, 20.0, 10.0, 20.0]], atol=1e-9)
++
++
++def test_affine_rotation_sign_matches_the_image(affine_image):
++    """30 degrees: a positive angle must move the annotations the same way as the pixels."""
++    img, kpts, boxes, _ = run(affine_pipeline(30, 1.0, 0), affine_image, AFFINE_KP, AFFINE_BB)
++    np.testing.assert_allclose(
++        kpts[:, :2], [[5.1794919243, 17.0096189432], [30.0, 20.0]], atol=1e-8
++    )
++    np.testing.assert_allclose(
++        boxes, [[5.1794919243, 7.0096189432, 22.3205080757, 18.6602540378]], atol=1e-8
++    )
++    # and the pixels agree: the colour at the moved keypoint is the colour it started on
++    src = affine_image[5, 10]
++    dst = img[int(round(17.0096189432)), int(round(5.1794919243))]
++    assert np.abs(src.astype(int) - dst.astype(int)).max() <= 8
++
++
++def test_affine_translation_is_in_pixels(affine_image):
++    _, kpts, boxes, _ = run(affine_pipeline(0, 1.0, 7), affine_image, AFFINE_KP, AFFINE_BB)
++    np.testing.assert_allclose(kpts[:, :2], [[17.0, 12.0], [37.0, 27.0]], atol=1e-9)
++    np.testing.assert_allclose(boxes, [[17.0, 12.0, 20.0, 10.0]], atol=1e-9)
++
++
++def test_affine_scales_about_the_centre(affine_image):
++    _, kpts, boxes, _ = run(affine_pipeline(0, 2.0, 0), affine_image, AFFINE_KP, AFFINE_BB)
++    # a keypoint may leave the image; it keeps its coordinates
++    np.testing.assert_allclose(kpts[:, :2], [[-10.0, -10.0], [30.0, 20.0]], atol=1e-9)
++    # boxes are clipped to the image at the end of the pipeline
++    np.testing.assert_allclose(boxes, [[0.0, 0.0, 30.0, 10.0]], atol=1e-9)
++
++
++# --------------------------------------------------------------------------------
++# crop_sampling
++# --------------------------------------------------------------------------------
++@pytest.mark.parametrize(
++    "h_start, w_start, expected",
++    [(0.0, 0.0, (0, 0)), (0.5, 0.5, (35, 30)), (0.99999, 0.99999, (70, 60))],
++)
++def test_random_crop_origin_formula(h_start, w_start, expected):
++    """int((size - crop + 1) * start), so the last valid origin is reachable."""
++    crop = aug.RandomCrop(height=40, width=50)
++    params = crop.crop_coords((100, 120), h_start, w_start)
++    assert (params["x_min"], params["y_min"]) == expected
++
++
++def test_keypoint_aware_crop_moves_and_masks_keypoints():
++    """Keypoints shift by the crop origin; those outside the crop become NaN.
++
++    A keypoint exactly on the far edge (x == width) is outside; one at x == width - 1
++    is inside.
++    """
++    crop = T.KeypointAwareCrop(width=50, height=40, max_shift=0.1, crop_sampling="uniform")
++    image = np.zeros((100, 120, 3), np.uint8)
++    params = crop.crop_coords((100, 120), 0.0, 0.0)
++    params = dict(params)
++    params.update({"x_min": 10, "y_min": 20})
++    kp = np.array(
++        [
++            [15.0, 25.0, 2.0],  # inside  -> (5, 5)
++            [10.0, 20.0, 2.0],  # the crop origin -> (0, 0), inside
++            [59.0, 59.0, 2.0],  # -> (49, 39), the last pixel, inside
++            [60.0, 60.0, 2.0],  # -> (50, 40), one past the crop, outside
++            [5.0, 25.0, 2.0],  # left of the crop -> (-5, 5), outside
++        ]
++    )
++    out = crop.apply_to_keypoints(kp.copy(), **params)
++    np.testing.assert_allclose(out[:3, :2], [[5.0, 5.0], [0.0, 0.0], [49.0, 39.0]])
++    assert np.isnan(out[3, :2]).all()
++    assert np.isnan(out[4, :2]).all()
++    cropped = crop.apply(image, **params)
++    assert cropped.shape == (40, 50, 3)
++
++
++@pytest.mark.parametrize("method", ["uniform", "keypoints", "density", "hybrid"])
++def test_crop_sampling_stays_inside_the_image(image, method):
++    """Whatever the sampling method, the crop window must lie inside the padded image."""
++    cfg = {
++        "crop_sampling": {"width": 32, "height": 24, "max_shift": 0.1, "method": method},
++    }
++    pipeline = build(cfg)
++    for _ in range(50):
++        img, kpts, _, _ = run(pipeline, image, KEYPOINTS, BBOXES)
++        assert img.shape == (24, 32, 3)
++        visible = kpts[~np.isnan(kpts[:, 0])]
++        assert ((visible[:, 0] >= 0) & (visible[:, 0] < 32)).all()
++        assert ((visible[:, 1] >= 0) & (visible[:, 1] < 24)).all()
++
++
++# --------------------------------------------------------------------------------
++# covering / CoarseDropout
++# --------------------------------------------------------------------------------
++def test_coarse_dropout_masks_covered_keypoints_but_keeps_boxes():
++    """A hole is half open: [x1, x2) x [y1, y2). Boxes are never dropped by a hole."""
++    dropout = T.CoarseDropout(max_holes=1, max_height=4, max_width=4, p=1.0)
++    holes = [(10, 20, 15, 25)]
++    kp = np.array(
++        [
++            [10.0, 20.0, 2.0],  # the inclusive corner -> covered
++            [14.9, 24.9, 2.0],  # just inside -> covered
++            [15.0, 25.0, 2.0],  # the exclusive corner -> not covered
++            [15.0, 22.0, 2.0],  # on the exclusive x edge, y inside -> not covered
++            [12.0, 25.0, 2.0],  # on the exclusive y edge, x inside -> not covered
++            [9.0, 20.0, 2.0],  # left of the hole -> not covered
++            [12.0, 19.0, 2.0],  # above the hole -> not covered
++        ]
++    )
++    out = dropout.apply_to_keypoints(kp.copy(), holes=holes)
++    assert np.isnan(out[0, :2]).all()
++    assert np.isnan(out[1, :2]).all()
++    assert not np.isnan(out[2:, :2]).any()
++    np.testing.assert_allclose(out[2:, :2], kp[2:, :2])
++    boxes = np.array([[0.0, 0.0, 30.0, 30.0]])
++    np.testing.assert_array_equal(dropout.apply_to_bboxes(boxes.copy(), holes=holes), boxes)
++    image = np.full((40, 40, 3), 200, np.uint8)
++    blanked = dropout.apply(image, holes=holes)
++    np.testing.assert_array_equal(blanked[20:25, 10:15], 0)
++    np.testing.assert_array_equal(blanked[25, 15], 200)
++
++
++# --------------------------------------------------------------------------------
++# elastic_transform
++# --------------------------------------------------------------------------------
++def test_elastic_transform_keypoints_follow_the_displacement_field():
++    """A constant field is a pure translation; keypoints must move with the pixels.
++
++    ``map_x``/``map_y`` say where each output pixel *reads from*, so a field of
++    ``x - 3`` shifts the image (and every keypoint) three pixels to the right.
++    """
++    elastic = T.ElasticTransform(p=1.0)
++    h, w = 60, 80
++    y, x = np.meshgrid(np.arange(h, dtype=np.float32), np.arange(w, dtype=np.float32), indexing="ij")
++    map_x, map_y = np.float32(x - 3), np.float32(y - 2)
++
++    image = np.zeros((h, w, 3), np.uint8)
++    image[30, 40] = 255
++    warped = elastic.apply(image, map_x=map_x, map_y=map_y)
++    assert tuple(np.argwhere(warped[:, :, 0] == 255)[0]) == (32, 43)
++
++    kp = np.array([[40.0, 30.0, 2.0]])
++    moved = elastic.apply_to_keypoints(kp.copy(), map_x=map_x, map_y=map_y)
++    np.testing.assert_allclose(moved[:, :2], [[43.0, 32.0]], atol=1e-6)
++
++
++# --------------------------------------------------------------------------------
++# pixel-only transforms
++# --------------------------------------------------------------------------------
++@pytest.mark.parametrize(
++    "value, expected",
++    [
++        (0, [-2.1179039478302, -2.0357141494750977, -1.804444432258606]),
++        (128, [0.07406450808048248, 0.20518207550048828, 0.4264923930168152]),
++        (255, [2.248908281326294, 2.4285712242126465, 2.6399998664855957]),
++    ],
++)
++def test_normalize_uses_the_imagenet_statistics(value, expected):
++    """(x - 255 * mean) / (255 * std), per channel, in float32."""
++    image = np.full((4, 6, 3), value, np.uint8)
++    out = aug.Normalize().apply(image)
++    assert out.dtype == np.float32
++    assert out.shape == (4, 6, 3)
++    np.testing.assert_allclose(out[0, 0], expected, rtol=1e-6)
++
++
++def test_scale_to_unit_range():
++    image = np.array([[[0, 128, 255]]], np.uint8)
++    out = T.ScaleToUnitRange().apply(image)
++    assert out.dtype == np.float32
++    np.testing.assert_allclose(out[0, 0], [0.0, 128 / 255, 1.0], rtol=1e-6)
++
++
++def test_equalize_matches_opencv_per_channel():
++    rng = np.random.default_rng(0)
++    image = rng.integers(0, 256, (40, 50, 3), dtype=np.uint8)
++    out = aug.Equalize(p=1.0).apply(image)
++    for c in range(3):
++        np.testing.assert_array_equal(out[..., c], cv2.equalizeHist(image[..., c]))
++
++
++def test_grayscale_blends_towards_the_luma_plane():
++    rng = np.random.default_rng(1)
++    image = rng.integers(0, 256, (20, 30, 3), dtype=np.uint8)
++    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
++    np.testing.assert_array_equal(T.Grayscale(alpha=1.0).apply(image), np.repeat(gray[..., None], 3, axis=2))
++    np.testing.assert_array_equal(T.Grayscale(alpha=0.0).apply(image), image)
++
++
++# --------------------------------------------------------------------------------
++# Compose bookkeeping
++# --------------------------------------------------------------------------------
++def test_labels_stay_aligned_with_the_surviving_boxes(image):
++    """``utils._apply_transform`` scatters boxes back by ``bbox_labels``.
++
++    If a dropped box does not drop its label too, every surviving box is written to
++    the wrong row of the output array.
++    """
++    pipeline = affine_pipeline(0, 1.0, 0)
++    pipeline.transforms[0].translate_px = (-45, -45)
++    boxes = [
++        (1.0, 1.0, 10.0, 10.0),  # -> corners (-44, -44, -35, -35): gone
++        (50.0, 50.0, 8.0, 8.0),  # -> (5, 5, 13, 13): survives
++        (2.0, 2.0, 6.0, 6.0),  # -> (-43, -43, -37, -37): gone
++    ]
++    _, _, out_boxes, labels = run(pipeline, image, KEYPOINTS, boxes)
++    assert labels == [1]
++    np.testing.assert_allclose(out_boxes, [[5.0, 5.0, 8.0, 8.0]], atol=1e-9)
++
++
++@pytest.mark.parametrize("n_keypoints, n_boxes", [(0, 1), (3, 0), (0, 0)])
++def test_empty_annotations_survive_the_pipeline(image, n_keypoints, n_boxes):
++    cfg = {
++        "resize": {"height": 32, "width": 32, "keep_ratio": False},
++        "auto_padding": {
++            "pad_height_divisor": 32,
++            "pad_width_divisor": 32,
++            "position": "center",
++            "border_mode": "constant",
++        },
++        "normalize_images": True,
++    }
++    kp = KEYPOINTS[:n_keypoints]
++    bb = BBOXES[:n_boxes]
++    raw = build(cfg)(
++        image=image,
++        keypoints=np.asarray(kp, dtype=float).reshape(-1, 3),
++        class_labels=list(range(len(kp))),
++        bboxes=np.asarray(bb, dtype=float).reshape(-1, 4),
++        bbox_labels=np.arange(len(bb)),
++    )
++    assert len(raw["keypoints"]) == n_keypoints
++    assert all(len(k) == 3 for k in raw["keypoints"])
++    img, kpts, boxes, labels = run(build(cfg), image, kp, bb)
++    assert img.shape == (32, 32, 3)
++    assert kpts.shape == (n_keypoints, 3)
++    assert boxes.shape == (n_boxes, 4)
++    assert len(labels) == n_boxes
++
++
++def test_compose_requires_the_declared_label_fields(image):
++    pipeline = build({"resize": {"height": 32, "width": 32, "keep_ratio": False}})
++    with pytest.raises(ValueError, match="label_fields"):
++        pipeline(image=image, keypoints=[], bboxes=[], bbox_labels=[])
++
++
++# --------------------------------------------------------------------------------
++# confirmed deviations from albumentations 1.4.1
++#
++# Each of these is a behaviour the reference implementation had and the vendored
++# module does not. They are recorded as strict xfails so that fixing one turns into
++# an XPASS and the marker has to be removed, rather than the deviation quietly
++# surviving another review.
++# --------------------------------------------------------------------------------
++@pytest.mark.xfail(strict=True, reason="vendored RandomCrop computes a negative origin instead of raising")
++def test_crop_larger_than_the_image_is_rejected():
++    """albumentations raised ValueError; the vendored crop returns a wrong-sized array.
++
++    ``build_transforms`` always pads to at least the crop size first, so the stock
++    pipeline cannot reach this -- but the class is also instantiated directly.
++    """
++    crop = aug.RandomCrop(height=60, width=80)
++    with pytest.raises(ValueError):
++        crop.crop_coords((40, 50), 0.0, 0.0)
++
++
++@pytest.mark.xfail(strict=True, reason="Compose re-seeds on every call, collapsing an epoch to one augmentation")
++def test_compose_seed_does_not_repeat_the_same_augmentation():
++    pipeline = aug.Compose(
++        [aug.GaussNoise(std_range=(0.01, 0.05), p=1.0)],
++        keypoint_params=aug.KeypointParams("xy", label_fields=["class_labels"]),
++        bbox_params=aug.BboxParams("coco", label_fields=["bbox_labels"]),
++        seed=1234,
++    )
++    image = np.full((8, 8, 3), 128, np.uint8)
++    outs = [
++        pipeline(image=image, keypoints=[], class_labels=[], bboxes=[], bbox_labels=[])["image"]
++        for _ in range(4)
++    ]
++    assert not all(np.array_equal(outs[0], other) for other in outs[1:])
++
++
++@pytest.mark.parametrize(
++    "affine_cfg",
++    [{"p": 1.0, "translation": 40}, {"p": 1.0, "rotation": 30}, {"p": 1.0, "rotation": 30, "translation": 0}],
++)
++@pytest.mark.xfail(strict=True, reason="a partial affine block raises TypeError instead of defaulting to the identity")
++def test_partial_affine_block_defaults_the_missing_parameters(image, affine_cfg):
++    """albumentations treated a missing rotation/scaling/translation as the identity."""
++    pipeline = build({"affine": affine_cfg})
++    run(pipeline, image, KEYPOINTS, BBOXES)
++
++
++@pytest.mark.xfail(strict=True, reason="ksize is drawn from {3,4,5,6,7} then rounded up, so 3 is half as likely")
++def test_motion_blur_kernel_size_is_uniform_over_the_odd_sizes():
++    """albumentations drew uniformly from {3, 5, 7}; the vendored draw is 0.20/0.40/0.40."""
++    transform = aug.MotionBlur(blur_limit=(3, 7), p=1.0)
++    rng = np.random.default_rng(0)
++    image = np.zeros((16, 16, 3), np.uint8)
++    sizes = np.array(
++        [transform.get_params(image, np.zeros((0, 2)), np.zeros((0, 4)), rng)["kernel"].shape[0]
++         for _ in range(20000)]
++    )
++    for k in (3, 5, 7):
++        assert abs((sizes == k).mean() - 1 / 3) < 0.02, f"P(ksize={k}) = {(sizes == k).mean():.3f}"
++
++
++@pytest.mark.xfail(strict=True, reason="sigma is drawn uniformly instead of as the root of a uniform variance")
++def test_gauss_noise_sigma_matches_the_reference_distribution():
++    """``gaussian_noise: 12.75`` meant sigma = sqrt(U(0, 12.75**2)), mean 8.5.
++
++    The vendored transform draws sigma = 255 * U(0, 0.05), mean 6.375 -- the same
++    support but about 24% less noise on average.
++    """
++    transform = aug.GaussNoise(std_range=(0.0, 12.75 / 255.0), p=1.0)
++    rng = np.random.default_rng(0)
++    # a large plane per draw, so the sample standard deviation is an unbiased read of sigma
++    image = np.zeros((96, 96, 1), np.uint8)
++    sigmas = np.array(
++        [transform.get_params(image, np.zeros((0, 2)), np.zeros((0, 4)), rng)["noise"].std()
++         for _ in range(300)]
++    )
++    assert abs(sigmas.mean() - (2 / 3) * 12.75) < 0.3, f"mean sigma = {sigmas.mean():.3f}"
