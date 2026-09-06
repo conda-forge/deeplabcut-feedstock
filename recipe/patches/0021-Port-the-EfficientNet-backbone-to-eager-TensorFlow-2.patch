@@ -146,8 +146,8 @@ tensorflow.python.tpu.
  .../nnets/checkpoint.py                       |  31 +-
  .../nnets/efficientnet.py                     |  93 ++-
  .../pose_estimation_tensorflow/nnets/utils.py |  74 ---
- tests/test_nnets_efficientnet_keras.py        | 369 ++++++++++++
- 9 files changed, 1112 insertions(+), 111 deletions(-)
+ tests/test_nnets_efficientnet_keras.py        | 380 ++++++++++++
+ 9 files changed, 1123 insertions(+), 111 deletions(-)
  create mode 100644 deeplabcut/pose_estimation_tensorflow/backbones/efficientnet_keras.py
  create mode 100644 tests/test_nnets_efficientnet_keras.py
 
@@ -1263,10 +1263,10 @@ index 01202bc..429b5dd 100644
 -    """Wrap keras DepthwiseConv2D to tf.layers."""
 diff --git a/tests/test_nnets_efficientnet_keras.py b/tests/test_nnets_efficientnet_keras.py
 new file mode 100644
-index 0000000..5464cd0
+index 0000000..03bb265
 --- /dev/null
 +++ b/tests/test_nnets_efficientnet_keras.py
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,380 @@
 +#
 +# DeepLabCut Toolbox (deeplabcut.org)
 +# © A. & M.W. Mathis Labs
@@ -1481,8 +1481,19 @@ index 0000000..5464cd0
 +    """Batch norm uses the moving averages, so images cannot interact.
 +
 +    Only the batch *size* changes anything, and only because the convolution
-+    kernels block differently: about 1e-6 relative, with the companions
-+    themselves making no difference at all.
++    kernels block differently, by about 1e-6 relative; the companions
++    themselves make no difference at all.
++
++    The bound is absolute rather than scaled to the output.  Untrained, this
++    net's part_pred spans only about 3e-4, so a 1e-5 *relative* bound came to
++    3e-9 and sat a factor of ten over the kernel noise -- close enough to
++    dispatch differences on another CPU to fail there and nowhere else, which
++    is how the MobileNet sibling of this test broke.  1e-7 is 300x clear of
++    the noise seen here and still 3000x inside the signal.  Unlike MobileNet
++    there is no batch-dependent norm mode to catch: EfficientNet's batch norm
++    never reads the batch (see ``efficientnet_keras``'s module docstring, and
++    the TF1 graph's zero UPDATE_OPS), so what this bounds is gross leakage
++    between companions, not a norm regression.
 +    """
 +    model = build(pose_cfg(), batch_size=1)
 +    predict = tf.function(
@@ -1492,7 +1503,7 @@ index 0000000..5464cd0
 +    reference = predict(batch[:1])["part_pred"].numpy()
 +    for n in (2, 4, 8):
 +        same_size = predict(batch[:n])["part_pred"].numpy()[:1]
-+        assert np.abs(same_size - reference).max() <= 1e-5 * np.abs(reference).max()
++        assert np.abs(same_size - reference).max() < 1e-7
 +        shuffled = tf.concat([batch[:1], batch[1:n][::-1]], axis=0)
 +        assert np.array_equal(predict(shuffled)["part_pred"].numpy()[:1], same_size)
 +

@@ -186,13 +186,13 @@ block names and would fail at the first forward pass; that mirrors the
 tf_slim net, whose own mobilenet branch is unreachable because it needs
 stride < 8 and nothing writes such a value.
 ---
- .../backbones/mobilenet_v2_keras.py           | 332 ++++++++++++++
+ .../backbones/mobilenet_v2_keras.py           | 332 +++++++++++++
  .../nnets/__init__.py                         |   3 +-
  .../nnets/mobilenet.py                        |  48 +-
  tests/test_nnets_efficientnet_keras.py        |  23 +-
  tests/test_nnets_keras.py                     |  13 +-
- tests/test_nnets_keras_mobilenet.py           | 434 ++++++++++++++++++
- 6 files changed, 842 insertions(+), 11 deletions(-)
+ tests/test_nnets_keras_mobilenet.py           | 444 ++++++++++++++++++
+ 6 files changed, 852 insertions(+), 11 deletions(-)
  create mode 100644 deeplabcut/pose_estimation_tensorflow/backbones/mobilenet_v2_keras.py
  create mode 100644 tests/test_nnets_keras_mobilenet.py
 
@@ -620,7 +620,7 @@ index 707342c..16c927f 100644
 +            out[key] = layer(source, training=is_training)
 +        return out
 diff --git a/tests/test_nnets_efficientnet_keras.py b/tests/test_nnets_efficientnet_keras.py
-index 5464cd0..4858b2b 100644
+index 03bb265..4cdffa5 100644
 --- a/tests/test_nnets_efficientnet_keras.py
 +++ b/tests/test_nnets_efficientnet_keras.py
 @@ -22,6 +22,7 @@ tf = pytest.importorskip("tensorflow")
@@ -631,7 +631,7 @@ index 5464cd0..4858b2b 100644
      KerasBackboneFactory,
      PoseEfficientNetKeras,
      PoseNetFactory,
-@@ -327,16 +328,24 @@ CONFIG_LISTS = {
+@@ -338,16 +339,24 @@ CONFIG_LISTS = {
  }
  
  
@@ -660,7 +660,7 @@ index 5464cd0..4858b2b 100644
      build_it(cfg)
      write_plainconfig(str(after), cfg)
      assert before.read_text() == after.read_text()
-@@ -354,7 +363,11 @@ def test_backbone_leaves_the_caller_config_alone(tmp_path):
+@@ -365,7 +374,11 @@ def test_backbone_leaves_the_caller_config_alone(tmp_path):
      reason="BaseKerasPoseNet still assigns cfg through Keras attribute tracking",
  )
  def test_pose_net_leaves_the_caller_config_alone(tmp_path):
@@ -703,10 +703,10 @@ index 35b213d..335bd5f 100644
      assert "!!python" not in after
 diff --git a/tests/test_nnets_keras_mobilenet.py b/tests/test_nnets_keras_mobilenet.py
 new file mode 100644
-index 0000000..80473fa
+index 0000000..a2bb135
 --- /dev/null
 +++ b/tests/test_nnets_keras_mobilenet.py
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,444 @@
 +#
 +# DeepLabCut Toolbox (deeplabcut.org)
 +# © A. & M.W. Mathis Labs
@@ -903,23 +903,27 @@ index 0000000..80473fa
 +    bit-for-bit: TensorFlow reassociates differently for different batch
 +    sizes -- its own start-up banner warns that oneDNN may give "slightly
 +    different numerical results ... from different computation orders" -- and
-+    which kernel is picked depends on the host CPU.  Measured on the feature
-+    map: 0.0 on one machine, 1.4e-06 on a GitHub runner, against 4.19 when
-+    the norm really does read the batch, which
-+    ``test_batch_mode_reproduces_the_bug_it_replaces`` pins down.  1e-4 sits
-+    a factor of 70 above the noise and 4e4 below the bug.
++    which kernel is picked depends on the host CPU.
++
++    So the bound comes from the *defect*, which is stable and large, not from
++    the noise, which is neither: this machine shows 0.0 whatever the thread
++    and oneDNN settings, while a GitHub runner showed 1.4e-06 on the feature
++    map and 2.6e-05 on the heads.  Batch-dependent norm costs 4.2 and 1.7 at
++    those two points, as ``test_batch_mode_reproduces_the_bug_it_replaces``
++    measures, so 1e-3 stays about 2000x below the defect while clearing every
++    noise figure yet observed by a factor of 40 or more.
 +    """
 +    model = build(pose_cfg(), batch_size=4)
 +    batch = images(4, seed=1)
 +    alone, _ = model.extract_features(batch[:1])
 +    together, _ = model.extract_features(batch)
 +    shuffled, _ = model.extract_features(tf.gather(batch, [3, 0, 2, 1]))
-+    assert np.abs(alone.numpy() - together.numpy()[:1]).max() < 1e-4
-+    assert np.abs(alone.numpy() - shuffled.numpy()[1:2]).max() < 1e-4
++    assert np.abs(alone.numpy() - together.numpy()[:1]).max() < 1e-3
++    assert np.abs(alone.numpy() - shuffled.numpy()[1:2]).max() < 1e-3
 +
 +    head_alone = model.get_net(batch[:1])["part_pred"].numpy()
 +    head_together = model.get_net(batch)["part_pred"].numpy()[:1]
-+    assert np.abs(head_alone - head_together).max() < 1e-5
++    assert np.abs(head_alone - head_together).max() < 1e-3
 +
 +
 +def test_batch_mode_reproduces_the_bug_it_replaces():
@@ -941,7 +945,11 @@ index 0000000..80473fa
 +
 +
 +def test_a_dynamic_batch_dimension_is_batch_independent_too():
-+    """What export_model builds, and the one case patch 0014 could not fix."""
++    """What export_model builds, and the one case patch 0014 could not fix.
++
++    Same bound, for the same reason, as
++    ``test_inference_is_independent_of_batch_composition``.
++    """
 +    model = build(pose_cfg(), batch_size=4)
 +
 +    @tf.function(input_signature=[tf.TensorSpec([None, *SIZE, 3], tf.float32)])
@@ -951,7 +959,7 @@ index 0000000..80473fa
 +    batch = images(4, seed=1)
 +    alone = graph(batch[:1]).numpy()
 +    for size in (2, 3, 4):
-+        assert np.abs(alone - graph(batch[:size]).numpy()[:1]).max() < 1e-4
++        assert np.abs(alone - graph(batch[:size]).numpy()[:1]).max() < 1e-3
 +
 +
 +def test_the_backbone_updates_its_moving_averages_only_in_training_mode():
@@ -1139,5 +1147,10 @@ index 0000000..80473fa
 +        if hasattr(session, "close"):
 +            session.close()
 +
++    # in pixels: a peak assigned to a different cell moves by a whole stride,
++    # so anything under a pixel is locref arithmetic rather than batch leakage
 +    moved = np.linalg.norm(poses[1][:, :2] - poses[4][:, :2], axis=-1)
-+    assert moved.max() < 1e-3, moved
++    assert moved.max() < 1e-2, moved
+-- 
+2.55.0
+
