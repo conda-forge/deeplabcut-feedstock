@@ -191,8 +191,8 @@ stride < 8 and nothing writes such a value.
  .../nnets/mobilenet.py                        |  48 +-
  tests/test_nnets_efficientnet_keras.py        |  23 +-
  tests/test_nnets_keras.py                     |  13 +-
- tests/test_nnets_keras_mobilenet.py           | 421 ++++++++++++++++++
- 6 files changed, 829 insertions(+), 11 deletions(-)
+ tests/test_nnets_keras_mobilenet.py           | 434 ++++++++++++++++++
+ 6 files changed, 842 insertions(+), 11 deletions(-)
  create mode 100644 deeplabcut/pose_estimation_tensorflow/backbones/mobilenet_v2_keras.py
  create mode 100644 tests/test_nnets_keras_mobilenet.py
 
@@ -703,10 +703,10 @@ index 35b213d..335bd5f 100644
      assert "!!python" not in after
 diff --git a/tests/test_nnets_keras_mobilenet.py b/tests/test_nnets_keras_mobilenet.py
 new file mode 100644
-index 0000000..e766c86
+index 0000000..80473fa
 --- /dev/null
 +++ b/tests/test_nnets_keras_mobilenet.py
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,434 @@
 +#
 +# DeepLabCut Toolbox (deeplabcut.org)
 +# © A. & M.W. Mathis Labs
@@ -898,19 +898,24 @@ index 0000000..e766c86
 +def test_inference_is_independent_of_batch_composition():
 +    """Patch 0014's property, without its graph replication.
 +
-+    The feature map is bit-identical whatever else is in the batch.  The heads
-+    are not quite: ``Conv2DTranspose`` accumulates differently for different
-+    batch sizes, which is the same last-bit noise the tf_slim graph shows
-+    (1.2e-06 between its own batch-1 and batch-4 builds) and has nothing to do
-+    with batch norm.
++    An image's output does not depend on what it is batched with, because
++    batch norm reads the moving averages rather than the batch.  Not
++    bit-for-bit: TensorFlow reassociates differently for different batch
++    sizes -- its own start-up banner warns that oneDNN may give "slightly
++    different numerical results ... from different computation orders" -- and
++    which kernel is picked depends on the host CPU.  Measured on the feature
++    map: 0.0 on one machine, 1.4e-06 on a GitHub runner, against 4.19 when
++    the norm really does read the batch, which
++    ``test_batch_mode_reproduces_the_bug_it_replaces`` pins down.  1e-4 sits
++    a factor of 70 above the noise and 4e4 below the bug.
 +    """
 +    model = build(pose_cfg(), batch_size=4)
 +    batch = images(4, seed=1)
 +    alone, _ = model.extract_features(batch[:1])
 +    together, _ = model.extract_features(batch)
 +    shuffled, _ = model.extract_features(tf.gather(batch, [3, 0, 2, 1]))
-+    assert np.array_equal(alone.numpy(), together.numpy()[:1])
-+    assert np.array_equal(alone.numpy(), shuffled.numpy()[1:2])
++    assert np.abs(alone.numpy() - together.numpy()[:1]).max() < 1e-4
++    assert np.abs(alone.numpy() - shuffled.numpy()[1:2]).max() < 1e-4
 +
 +    head_alone = model.get_net(batch[:1])["part_pred"].numpy()
 +    head_together = model.get_net(batch)["part_pred"].numpy()[:1]
@@ -918,10 +923,18 @@ index 0000000..e766c86
 +
 +
 +def test_batch_mode_reproduces_the_bug_it_replaces():
-+    """The stock tf_slim reduction really does depend on the other images."""
++    """The stock tf_slim reduction really does depend on the other images.
++
++    This is what the tolerance in
++    ``test_inference_is_independent_of_batch_composition`` has to separate
++    from kernel noise, so measure it at the same two points.
++    """
 +    model = build(pose_cfg(), batch_size=4)
 +    model.backbone.set_bn_mode(mnk.BN_BATCH)
 +    batch = images(4, seed=1)
++    feat_alone, _ = model.extract_features(batch[:1])
++    feat_together, _ = model.extract_features(batch)
++    assert np.abs(feat_alone.numpy() - feat_together.numpy()[:1]).max() > 1.0
 +    alone = model.get_net(batch[:1])["part_pred"].numpy()
 +    together = model.get_net(batch)["part_pred"].numpy()[:1]
 +    assert np.abs(alone - together).max() > 1e-3
